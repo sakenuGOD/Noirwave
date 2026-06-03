@@ -1,0 +1,49 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Xcode local state and generated project
+Noirwave.xcodeproj/
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+*.moved-aside
+
+# Swift Package Manager
+.build/
+Packages/
+Package.resolved
+
+# Node
+NoirwaveBackend/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Python
+NoirwaveBackend/.venv/
+NoirwaveBackend/.pytest_cache/
+NoirwaveBackend/__pycache__/
+NoirwaveBackend/**/*.pyc
+
+# Vendored/runtime Deemix checkout
+NoirwaveBackend/vendor/
+
+# Local secrets and runtime config
+.env
+.env.*
+!.env.example
+NoirwaveBackend/.env
+NoirwaveBackend/.env.*
+!NoirwaveBackend/.env.example
+*.pem
+*.key
+*.p12
+*.mobileprovision
+
+# Logs and local runtime output
+*.log
+*.pid
+*.xcresult

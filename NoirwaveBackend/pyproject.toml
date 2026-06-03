@@ -1,0 +1,7 @@
+[project]
+name = "noirwave-backend"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "deezer-python-gql @ git+https://github.com/music-assistant/deezer-python-gql",
+]

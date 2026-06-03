@@ -1,0 +1,99 @@
+# Noirwave
+
+Native SwiftUI macOS music player MVP with a local Deezer stream backend.
+
+## Run
+
+Start the headless backend:
+
+```sh
+cd /Users/fsociety/Developer/Noirwave/NoirwaveBackend
+npm install
+npm start
+```
+
+Or install it as a macOS LaunchAgent:
+
+```sh
+cd /Users/fsociety/Developer/Noirwave/NoirwaveBackend
+chmod +x scripts/install-launch-agent.sh
+scripts/install-launch-agent.sh
+```
+
+Open the macOS app:
+
+```sh
+cd /Users/fsociety/Developer/Noirwave
+xcodegen generate
+open Noirwave.xcodeproj
+```
+
+Noirwave talks to `http://127.0.0.1:6605` by default. Override it with:
+
+```sh
+NOIRWAVE_BACKEND_API_BASE=http://127.0.0.1:6605 open Noirwave.xcodeproj
+```
+
+## Session
+
+Full-track playback needs a Deezer ARL session. Use `Stream Session` in the app
+sidebar:
+
+- `Connect ARL` sends the pasted ARL to the local backend for the current
+  process.
+- `Use Saved ARL` asks the backend to use the saved local session it can already
+  read.
+
+The backend reads ARL in this order:
+
+1. ARL connected from the app.
+2. `NOIRWAVE_DEEZER_ARL`.
+3. `~/Library/Application Support/deemix/login.json`.
+
+Noirwave does not write ARL into the Swift app bundle or source tree.
+
+Use `NoirwaveBackend/.env.example` as a local environment template. Keep real
+ARL values in `.env`, shell environment, or the app session sheet; `.env` files
+are ignored by Git.
+
+## Backend
+
+The backend is a local headless service. It uses:
+
+- `deezer-python-gql` through `scripts/catalog_cli.py` for search, artists,
+  albums, track metadata, and lyrics.
+- `deezer-sdk` from the modified Deemix package as a low-level media URL and
+  stream helper.
+
+Visible app flow does not use the Deemix WebUI. Playback resolves a Deezer track
+id, requests MP3 320 kbps, and streams the audio through:
+
+- `GET /api/playback/:trackId`
+- `GET /api/stream/:trackId`
+
+Noirwave does not fall back to 128 kbps or 30-second previews. If the current
+ARL cannot stream MP3 320, playback fails with a bitrate-specific message.
+
+Useful backend endpoints:
+
+- `GET /health`
+- `GET /api/connect`
+- `POST /api/loginArl`
+- `GET /api/search?term=<query>&type=track|artist|album&nb=30`
+- `GET /api/getTracklist?type=artist|album&id=<id>`
+- `GET /api/lyrics/:trackId`
+- `GET /api/playback/:trackId`
+- `GET /api/stream/:trackId`
+
+Backend format defaults to MP3 320:
+
+```sh
+NOIRWAVE_DEEZER_FORMAT=MP3_320 npm start
+```
+
+## Test Seeds
+
+The first screen loads two catalog seed searches:
+
+- `Daft Punk Around the World`
+- `Nirvana Come As You Are`
