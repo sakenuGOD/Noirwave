@@ -3,8 +3,13 @@ import { Transform } from "node:stream";
 
 const encryptedStreamMarkers = ["/mobile/", "/media/", "media.deezer.com"];
 const decryptWindowSize = 2048 * 3;
+const streamRetryDelayMs = 450;
 
 export const isEncryptedStreamURL = (url) => encryptedStreamMarkers.some((marker) => url.includes(marker));
+
+export const isRetriableStreamError = (error) =>
+  /connection reset|socket hang up|timeout|timed out|econnreset|etimedout|econnrefused|eai_again|enetunreach/i
+    .test(`${error?.code ?? ""} ${error?.message ?? ""}`);
 
 export const createStripeDecryptStream = ({ trackId, utils, encrypted }) => {
   if (!encrypted) return new Transform({
@@ -63,30 +68,110 @@ export const createDepadStream = () => {
   });
 };
 
-export const streamDeezerMedia = ({ mediaURL, trackId, response, utils }) => {
-  const encrypted = isEncryptedStreamURL(mediaURL);
+const applyAudioHeaders = (response) => {
+  if (response.headersSent) return;
   response.status(200);
   response.setHeader("Content-Type", "audio/mpeg");
   response.setHeader("Cache-Control", "no-store");
+  response.setHeader("Accept-Ranges", "none");
+  response.setHeader("X-Content-Type-Options", "nosniff");
+};
 
-  const source = got.stream(mediaURL, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 Noirwave/0.1",
-    },
-    https: {
-      rejectUnauthorized: false,
-    },
-    retry: {
-      limit: 1,
-    },
+const sendStreamFailure = (response, error) => {
+  if (response.headersSent) {
+    response.destroy(error);
+    return;
+  }
+
+  response.removeHeader("Content-Type");
+  response.removeHeader("Cache-Control");
+  response.removeHeader("Accept-Ranges");
+  response.removeHeader("X-Content-Type-Options");
+  response.status(503).json({
+    result: false,
+    errid: "NetworkUnavailable",
+    error: "Deezer media stream failed before audio started.",
   });
+};
 
-  source
-    .pipe(createStripeDecryptStream({ trackId, utils, encrypted }))
-    .pipe(createDepadStream())
-    .pipe(response);
+export const streamDeezerMedia = ({ mediaURL, trackId, response, utils, attempts = 3 }) => {
+  const encrypted = isEncryptedStreamURL(mediaURL);
+  let activeSource;
+  let activeDecrypt;
+  let activeDepad;
+  let didClose = false;
+  let didStartAudio = false;
+  let attempt = 0;
+
+  const destroyActivePipeline = () => {
+    activeSource?.destroy();
+    activeDecrypt?.destroy();
+    activeDepad?.destroy();
+  };
+
+  const startAttempt = () => {
+    if (didClose || response.headersSent) return;
+
+    attempt += 1;
+    const source = got.stream(mediaURL, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 Noirwave/0.1",
+      },
+      https: {
+        rejectUnauthorized: false,
+      },
+      retry: {
+        limit: 0,
+      },
+      timeout: {
+        request: 18000,
+      },
+    });
+    const decrypt = createStripeDecryptStream({ trackId, utils, encrypted });
+    const depad = createDepadStream();
+
+    activeSource = source;
+    activeDecrypt = decrypt;
+    activeDepad = depad;
+
+    const handlePipelineError = (error) => {
+      destroyActivePipeline();
+      if (didClose) return;
+
+      const canRetry = !didStartAudio
+        && !response.headersSent
+        && attempt < attempts
+        && isRetriableStreamError(error);
+
+      if (canRetry) {
+        setTimeout(startAttempt, streamRetryDelayMs * attempt);
+        return;
+      }
+
+      sendStreamFailure(response, error);
+    };
+
+    source.once("response", () => {
+      applyAudioHeaders(response);
+    });
+    depad.once("data", () => {
+      didStartAudio = true;
+    });
+
+    source.once("error", handlePipelineError);
+    decrypt.once("error", handlePipelineError);
+    depad.once("error", handlePipelineError);
+
+    source
+      .pipe(decrypt)
+      .pipe(depad)
+      .pipe(response);
+  };
 
   response.on("close", () => {
-    source.destroy();
+    didClose = true;
+    destroyActivePipeline();
   });
+
+  startAttempt();
 };

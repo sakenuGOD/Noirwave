@@ -61,9 +61,9 @@ are ignored by Git.
 The backend is a local headless service. It uses:
 
 - `deezer-python-gql` through `scripts/catalog_cli.py` for search, artists,
-  albums, track metadata, and lyrics.
-- `deezer-sdk` from the modified Deemix package as a low-level media URL and
-  stream helper.
+  albums, catalog metadata, and lyrics.
+- `deezer-sdk` from the modified Deemix package for playback media tokens,
+  media URLs, and stream helper crypto.
 
 Visible app flow does not use the Deemix WebUI. Playback resolves a Deezer track
 id, requests MP3 320 kbps first, falls back to MP3 128 kbps for free sessions,

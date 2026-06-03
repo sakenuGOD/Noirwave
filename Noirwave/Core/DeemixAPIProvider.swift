@@ -1205,10 +1205,16 @@ final class DeemixAPIProvider: MusicProviding {
 
         let playbackURL = try await fullTrackURL(for: track)
         let item = AVPlayerItem(url: playbackURL)
+        item.preferredForwardBufferDuration = 2
+        item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+
+        let streamPlayer = AVPlayer(playerItem: item)
+        streamPlayer.automaticallyWaitsToMinimizeStalling = false
+
         cleanupLastPlaybackFile(except: playbackURL)
-        player = AVPlayer(playerItem: item)
+        player = streamPlayer
         lastPlaybackFileURL = playbackURL
-        player?.play()
+        streamPlayer.play()
         try await waitUntilReadyToPlay(item)
     }
 
@@ -1267,7 +1273,7 @@ final class DeemixAPIProvider: MusicProviding {
         return url
     }
 
-    private func waitUntilReadyToPlay(_ item: AVPlayerItem, timeout: TimeInterval = 8) async throws {
+    private func waitUntilReadyToPlay(_ item: AVPlayerItem, timeout: TimeInterval = 15) async throws {
         let deadline = Date().addingTimeInterval(timeout)
 
         while Date() < deadline {

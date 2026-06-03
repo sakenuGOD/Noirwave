@@ -18,6 +18,7 @@ const bitrateByFormat = new Map([
 
 let sdkState = null;
 const mediaURLCache = new Map();
+const trackMediaCache = new Map();
 
 app.use(express.json());
 
@@ -28,6 +29,19 @@ const normalizeFormat = (value) => {
   return bitrateByFormat.has(requestedFormat) ? requestedFormat : preferredFormat;
 };
 
+const sessionCanUseFormat = (currentUser, format) =>
+  format !== "MP3_320" || currentUser?.can_stream_hq !== false;
+
+const selectFormatsForSession = (currentUser, requestedFormat) => {
+  const normalizedFormat = normalizeFormat(requestedFormat);
+  const candidates = normalizedFormat === preferredFormat
+    ? formatPreferences
+    : [normalizedFormat];
+  const selectedFormats = candidates.filter((format) => sessionCanUseFormat(currentUser, format));
+
+  return selectedFormats.length > 0 ? selectedFormats : [fallbackFormat];
+};
+
 const isWrongLicenseError = (error) =>
   error?.name === "WrongLicense" || /wronglicense|wrong license|license/i.test(error?.message ?? "");
 
@@ -35,6 +49,58 @@ const isTransientNetworkError = (error) =>
   /connection reset|cannot connect|timeout|timed out|econnreset|etimedout/i.test(error.message ?? "");
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+const cacheTrackMedia = (trackId, media) => {
+  const now = Date.now();
+  const tokenExpiresAt = Number(media.tokenExpire) > 0
+    ? Number(media.tokenExpire) * 1000
+    : now + 45 * 60 * 1000;
+  const expiresAt = Math.min(tokenExpiresAt - 60 * 1000, now + 45 * 60 * 1000);
+  const cached = {
+    ...media,
+    expiresAt: Math.max(expiresAt, now + 5 * 60 * 1000),
+  };
+  trackMediaCache.set(String(trackId), cached);
+  return cached;
+};
+
+const resolveTrackMediaFromGW = async (dz, trackId) => {
+  const track = await dz.gw.get_track_with_fallback(trackId);
+  const mediaToken = track?.TRACK_TOKEN;
+  if (!mediaToken) {
+    const error = new Error("Deezer gateway did not return a track token.");
+    error.name = "MediaTokenNotFound";
+    throw error;
+  }
+
+  return cacheTrackMedia(trackId, {
+    id: String(track?.SNG_ID ?? trackId),
+    title: track?.SNG_TITLE ?? null,
+    duration: Number(track?.DURATION ?? 0),
+    mediaToken,
+    mediaVersion: track?.MEDIA_VERSION ?? null,
+    tokenExpire: track?.TRACK_TOKEN_EXPIRE ?? null,
+    canStreamSub: track?.RIGHTS?.STREAM_SUB_AVAILABLE !== false,
+    estimatedSize128: Number(track?.FILESIZE_MP3_128 ?? 0),
+    estimatedSize320: Number(track?.FILESIZE_MP3_320 ?? 0),
+    source: "deezer-gw",
+  });
+};
+
+const resolveTrackMedia = async (dz, trackId) => {
+  const cached = trackMediaCache.get(String(trackId));
+  if (cached?.expiresAt > Date.now()) return cached;
+
+  try {
+    return await resolveTrackMediaFromGW(dz, trackId);
+  } catch (_gwError) {
+    const media = await callCatalog(["track-media", "--id", trackId]);
+    return cacheTrackMedia(trackId, {
+      ...media,
+      source: "deezer-gql",
+    });
+  }
+};
 
 const loginViaArlWithRetry = async (dz, arl, attempts = 3) => {
   let lastError;
@@ -96,14 +162,9 @@ const ensureSDK = async () => {
 };
 
 const resolveMediaURL = async (trackId, requestedFormat = preferredFormat) => {
-  const selectedFormats = requestedFormat === preferredFormat
-    ? formatPreferences
-    : [normalizeFormat(requestedFormat)];
-
-  const [{ dz }, media] = await Promise.all([
-    ensureSDK(),
-    callCatalog(["track-media", "--id", trackId]),
-  ]);
+  const { dz } = await ensureSDK();
+  const media = await resolveTrackMedia(dz, trackId);
+  const selectedFormats = selectFormatsForSession(dz.currentUser, requestedFormat);
 
   if (!media.canStreamSub) {
     const error = new Error("The current Deezer session cannot stream this track.");
@@ -184,6 +245,7 @@ app.post("/api/loginArl", asyncHandler(async (request, response) => {
   setRuntimeARL(arl);
   sdkState = null;
   mediaURLCache.clear();
+  trackMediaCache.clear();
 
   const sdk = await ensureSDK();
   response.json({
