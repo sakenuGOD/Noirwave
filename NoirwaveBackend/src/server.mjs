@@ -20,6 +20,24 @@ const isValidTrackId = (value) => /^\d+$/.test(String(value ?? ""));
 const isTransientNetworkError = (error) =>
   /connection reset|cannot connect|timeout|timed out|econnreset|etimedout/i.test(error.message ?? "");
 
+const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+const loginViaArlWithRetry = async (dz, arl, attempts = 3) => {
+  let lastError;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await dz.loginViaArl(arl);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts - 1 || !isTransientNetworkError(error)) throw error;
+      await delay(650 * (attempt + 1));
+    }
+  }
+
+  throw lastError;
+};
+
 const normalizeARL = (value) => {
   const normalized = String(value ?? "").trim();
   if (normalized.length < 32 || /\s/.test(normalized)) return null;
@@ -52,7 +70,7 @@ const ensureSDK = async () => {
 
   const modules = await loadDeemixModules();
   const dz = new modules.deezerSdk.Deezer();
-  const loggedIn = await dz.loginViaArl(arl);
+  const loggedIn = await loginViaArlWithRetry(dz, arl);
   if (!loggedIn) {
     const error = new Error("Deezer session login failed.");
     error.statusCode = 401;

@@ -9,7 +9,7 @@ const scriptPath = path.join(backendRoot, "scripts", "catalog_cli.py");
 const shouldRetryCatalogError = (error) =>
   /connection reset|cannot connect|timeout|timed out|econnreset|etimedout/i.test(error.message);
 
-const runCatalogOnce = (args, { timeoutMs = 18000 } = {}) =>
+const runCatalogOnce = (args, { timeoutMs = 22000 } = {}) =>
   new Promise((resolve, reject) => {
     const arl = readARL();
     if (!arl) {
@@ -28,7 +28,11 @@ const runCatalogOnce = (args, { timeoutMs = 18000 } = {}) =>
 
     let stdout = "";
     let stderr = "";
-    const timer = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
+    let didTimeout = false;
+    const timer = setTimeout(() => {
+      didTimeout = true;
+      child.kill("SIGTERM");
+    }, timeoutMs);
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
@@ -40,6 +44,14 @@ const runCatalogOnce = (args, { timeoutMs = 18000 } = {}) =>
     });
     child.on("close", (code) => {
       clearTimeout(timer);
+      if (didTimeout) {
+        const error = new Error(`Catalog request timed out after ${timeoutMs}ms.`);
+        error.name = "CatalogTimeout";
+        error.statusCode = 504;
+        reject(error);
+        return;
+      }
+
       if (code !== 0) {
         reject(new Error(stderr.trim() || `catalog_cli exited with code ${code}`));
         return;
@@ -53,7 +65,7 @@ const runCatalogOnce = (args, { timeoutMs = 18000 } = {}) =>
     });
   });
 
-export const callCatalog = async (args, { timeoutMs = 18000, attempts = 2 } = {}) => {
+export const callCatalog = async (args, { timeoutMs = 22000, attempts = 3 } = {}) => {
   let lastError;
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {

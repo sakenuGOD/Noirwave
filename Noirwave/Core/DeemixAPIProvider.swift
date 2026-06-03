@@ -797,6 +797,10 @@ enum DeemixAPIPlaybackFailureMapper {
 
     private static func error(errid: String?, bitrate: Int?, message: String?) -> MusicProviderError {
         switch errid {
+        case "NetworkUnavailable":
+            return .providerNotReady("Deezer network request timed out. Try again in a moment.")
+        case "CatalogTimeout":
+            return .providerNotReady("Catalog request timed out. Try a narrower search.")
         case "NotLoggedIn":
             return .providerNotReady("Backend session inactive.")
         case "CantStream":
@@ -874,6 +878,7 @@ enum DeemixAPISessionState {
 struct DeemixAPIClient {
     let baseURL: URL
     var session: URLSession = .shared
+    private let requestTimeout: TimeInterval = 45
 
     func connect() async throws -> DeemixAPIConnectResponse {
         try await get("connect", queryItems: [])
@@ -988,7 +993,7 @@ struct DeemixAPIClient {
         }
 
         var request = URLRequest(url: url)
-        request.timeoutInterval = 8
+        request.timeoutInterval = requestTimeout
 
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse,
@@ -1007,7 +1012,7 @@ struct DeemixAPIClient {
         let url = baseURL.appendingPathComponent("api").appendingPathComponent(endpoint)
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.timeoutInterval = 8
+        request.timeoutInterval = requestTimeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(body)
 
