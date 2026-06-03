@@ -8,7 +8,13 @@ import { normalizeLyricsPayload } from "./lyricsMapper.mjs";
 const app = express();
 const port = Number(process.env.NOIRWAVE_BACKEND_PORT ?? 6605);
 const host = process.env.NOIRWAVE_BACKEND_HOST ?? "127.0.0.1";
-const format = process.env.NOIRWAVE_DEEZER_FORMAT ?? "MP3_320";
+const preferredFormat = process.env.NOIRWAVE_DEEZER_FORMAT ?? "MP3_320";
+const fallbackFormat = "MP3_128";
+const formatPreferences = [...new Set([preferredFormat, fallbackFormat])];
+const bitrateByFormat = new Map([
+  ["MP3_320", 3],
+  ["MP3_128", 1],
+]);
 
 let sdkState = null;
 const mediaURLCache = new Map();
@@ -16,6 +22,14 @@ const mediaURLCache = new Map();
 app.use(express.json());
 
 const isValidTrackId = (value) => /^\d+$/.test(String(value ?? ""));
+
+const normalizeFormat = (value) => {
+  const requestedFormat = String(value ?? preferredFormat).trim();
+  return bitrateByFormat.has(requestedFormat) ? requestedFormat : preferredFormat;
+};
+
+const isWrongLicenseError = (error) =>
+  error?.name === "WrongLicense" || /wronglicense|wrong license|license/i.test(error?.message ?? "");
 
 const isTransientNetworkError = (error) =>
   /connection reset|cannot connect|timeout|timed out|econnreset|etimedout/i.test(error.message ?? "");
@@ -81,10 +95,10 @@ const ensureSDK = async () => {
   return sdkState;
 };
 
-const resolveMediaURL = async (trackId) => {
-  const cacheKey = `${trackId}:${format}`;
-  const cached = mediaURLCache.get(cacheKey);
-  if (cached?.expiresAt > Date.now()) return cached.url;
+const resolveMediaURL = async (trackId, requestedFormat = preferredFormat) => {
+  const selectedFormats = requestedFormat === preferredFormat
+    ? formatPreferences
+    : [normalizeFormat(requestedFormat)];
 
   const [{ dz }, media] = await Promise.all([
     ensureSDK(),
@@ -99,31 +113,45 @@ const resolveMediaURL = async (trackId) => {
     throw error;
   }
 
-  try {
-    const url = await dz.get_track_url(media.mediaToken, format);
-    if (!url) {
-      const error = new Error("Deezer did not return a media URL.");
-      error.name = "MediaURLNotFound";
-      error.statusCode = 404;
+  let lastError;
+  for (const selectedFormat of selectedFormats) {
+    const cacheKey = `${trackId}:${selectedFormat}`;
+    const cachedFormat = mediaURLCache.get(cacheKey);
+    if (cachedFormat?.expiresAt > Date.now()) return cachedFormat;
+
+    try {
+      const url = await dz.get_track_url(media.mediaToken, selectedFormat);
+      if (!url) {
+        const error = new Error("Deezer did not return a media URL.");
+        error.name = "MediaURLNotFound";
+        error.statusCode = 404;
+        throw error;
+      }
+
+      const resolved = {
+        url,
+        format: selectedFormat,
+        bitrate: bitrateByFormat.get(selectedFormat),
+        expiresAt: Date.now() + 10 * 60 * 1000,
+      };
+      mediaURLCache.set(cacheKey, resolved);
+      return resolved;
+    } catch (error) {
+      lastError = error;
+      if (isWrongLicenseError(error)) continue;
       throw error;
     }
-
-    mediaURLCache.set(cacheKey, {
-      url,
-      expiresAt: Date.now() + 10 * 60 * 1000,
-    });
-    return url;
-  } catch (error) {
-    if (error.name === "WrongLicense") {
-      const mapped = new Error(`The current Deezer session cannot stream ${format}.`);
-      mapped.name = "CantStream";
-      mapped.statusCode = 403;
-      mapped.bitrate = 3;
-      throw mapped;
-    }
-
-    throw error;
   }
+
+  if (isWrongLicenseError(lastError)) {
+    const mapped = new Error(`The current Deezer session cannot stream ${selectedFormats.join(" or ")}.`);
+    mapped.name = "CantStream";
+    mapped.statusCode = 403;
+    mapped.bitrate = bitrateByFormat.get(selectedFormats.at(-1));
+    throw mapped;
+  }
+
+  throw lastError ?? new Error("Deezer did not return a media URL.");
 };
 
 app.get("/api/connect", asyncHandler(async (_request, response) => {
@@ -141,7 +169,8 @@ app.get("/api/connect", asyncHandler(async (_request, response) => {
     },
     source: "Noirwave Backend",
     playback: "deezer-sdk",
-    format,
+    format: preferredFormat,
+    fallbackFormat,
   });
 }));
 
@@ -227,21 +256,21 @@ app.get("/api/playback/:trackId", asyncHandler(async (request, response) => {
   }
 
   try {
-    await resolveMediaURL(request.params.trackId);
+    const resolved = await resolveMediaURL(request.params.trackId);
+    response.json({
+      result: true,
+      format: resolved.format,
+      bitrate: resolved.bitrate,
+      streamURL: `http://${host}:${port}/api/stream/${encodeURIComponent(request.params.trackId)}?format=${encodeURIComponent(resolved.format)}`,
+    });
   } catch (error) {
     if (error.name === "CantStream") {
-      response.status(403).json({ result: false, errid: "CantStream", bitrate: error.bitrate ?? 3, format });
+      response.status(403).json({ result: false, errid: "CantStream", bitrate: error.bitrate ?? 1, format: fallbackFormat });
       return;
     }
 
     throw error;
   }
-
-  response.json({
-    result: true,
-    format,
-    streamURL: `http://${host}:${port}/api/stream/${encodeURIComponent(request.params.trackId)}`,
-  });
 }));
 
 app.get("/api/stream/:trackId", asyncHandler(async (request, response) => {
@@ -250,18 +279,19 @@ app.get("/api/stream/:trackId", asyncHandler(async (request, response) => {
     return;
   }
 
-  const [{ deemix }, mediaURL] = await Promise.all([
+  const requestedFormat = normalizeFormat(request.query.format);
+  const [{ deemix }, resolved] = await Promise.all([
     ensureSDK(),
-    resolveMediaURL(request.params.trackId),
+    resolveMediaURL(request.params.trackId, requestedFormat),
   ]);
 
-  if (!mediaURL) {
-    response.status(404).json({ result: false, errid: "MediaURLNotFound", bitrate: 3 });
+  if (!resolved?.url) {
+    response.status(404).json({ result: false, errid: "MediaURLNotFound", bitrate: bitrateByFormat.get(requestedFormat), format: requestedFormat });
     return;
   }
 
   streamDeezerMedia({
-    mediaURL,
+    mediaURL: resolved.url,
     trackId: request.params.trackId,
     response,
     utils: deemix.utils,

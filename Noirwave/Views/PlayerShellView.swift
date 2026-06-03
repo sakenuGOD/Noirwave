@@ -961,12 +961,8 @@ private struct PlaybackStatusLine: View {
 
 private struct LyricsPanelView: View {
     @EnvironmentObject private var store: PlayerStore
+    @State private var isShowingExpandedLyrics = false
     let track: Track
-
-    private var activeLineIndex: Int? {
-        guard case .loaded(let lyrics) = store.lyricsState else { return nil }
-        return lyrics.activeLineIndex(at: store.progress)
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -974,18 +970,25 @@ private struct LyricsPanelView: View {
                 Label("Lyrics", systemImage: "text.quote")
                     .font(.system(size: 15, weight: .semibold))
                 Spacer()
-                if case .loaded(let lyrics) = store.lyricsState,
-                   lyrics.hasSynchronizedLines {
-                    Text("Synced")
-                        .font(.system(size: 10, weight: .bold, design: .rounded))
-                        .foregroundStyle(track.palette.accent)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(track.palette.accent.opacity(0.14), in: Capsule())
+
+                Button {
+                    isShowingExpandedLyrics = true
+                } label: {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 12, weight: .semibold))
                 }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white.opacity(0.72))
+                .frame(width: 28, height: 24)
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .stroke(.white.opacity(0.08), lineWidth: 1)
+                )
+                .help("Expand lyrics")
             }
 
-            content
+            LyricsReaderContentView(track: track, isExpanded: false)
         }
         .padding(12)
         .frame(minHeight: 220, maxHeight: 310)
@@ -994,6 +997,74 @@ private struct LyricsPanelView: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(.white.opacity(0.07), lineWidth: 1)
         )
+        .sheet(isPresented: $isShowingExpandedLyrics) {
+            ExpandedLyricsSheet(track: track)
+                .environmentObject(store)
+        }
+    }
+}
+
+private struct ExpandedLyricsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let track: Track
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 14) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(track.title)
+                        .font(.system(size: 24, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+
+                    Text([track.artist, track.album].filter { !$0.isEmpty }.joined(separator: " • "))
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.58))
+                        .lineLimit(1)
+                }
+
+                Spacer()
+
+                Button {
+                    dismiss()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 12, weight: .bold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white.opacity(0.7))
+                .frame(width: 30, height: 30)
+                .background(.thinMaterial, in: Circle())
+                .overlay(
+                    Circle()
+                        .stroke(.white.opacity(0.08), lineWidth: 1)
+                )
+                .help("Close")
+            }
+
+            LyricsReaderContentView(track: track, isExpanded: true)
+        }
+        .padding(22)
+        .frame(minWidth: 560, idealWidth: 660, minHeight: 640, idealHeight: 760)
+        .background {
+            ZStack {
+                track.palette.base.opacity(0.56)
+                track.palette.mid.opacity(0.32)
+                Rectangle().fill(.regularMaterial)
+            }
+            .ignoresSafeArea()
+        }
+    }
+}
+
+private struct LyricsReaderContentView: View {
+    @EnvironmentObject private var store: PlayerStore
+    let track: Track
+    let isExpanded: Bool
+
+    private var activeLineIndex: Int? {
+        guard case .loaded(let lyrics) = store.lyricsState else { return nil }
+        return lyrics.activeLineIndex(at: store.progress)
     }
 
     @ViewBuilder
@@ -1029,21 +1100,31 @@ private struct LyricsPanelView: View {
         }
     }
 
+    var body: some View {
+        content
+    }
+
     private func synchronizedLyrics(_ lyrics: TrackLyrics) -> some View {
         ScrollViewReader { proxy in
-            ScrollView(showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 12) {
+            ScrollView(showsIndicators: isExpanded) {
+                VStack(alignment: .leading, spacing: isExpanded ? 18 : 12) {
                     ForEach(Array(lyrics.lines.enumerated()), id: \.offset) { index, line in
                         LyricsLineView(
                             text: line.text,
                             isActive: index == activeLineIndex,
-                            accent: track.palette.accent
+                            accent: track.palette.accent,
+                            isExpanded: isExpanded
                         )
                         .id(index)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.vertical, 6)
+                .padding(.vertical, isExpanded ? 18 : 6)
+                .padding(.trailing, isExpanded ? 18 : 0)
+            }
+            .onAppear {
+                guard let activeLineIndex else { return }
+                proxy.scrollTo(activeLineIndex, anchor: .center)
             }
             .onChange(of: activeLineIndex) { _, index in
                 guard let index else { return }
@@ -1055,14 +1136,15 @@ private struct LyricsPanelView: View {
     }
 
     private func plainLyrics(_ lyrics: TrackLyrics) -> some View {
-        ScrollView(showsIndicators: false) {
+        ScrollView(showsIndicators: isExpanded) {
             Text(lyrics.text)
-                .font(.system(size: 14, weight: .semibold, design: .rounded))
-                .lineSpacing(7)
+                .font(.system(size: isExpanded ? 19 : 14, weight: .semibold, design: .rounded))
+                .lineSpacing(isExpanded ? 11 : 7)
                 .foregroundStyle(.white.opacity(0.82))
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .textSelection(.enabled)
-                .padding(.vertical, 6)
+                .padding(.vertical, isExpanded ? 18 : 6)
+                .padding(.trailing, isExpanded ? 18 : 0)
         }
     }
 }
@@ -1071,11 +1153,16 @@ private struct LyricsLineView: View {
     let text: String
     let isActive: Bool
     let accent: Color
+    let isExpanded: Bool
 
     var body: some View {
         Text(text)
-            .font(.system(size: isActive ? 17 : 13, weight: isActive ? .bold : .semibold, design: .rounded))
-            .lineSpacing(4)
+            .font(.system(
+                size: isExpanded ? (isActive ? 25 : 18) : (isActive ? 17 : 13),
+                weight: isActive ? .bold : .semibold,
+                design: .rounded
+            ))
+            .lineSpacing(isExpanded ? 8 : 4)
             .foregroundStyle(isActive ? accent : .white.opacity(0.48))
             .scaleEffect(isActive ? 1.01 : 1, anchor: .leading)
             .animation(.snappy(duration: 0.16), value: isActive)

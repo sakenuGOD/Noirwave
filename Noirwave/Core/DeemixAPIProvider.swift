@@ -817,7 +817,7 @@ enum DeemixAPIPlaybackFailureMapper {
 enum DeemixAPIBitrate {
     static let mp3_320 = 3
     static let mp3_128 = 1
-    static let fullTrackPlaybackPreferences = [mp3_320]
+    static let fullTrackPlaybackPreferences = [mp3_320, mp3_128]
 
     static func displayLabel(for bitrate: Int) -> String {
         switch bitrate {
@@ -1157,7 +1157,7 @@ final class DeemixAPIProvider: MusicProviding {
                 savedARL: savedARL
             )
             let qualityMessage = response.currentUser?.canStreamHQ == false
-                ? "MP3 320 unavailable"
+                ? "MP3 128 fallback ready"
                 : "MP3 320 ready"
             return ProviderStatus(
                 authorization: .authorized,
@@ -1209,6 +1209,7 @@ final class DeemixAPIProvider: MusicProviding {
         player = AVPlayer(playerItem: item)
         lastPlaybackFileURL = playbackURL
         player?.play()
+        try await waitUntilReadyToPlay(item)
     }
 
     func resume() async throws {
@@ -1264,6 +1265,29 @@ final class DeemixAPIProvider: MusicProviding {
         }
 
         return url
+    }
+
+    private func waitUntilReadyToPlay(_ item: AVPlayerItem, timeout: TimeInterval = 8) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+
+        while Date() < deadline {
+            try Task.checkCancellation()
+
+            switch item.status {
+            case .readyToPlay:
+                return
+            case .failed:
+                throw MusicProviderError.providerNotReady(
+                    item.error?.localizedDescription.nonEmpty ?? "Backend stream failed before audio playback."
+                )
+            case .unknown:
+                try await Task.sleep(for: .milliseconds(100))
+            @unknown default:
+                throw MusicProviderError.playbackDidNotStart("unknown AVPlayerItem status")
+            }
+        }
+
+        throw MusicProviderError.playbackDidNotStart("waiting for backend stream")
     }
 
     private func existingDownloadedFileURL(for track: Track) async throws -> URL? {

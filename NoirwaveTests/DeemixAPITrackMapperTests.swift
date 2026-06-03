@@ -130,9 +130,28 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         XCTAssertFalse(DeemixAPIPlaybackURLResolver.shouldUsePreviewFallback(after: error))
     }
 
-    func testRequestsHighQualityFullTrackBeforeDefaultBitrate() {
-        XCTAssertEqual(DeemixAPIBitrate.fullTrackPlaybackPreferences, [3])
+    func testRequestsHighQualityFullTrackBeforeFreeFallbackBitrate() {
+        XCTAssertEqual(DeemixAPIBitrate.fullTrackPlaybackPreferences, [3, 1])
         XCTAssertEqual(DeemixAPIBitrate.displayLabel(for: 3), "320 kbps")
+        XCTAssertEqual(DeemixAPIBitrate.displayLabel(for: 1), "128 kbps")
+    }
+
+    func testDecodesBackendPlaybackFallbackResponse() throws {
+        let data = Data("""
+        {
+          "result": true,
+          "format": "MP3_128",
+          "bitrate": 1,
+          "streamURL": "http://127.0.0.1:6605/api/stream/13791932?format=MP3_128"
+        }
+        """.utf8)
+
+        let response = try JSONDecoder().decode(DeemixAPIPlaybackResponse.self, from: data)
+
+        XCTAssertTrue(response.result)
+        XCTAssertEqual(response.format, "MP3_128")
+        XCTAssertEqual(response.bitrate, 1)
+        XCTAssertEqual(response.streamURL, "http://127.0.0.1:6605/api/stream/13791932?format=MP3_128")
     }
 
     func testMapsArtistSearchMetadataForNativeCards() {

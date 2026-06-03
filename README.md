@@ -66,13 +66,15 @@ The backend is a local headless service. It uses:
   stream helper.
 
 Visible app flow does not use the Deemix WebUI. Playback resolves a Deezer track
-id, requests MP3 320 kbps, and streams the audio through:
+id, requests MP3 320 kbps first, falls back to MP3 128 kbps for free sessions,
+and streams the audio through:
 
 - `GET /api/playback/:trackId`
 - `GET /api/stream/:trackId`
 
-Noirwave does not fall back to 128 kbps or 30-second previews. If the current
-ARL cannot stream MP3 320, playback fails with a bitrate-specific message.
+Noirwave does not fall back to 30-second previews. If the current ARL cannot
+stream MP3 320, the backend retries MP3 128 and returns the playable stream URL
+with the selected format in the query string.
 
 Useful backend endpoints:
 
