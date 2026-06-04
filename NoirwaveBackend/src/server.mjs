@@ -2,7 +2,7 @@ import express from "express";
 import { callCatalog } from "./pythonCatalog.mjs";
 import { loadDeemixModules } from "./deemixModules.mjs";
 import { readARL, setRuntimeARL } from "./session.mjs";
-import { streamDeezerMedia } from "./streaming.mjs";
+import { parseRangeHeader, streamDeezerMedia } from "./streaming.mjs";
 import { normalizeLyricsPayload } from "./lyricsMapper.mjs";
 
 const app = express();
@@ -40,6 +40,13 @@ const selectFormatsForSession = (currentUser, requestedFormat) => {
   const selectedFormats = candidates.filter((format) => sessionCanUseFormat(currentUser, format));
 
   return selectedFormats.length > 0 ? selectedFormats : [fallbackFormat];
+};
+
+const estimatedSizeForFormat = (media, format) => {
+  const size = format === "MP3_320"
+    ? Number(media.estimatedSize320)
+    : Number(media.estimatedSize128);
+  return Number.isSafeInteger(size) && size > 0 ? size : null;
 };
 
 const isWrongLicenseError = (error) =>
@@ -138,6 +145,21 @@ const asyncHandler = (handler) => async (request, response) => {
   }
 };
 
+const applyStreamProbeHeaders = (response, { range, size }) => {
+  response.status(range ? 206 : 200);
+  response.setHeader("Content-Type", "audio/mpeg");
+  response.setHeader("Cache-Control", "no-store");
+  response.setHeader("Accept-Ranges", "bytes");
+  response.setHeader("X-Content-Type-Options", "nosniff");
+
+  if (range) {
+    response.setHeader("Content-Range", `bytes ${range.start}-${range.end}/${range.total}`);
+    response.setHeader("Content-Length", String(range.contentLength));
+  } else if (Number.isSafeInteger(size) && size > 0) {
+    response.setHeader("Content-Length", String(size));
+  }
+};
+
 const ensureSDK = async () => {
   if (sdkState) return sdkState;
 
@@ -193,6 +215,7 @@ const resolveMediaURL = async (trackId, requestedFormat = preferredFormat) => {
         url,
         format: selectedFormat,
         bitrate: bitrateByFormat.get(selectedFormat),
+        size: estimatedSizeForFormat(media, selectedFormat),
         expiresAt: Date.now() + 10 * 60 * 1000,
       };
       mediaURLCache.set(cacheKey, resolved);
@@ -335,6 +358,28 @@ app.get("/api/playback/:trackId", asyncHandler(async (request, response) => {
   }
 }));
 
+app.head("/api/stream/:trackId", asyncHandler(async (request, response) => {
+  if (!isValidTrackId(request.params.trackId)) {
+    response.status(400).end();
+    return;
+  }
+
+  const requestedFormat = normalizeFormat(request.query.format);
+  const resolved = await resolveMediaURL(request.params.trackId, requestedFormat);
+  const range = parseRangeHeader(request.headers.range, resolved.size);
+
+  if (range === "unsatisfiable") {
+    response
+      .status(416)
+      .set("Content-Range", `bytes */${resolved.size}`)
+      .end();
+    return;
+  }
+
+  applyStreamProbeHeaders(response, { range, size: resolved.size });
+  response.end();
+}));
+
 app.get("/api/stream/:trackId", asyncHandler(async (request, response) => {
   if (!isValidTrackId(request.params.trackId)) {
     response.status(400).json({ result: false, errid: "InvalidTrackId", error: "trackId must be numeric" });
@@ -352,11 +397,21 @@ app.get("/api/stream/:trackId", asyncHandler(async (request, response) => {
     return;
   }
 
+  const range = parseRangeHeader(request.headers.range, resolved.size);
+  if (range === "unsatisfiable") {
+    response
+      .status(416)
+      .set("Content-Range", `bytes */${resolved.size}`)
+      .end();
+    return;
+  }
+
   streamDeezerMedia({
     mediaURL: resolved.url,
     trackId: request.params.trackId,
     response,
     utils: deemix.utils,
+    range,
   });
 }));
 
