@@ -160,6 +160,21 @@ const applyStreamProbeHeaders = (response, { range, size }) => {
   }
 };
 
+const logStreamRequest = (request, { resolved, range, status }) => {
+  console.log("[stream]", {
+    method: request.method,
+    trackId: request.params.trackId,
+    requestRange: request.headers.range ?? null,
+    status,
+    responseRange: range && range !== "unsatisfiable"
+      ? `bytes ${range.start}-${range.end}/${range.total}`
+      : null,
+    format: resolved?.format ?? null,
+    bitrate: resolved?.bitrate ?? null,
+    size: resolved?.size ?? null,
+  });
+};
+
 const ensureSDK = async () => {
   if (sdkState) return sdkState;
 
@@ -369,6 +384,7 @@ app.head("/api/stream/:trackId", asyncHandler(async (request, response) => {
   const range = parseRangeHeader(request.headers.range, resolved.size);
 
   if (range === "unsatisfiable") {
+    logStreamRequest(request, { resolved, range, status: 416 });
     response
       .status(416)
       .set("Content-Range", `bytes */${resolved.size}`)
@@ -376,6 +392,7 @@ app.head("/api/stream/:trackId", asyncHandler(async (request, response) => {
     return;
   }
 
+  logStreamRequest(request, { resolved, range, status: range ? 206 : 200 });
   applyStreamProbeHeaders(response, { range, size: resolved.size });
   response.end();
 }));
@@ -399,6 +416,7 @@ app.get("/api/stream/:trackId", asyncHandler(async (request, response) => {
 
   const range = parseRangeHeader(request.headers.range, resolved.size);
   if (range === "unsatisfiable") {
+    logStreamRequest(request, { resolved, range, status: 416 });
     response
       .status(416)
       .set("Content-Range", `bytes */${resolved.size}`)
@@ -406,6 +424,7 @@ app.get("/api/stream/:trackId", asyncHandler(async (request, response) => {
     return;
   }
 
+  logStreamRequest(request, { resolved, range, status: range ? 206 : 200 });
   streamDeezerMedia({
     mediaURL: resolved.url,
     trackId: request.params.trackId,

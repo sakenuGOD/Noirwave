@@ -166,6 +166,12 @@ const applyAudioHeaders = (response, range) => {
 };
 
 const sendStreamFailure = (response, error) => {
+  console.error("[stream] upstream failure", {
+    code: error?.code ?? null,
+    name: error?.name ?? null,
+    message: error?.message ?? null,
+  });
+
   if (response.headersSent) {
     response.destroy(error);
     return;
