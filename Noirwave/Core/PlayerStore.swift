@@ -57,7 +57,9 @@ final class PlayerStore: ObservableObject {
             errorMessage = error.localizedDescription
         }
 
-        guard providerStatus.authorization == .authorized else {
+        guard providerStatus.authorization == .authorized,
+              providerStatus.canPlayCatalogContent
+        else {
             applyFeaturedTracks([])
             return
         }

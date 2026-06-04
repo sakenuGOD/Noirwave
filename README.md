@@ -40,15 +40,15 @@ Full-track playback needs a Deezer ARL session. Use `Stream Session` in the app
 sidebar:
 
 - `Connect ARL` sends the pasted ARL to the local backend for the current
-  process.
-- `Use Saved ARL` asks the backend to use the saved local session it can already
-  read.
+  process and saves it in the macOS Keychain for the next launch.
+- `Use Saved ARL` refreshes the source and lets the app restore the backend
+  session from Keychain automatically.
 
-The backend reads ARL in this order:
+Noirwave restores ARL in this order:
 
-1. ARL connected from the app.
+1. ARL connected from the app and saved in Keychain.
 2. `NOIRWAVE_DEEZER_ARL`.
-3. `~/Library/Application Support/deemix/login.json`.
+3. Backend-readable `~/Library/Application Support/deemix/login.json`.
 
 Noirwave does not write ARL into the Swift app bundle or source tree.
 
@@ -67,14 +67,13 @@ The backend is a local headless service. It uses:
 
 Visible app flow does not use the Deemix WebUI. Playback resolves a Deezer track
 id, requests MP3 320 kbps first, falls back to MP3 128 kbps for free sessions,
-and streams the audio through:
+and streams the audio directly through:
 
-- `GET /api/playback/:trackId`
 - `GET /api/stream/:trackId`
 
 Noirwave does not fall back to 30-second previews. If the current ARL cannot
 stream MP3 320, the backend retries MP3 128 and returns the playable stream URL
-with the selected format in the query string.
+from the same stream request.
 
 Useful backend endpoints:
 

@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import Security
 
 struct DeemixAPISearchResponse: Decodable {
     let data: [DeemixAPITrackPayload]?
@@ -848,6 +849,51 @@ enum DeemixAPIPlaybackURLResolver {
     }
 }
 
+enum DeemixAPIStreamURLResolver {
+    static func streamURL(baseURL: URL, track: Track, format: String? = nil) throws -> URL {
+        guard let trackID = deezerTrackID(from: track) else {
+            throw MusicProviderError.trackUnavailable
+        }
+
+        return try streamURL(baseURL: baseURL, trackID: trackID, format: format)
+    }
+
+    static func streamURL(baseURL: URL, trackID: String, format: String? = nil) throws -> URL {
+        guard trackID.range(of: #"^\d+$"#, options: .regularExpression) != nil else {
+            throw MusicProviderError.trackUnavailable
+        }
+
+        guard var components = URLComponents(
+            url: baseURL
+                .appendingPathComponent("api")
+                .appendingPathComponent("stream")
+                .appendingPathComponent(trackID),
+            resolvingAgainstBaseURL: false
+        ) else {
+            throw MusicProviderError.providerNotReady("Invalid backend stream URL.")
+        }
+
+        if let format = format?.nonEmpty {
+            components.queryItems = [URLQueryItem(name: "format", value: format)]
+        }
+
+        guard let url = components.url else {
+            throw MusicProviderError.providerNotReady("Invalid backend stream request.")
+        }
+
+        return url
+    }
+
+    private static func deezerTrackID(from track: Track) -> String? {
+        guard track.id.hasPrefix("deemix-api.") else {
+            return nil
+        }
+
+        let id = String(track.id.dropFirst("deemix-api.".count))
+        return id.hasPrefix("fallback-") ? nil : id
+    }
+}
+
 enum DeemixAPISessionSecret {
     private static let minimumLength = 32
 
@@ -860,6 +906,96 @@ enum DeemixAPISessionSecret {
         }
 
         return normalized
+    }
+}
+
+enum DeemixAPISessionVaultError: LocalizedError {
+    case invalidARL
+    case keychainFailure(OSStatus)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidARL:
+            "Enter a valid Deezer session token."
+        case .keychainFailure(let status):
+            "Could not save Deezer session in Keychain (status \(status))."
+        }
+    }
+}
+
+struct DeemixAPISessionVault {
+    static let app = DeemixAPISessionVault(
+        service: "com.fsociety.noirwave.deezer",
+        account: "arl"
+    )
+
+    let service: String
+    let account: String
+
+    func savedARL() throws -> String? {
+        var query = baseQuery
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status == errSecItemNotFound {
+            return nil
+        }
+
+        guard status == errSecSuccess else {
+            throw DeemixAPISessionVaultError.keychainFailure(status)
+        }
+
+        guard let data = item as? Data,
+              let value = String(data: data, encoding: .utf8)
+        else {
+            return nil
+        }
+
+        return DeemixAPISessionSecret.normalizedARL(value)
+    }
+
+    func saveARL(_ value: String) throws {
+        guard let normalizedARL = DeemixAPISessionSecret.normalizedARL(value) else {
+            throw DeemixAPISessionVaultError.invalidARL
+        }
+
+        let data = Data(normalizedARL.utf8)
+        let attributes = [kSecValueData as String: data]
+        let updateStatus = SecItemUpdate(baseQuery as CFDictionary, attributes as CFDictionary)
+
+        if updateStatus == errSecSuccess {
+            return
+        }
+
+        if updateStatus != errSecItemNotFound {
+            throw DeemixAPISessionVaultError.keychainFailure(updateStatus)
+        }
+
+        var addQuery = baseQuery
+        addQuery[kSecValueData as String] = data
+        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+
+        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        guard addStatus == errSecSuccess else {
+            throw DeemixAPISessionVaultError.keychainFailure(addStatus)
+        }
+    }
+
+    func deleteSavedARL() throws {
+        let status = SecItemDelete(baseQuery as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw DeemixAPISessionVaultError.keychainFailure(status)
+        }
+    }
+
+    private var baseQuery: [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
     }
 }
 
@@ -974,6 +1110,10 @@ struct DeemixAPIClient {
         try await get("playback/\(trackID)", queryItems: [])
     }
 
+    func streamURL(trackID: String, format: String? = nil) throws -> URL {
+        try DeemixAPIStreamURLResolver.streamURL(baseURL: baseURL, trackID: trackID, format: format)
+    }
+
     func lyrics(trackID: String) async throws -> DeemixAPILyricsResponse {
         try await get("lyrics/\(trackID)", queryItems: [])
     }
@@ -1038,6 +1178,7 @@ final class DeemixAPIProvider: MusicProviding {
     private static let arlEnvironmentKey = "NOIRWAVE_DEEZER_ARL"
     private let client: DeemixAPIClient
     private let downloadTimeout: TimeInterval
+    private let sessionVault: DeemixAPISessionVault
     private var player: AVPlayer?
     private var lastPlaybackFileURL: URL?
     private var didAttemptDownloadLogin = false
@@ -1049,10 +1190,12 @@ final class DeemixAPIProvider: MusicProviding {
 
     init(
         client: DeemixAPIClient = DeemixAPIClient(baseURL: DeemixAPIProvider.defaultBaseURL()),
-        downloadTimeout: TimeInterval = 180
+        downloadTimeout: TimeInterval = 180,
+        sessionVault: DeemixAPISessionVault = .app
     ) {
         self.client = client
         self.downloadTimeout = downloadTimeout
+        self.sessionVault = sessionVault
     }
 
     func featuredTracks() async throws -> [Track] {
@@ -1149,22 +1292,20 @@ final class DeemixAPIProvider: MusicProviding {
     func currentStatus() async throws -> ProviderStatus {
         do {
             let response = try await client.connect()
-            let available = response.deezerAvailable ?? "unknown"
-            let savedARL = ProcessInfo.processInfo.environment[Self.arlEnvironmentKey]
-                ?? response.singleUser?.arl
-            let loginMessage = DeemixAPISessionState.playbackMessage(
-                autologin: response.autologin,
-                savedARL: savedARL
-            )
-            let qualityMessage = response.currentUser?.canStreamHQ == false
-                ? "MP3 128 fallback ready"
-                : "MP3 320 ready"
-            return ProviderStatus(
-                authorization: .authorized,
-                canPlayCatalogContent: true,
-                message: "Source ready: \(available), \(loginMessage), \(qualityMessage)"
-            )
+            return providerStatus(from: response)
         } catch {
+            if let restoredStatus = await restoreSavedSessionStatus() {
+                return restoredStatus
+            }
+
+            if Self.isMissingSessionError(error) {
+                return ProviderStatus(
+                    authorization: .authorized,
+                    canPlayCatalogContent: false,
+                    message: "Backend session inactive."
+                )
+            }
+
             return ProviderStatus(
                 authorization: .unsupported,
                 canPlayCatalogContent: false,
@@ -1178,14 +1319,8 @@ final class DeemixAPIProvider: MusicProviding {
             throw MusicProviderError.providerNotReady("Enter a valid Deezer session token.")
         }
 
-        let login = try await client.loginArl(normalizedARL)
-        guard let status = login.status,
-              [1, 2, 3].contains(status)
-        else {
-            throw MusicProviderError.providerNotReady("Backend session activation failed.")
-        }
-
-        didAttemptDownloadLogin = false
+        try await activateBackendSession(normalizedARL)
+        try sessionVault.saveARL(normalizedARL)
         return try await currentStatus()
     }
 
@@ -1203,7 +1338,7 @@ final class DeemixAPIProvider: MusicProviding {
             throw MusicProviderError.trackUnavailable
         }
 
-        let playbackURL = try await fullTrackURL(for: track)
+        let playbackURL = try DeemixAPIStreamURLResolver.streamURL(baseURL: client.baseURL, track: track)
         let item = AVPlayerItem(url: playbackURL)
         item.preferredForwardBufferDuration = 2
         item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
@@ -1211,11 +1346,11 @@ final class DeemixAPIProvider: MusicProviding {
         let streamPlayer = AVPlayer(playerItem: item)
         streamPlayer.automaticallyWaitsToMinimizeStalling = false
 
-        cleanupLastPlaybackFile(except: playbackURL)
+        cleanupLastPlaybackFile()
         player = streamPlayer
-        lastPlaybackFileURL = playbackURL
+        lastPlaybackFileURL = nil
         streamPlayer.play()
-        try await waitUntilReadyToPlay(item)
+        try await waitUntilPlaybackAccepted(item, player: streamPlayer)
     }
 
     func resume() async throws {
@@ -1243,6 +1378,58 @@ final class DeemixAPIProvider: MusicProviding {
     func currentPlaybackTime() -> TimeInterval? {
         let seconds = player?.currentTime().seconds
         return seconds?.isFinite == true ? seconds : nil
+    }
+
+    private func providerStatus(from response: DeemixAPIConnectResponse) -> ProviderStatus {
+        let available = response.deezerAvailable ?? "unknown"
+        let savedARL = ProcessInfo.processInfo.environment[Self.arlEnvironmentKey]
+            ?? (try? sessionVault.savedARL())
+            ?? response.singleUser?.arl
+        let loginMessage = DeemixAPISessionState.playbackMessage(
+            autologin: response.autologin,
+            savedARL: savedARL
+        )
+        let qualityMessage = response.currentUser?.canStreamHQ == false
+            ? "MP3 128 fallback ready"
+            : "MP3 320 ready"
+
+        return ProviderStatus(
+            authorization: .authorized,
+            canPlayCatalogContent: true,
+            message: "Source ready: \(available), \(loginMessage), \(qualityMessage)"
+        )
+    }
+
+    private func restoreSavedSessionStatus() async -> ProviderStatus? {
+        guard let savedARL = try? sessionVault.savedARL() else {
+            return nil
+        }
+
+        do {
+            try await activateBackendSession(savedARL)
+            return providerStatus(from: try await client.connect())
+        } catch {
+            return nil
+        }
+    }
+
+    private func activateBackendSession(_ arl: String) async throws {
+        let login = try await client.loginArl(arl)
+        guard let status = login.status,
+              [1, 2, 3].contains(status)
+        else {
+            throw MusicProviderError.providerNotReady("Backend session activation failed.")
+        }
+
+        didAttemptDownloadLogin = false
+    }
+
+    private static func isMissingSessionError(_ error: Error) -> Bool {
+        let message = error.localizedDescription
+        return message.localizedCaseInsensitiveContains("no deezer session")
+            || message.localizedCaseInsensitiveContains("session inactive")
+            || message.localizedCaseInsensitiveContains("session token")
+            || message.localizedCaseInsensitiveContains("notloggedin")
     }
 
     private static func defaultBaseURL() -> URL {
@@ -1273,7 +1460,11 @@ final class DeemixAPIProvider: MusicProviding {
         return url
     }
 
-    private func waitUntilReadyToPlay(_ item: AVPlayerItem, timeout: TimeInterval = 15) async throws {
+    private func waitUntilPlaybackAccepted(
+        _ item: AVPlayerItem,
+        player: AVPlayer,
+        timeout: TimeInterval = 1.5
+    ) async throws {
         let deadline = Date().addingTimeInterval(timeout)
 
         while Date() < deadline {
@@ -1287,13 +1478,20 @@ final class DeemixAPIProvider: MusicProviding {
                     item.error?.localizedDescription.nonEmpty ?? "Backend stream failed before audio playback."
                 )
             case .unknown:
+                if player.timeControlStatus != .paused {
+                    return
+                }
                 try await Task.sleep(for: .milliseconds(100))
             @unknown default:
                 throw MusicProviderError.playbackDidNotStart("unknown AVPlayerItem status")
             }
         }
 
-        throw MusicProviderError.playbackDidNotStart("waiting for backend stream")
+        if item.status == .failed {
+            throw MusicProviderError.providerNotReady(
+                item.error?.localizedDescription.nonEmpty ?? "Backend stream failed before audio playback."
+            )
+        }
     }
 
     private func existingDownloadedFileURL(for track: Track) async throws -> URL? {
