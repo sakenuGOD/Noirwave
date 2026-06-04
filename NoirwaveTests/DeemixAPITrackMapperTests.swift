@@ -154,6 +154,38 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         XCTAssertEqual(response.streamURL, "http://127.0.0.1:6605/api/stream/13791932?format=MP3_128")
     }
 
+    func testBuildsDirectBackendStreamURLWithoutPlaybackPreflight() throws {
+        let track = Track(
+            id: "deemix-api.13791932",
+            title: "Come As You Are",
+            artist: "Nirvana",
+            album: "Nevermind",
+            duration: 218,
+            palette: .fallback,
+            catalogID: "https://www.deezer.com/track/13791932",
+            previewURL: nil
+        )
+        let baseURL = URL(string: "http://127.0.0.1:6605")!
+
+        let streamURL = try DeemixAPIStreamURLResolver.streamURL(baseURL: baseURL, track: track)
+
+        XCTAssertEqual(streamURL.absoluteString, "http://127.0.0.1:6605/api/stream/13791932")
+    }
+
+    func testSessionVaultPersistsARLInKeychain() throws {
+        let vault = DeemixAPISessionVault(
+            service: "com.fsociety.noirwave.tests.\(UUID().uuidString)",
+            account: "deezer-arl"
+        )
+        defer { try? vault.deleteSavedARL() }
+
+        let token = "abcdefghijklmnopqrstuvwxyz1234567890"
+
+        XCTAssertNil(try vault.savedARL())
+        try vault.saveARL(" \(token)\n")
+        XCTAssertEqual(try vault.savedARL(), token)
+    }
+
     func testMapsArtistSearchMetadataForNativeCards() {
         let payload = DeemixAPIArtistPayload(
             id: 415,
