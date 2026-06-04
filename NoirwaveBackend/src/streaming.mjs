@@ -3,7 +3,9 @@ import { Transform } from "node:stream";
 
 const encryptedStreamMarkers = ["/mobile/", "/media/", "media.deezer.com"];
 const decryptWindowSize = 2048 * 3;
-const streamRetryDelayMs = 450;
+const streamResponseTimeoutMs = Math.max(1000, Number(process.env.NOIRWAVE_STREAM_RESPONSE_TIMEOUT_MS) || 2500);
+const startupResponseTimeoutMs = Math.max(1000, Number(process.env.NOIRWAVE_STARTUP_RESPONSE_TIMEOUT_MS) || 2500);
+const streamRetryDelayMs = Math.max(50, Number(process.env.NOIRWAVE_STREAM_RETRY_DELAY_MS) || 180);
 
 export const isEncryptedStreamURL = (url) => encryptedStreamMarkers.some((marker) => url.includes(marker));
 
@@ -110,6 +112,42 @@ export const createDepadStream = () => {
   });
 };
 
+const createPassThroughTransform = () => new Transform({
+  transform(chunk, _encoding, callback) {
+    callback(null, chunk);
+  },
+});
+
+export const upstreamRangeForRequest = (range, { encrypted }) => {
+  if (!range || range === "unsatisfiable") {
+    return {
+      header: null,
+      pipelineRange: null,
+      startsAtZero: true,
+    };
+  }
+
+  if (!encrypted) {
+    return {
+      header: `bytes=${range.start}-${range.end}`,
+      pipelineRange: null,
+      startsAtZero: range.start === 0,
+    };
+  }
+
+  const upstreamStart = Math.floor(range.start / decryptWindowSize) * decryptWindowSize;
+  const upstreamEnd = Math.min(range.total - 1, range.end + decryptWindowSize);
+
+  return {
+    header: `bytes=${upstreamStart}-${upstreamEnd}`,
+    pipelineRange: {
+      start: range.start - upstreamStart,
+      end: range.end - upstreamStart,
+    },
+    startsAtZero: upstreamStart === 0,
+  };
+};
+
 export const createByteRangeStream = ({ start = 0, end = Number.POSITIVE_INFINITY }) => {
   let position = 0;
   let closed = false;
@@ -151,6 +189,93 @@ export const createByteRangeStream = ({ start = 0, end = Number.POSITIVE_INFINIT
     },
   });
 };
+
+export const cachedStartupRange = (cachedStartup, range) => {
+  if (!cachedStartup?.buffer || !range || range === "unsatisfiable") return null;
+  if (range.start < 0 || range.end < range.start) return null;
+  if (range.end >= cachedStartup.buffer.length) return null;
+
+  return cachedStartup.buffer.subarray(range.start, range.end + 1);
+};
+
+export const cachedStartupPrefix = (cachedStartup, range) => {
+  if (!cachedStartup?.buffer || !range || range === "unsatisfiable") return null;
+  if (range.start !== 0 || range.end < 0 || cachedStartup.buffer.length === 0) return null;
+
+  const end = Math.min(range.end, cachedStartup.buffer.length - 1);
+  return cachedStartup.buffer.subarray(0, end + 1);
+};
+
+export const readDeezerStartupSegment = ({
+  mediaURL,
+  trackId,
+  utils,
+  byteLimit,
+  timeoutMs = startupResponseTimeoutMs,
+}) => new Promise((resolve, reject) => {
+  const encrypted = isEncryptedStreamURL(mediaURL);
+  const targetBytes = Math.max(Number(byteLimit) || 0, 0);
+  if (targetBytes === 0) {
+    resolve(Buffer.alloc(0));
+    return;
+  }
+
+  const chunks = [];
+  let totalBytes = 0;
+  let settled = false;
+
+  const source = got.stream(mediaURL, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 Noirwave/0.1",
+      ...(!encrypted ? { Range: `bytes=0-${targetBytes - 1}` } : {}),
+    },
+    https: {
+      rejectUnauthorized: false,
+    },
+    retry: {
+      limit: 0,
+    },
+    timeout: {
+      response: timeoutMs,
+    },
+  });
+  const decrypt = createStripeDecryptStream({ trackId, utils, encrypted });
+  const depad = createDepadStream();
+
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    source.destroy();
+    decrypt.destroy();
+    depad.destroy();
+    resolve(Buffer.concat(chunks, totalBytes).subarray(0, targetBytes));
+  };
+
+  const fail = (error) => {
+    if (settled) return;
+    settled = true;
+    source.destroy();
+    decrypt.destroy();
+    depad.destroy();
+    reject(error);
+  };
+
+  depad.on("data", (chunk) => {
+    if (settled) return;
+    chunks.push(chunk);
+    totalBytes += chunk.length;
+    if (totalBytes >= targetBytes) finish();
+  });
+
+  depad.once("end", finish);
+  source.once("error", fail);
+  decrypt.once("error", fail);
+  depad.once("error", fail);
+
+  source
+    .pipe(decrypt)
+    .pipe(depad);
+});
 
 const applyAudioHeaders = (response, range) => {
   if (response.headersSent) return;
@@ -213,12 +338,14 @@ export const streamDeezerMedia = ({
   };
 
   const startAttempt = () => {
-    if (didClose || response.headersSent) return;
+    if (didClose) return;
 
     attempt += 1;
+    const upstreamRange = upstreamRangeForRequest(range, { encrypted });
     const source = got.stream(mediaURL, {
       headers: {
         "User-Agent": "Mozilla/5.0 Noirwave/0.1",
+        ...(upstreamRange.header ? { Range: upstreamRange.header } : {}),
       },
       https: {
         rejectUnauthorized: false,
@@ -227,12 +354,12 @@ export const streamDeezerMedia = ({
         limit: 0,
       },
       timeout: {
-        request: 18000,
+        response: streamResponseTimeoutMs,
       },
     });
     const decrypt = createStripeDecryptStream({ trackId, utils, encrypted });
-    const depad = createDepadStream();
-    const rangeStream = range ? createByteRangeStream(range) : null;
+    const depad = upstreamRange.startsAtZero ? createDepadStream() : createPassThroughTransform();
+    const rangeStream = upstreamRange.pipelineRange ? createByteRangeStream(upstreamRange.pipelineRange) : null;
 
     activeSource = source;
     activeDecrypt = decrypt;
@@ -244,7 +371,6 @@ export const streamDeezerMedia = ({
       if (didClose) return;
 
       const canRetry = !didStartAudio
-        && !response.headersSent
         && attempt < attempts
         && isRetriableStreamError(error);
 

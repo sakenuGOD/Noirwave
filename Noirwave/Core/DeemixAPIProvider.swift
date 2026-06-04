@@ -484,6 +484,41 @@ struct DeemixAPIPlaybackResponse: Decodable {
     let error: String?
 }
 
+struct DeemixAPIPrefetchRequest: Encodable {
+    let trackIds: [String]
+    let format: String?
+    let waitForStartup: Bool?
+    let timeoutMs: Int?
+}
+
+struct DeemixAPIPrefetchResponse: Decodable {
+    let result: Bool
+    let format: String?
+    let warmed: [DeemixAPIPrefetchItem]
+}
+
+struct DeemixAPIPrefetchItem: Decodable {
+    let result: Bool
+    let trackID: String
+    let format: String?
+    let bitrate: Int?
+    let startupBytes: Int?
+    let cacheHit: Bool?
+    let errid: String?
+    let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case result
+        case trackID = "trackId"
+        case format
+        case bitrate
+        case startupBytes
+        case cacheHit
+        case errid
+        case error
+    }
+}
+
 struct DeemixAPILyricsResponse: Decodable {
     let result: Bool?
     let id: String?
@@ -747,6 +782,134 @@ enum DeemixAPITrackSorter {
     }
 }
 
+enum CatalogSearchResultComposer {
+    static func catalogResults(term: String, tracks: [Track], artists: [Track]) -> [Track] {
+        let rankedArtists = artists
+            .filter { $0.kind == .artist }
+            .sorted { lhs, rhs in
+                let lhsScore = artistScore(lhs, term: term)
+                let rhsScore = artistScore(rhs, term: term)
+                if lhsScore != rhsScore {
+                    return lhsScore > rhsScore
+                }
+
+                let lhsFans = lhs.fanCount ?? 0
+                let rhsFans = rhs.fanCount ?? 0
+                if lhsFans != rhsFans {
+                    return lhsFans > rhsFans
+                }
+
+                return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+            }
+            .prefix(3)
+
+        let rankedTracks = tracks
+            .filter(\.isPlayable)
+            .sorted { lhs, rhs in
+                let lhsScore = trackScore(lhs, term: term)
+                let rhsScore = trackScore(rhs, term: term)
+                if lhsScore != rhsScore {
+                    return lhsScore > rhsScore
+                }
+
+                let lhsRank = lhs.rank ?? 0
+                let rhsRank = rhs.rank ?? 0
+                if lhsRank != rhsRank {
+                    return lhsRank > rhsRank
+                }
+
+                return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+            }
+
+        return Array(rankedArtists) + rankedTracks
+    }
+
+    private static func artistScore(_ artist: Track, term: String) -> Int {
+        let query = normalized(term)
+        guard !query.isEmpty else {
+            return 0
+        }
+
+        let tokens = queryTokens(query)
+        let title = normalized(artist.title)
+
+        if title == query {
+            return 100
+        }
+
+        if title.contains(query) {
+            return 90
+        }
+
+        if containsAll(tokens, in: title) {
+            return 80
+        }
+
+        return 0
+    }
+
+    private static func trackScore(_ track: Track, term: String) -> Int {
+        let query = normalized(term)
+        guard !query.isEmpty else {
+            return 0
+        }
+
+        let tokens = queryTokens(query)
+        let title = normalized(track.title)
+        let artist = normalized(track.artist)
+        let album = normalized(track.album)
+
+        if title == query {
+            return 100
+        }
+
+        if title.contains(query) {
+            return 90
+        }
+
+        if containsAll(tokens, in: title) {
+            return 80
+        }
+
+        if artist == query {
+            return 75
+        }
+
+        if artist.contains(query) {
+            return 70
+        }
+
+        if containsAll(tokens, in: artist) {
+            return 65
+        }
+
+        if album.contains(query) {
+            return 50
+        }
+
+        if containsAll(tokens, in: [title, artist, album].joined(separator: " ")) {
+            return 40
+        }
+
+        return 0
+    }
+
+    private static func containsAll(_ tokens: [String], in value: String) -> Bool {
+        !tokens.isEmpty && tokens.allSatisfy { value.contains($0) }
+    }
+
+    private static func queryTokens(_ value: String) -> [String] {
+        value.split(whereSeparator: \.isWhitespace).map(String.init)
+    }
+
+    private static func normalized(_ value: String) -> String {
+        value
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .trimmed
+            .lowercased()
+    }
+}
+
 enum DeemixAPIMediaSorter {
     static func sortedArtistsByAudience(_ artists: [Track]) -> [Track] {
         artists.sorted { lhs, rhs in
@@ -818,7 +981,7 @@ enum DeemixAPIPlaybackFailureMapper {
 enum DeemixAPIBitrate {
     static let mp3_320 = 3
     static let mp3_128 = 1
-    static let fullTrackPlaybackPreferences = [mp3_320, mp3_128]
+    static let fullTrackPlaybackPreferences = [mp3_320]
 
     static func displayLabel(for bitrate: Int) -> String {
         switch bitrate {
@@ -1110,6 +1273,23 @@ struct DeemixAPIClient {
         try await get("playback/\(trackID)", queryItems: [])
     }
 
+    func prefetch(
+        trackIDs: [String],
+        format: String? = "MP3_320",
+        waitForStartup: Bool? = nil,
+        timeoutMs: Int? = nil
+    ) async throws -> DeemixAPIPrefetchResponse {
+        try await post(
+            "prefetch",
+            body: DeemixAPIPrefetchRequest(
+                trackIds: trackIDs,
+                format: format,
+                waitForStartup: waitForStartup,
+                timeoutMs: timeoutMs
+            )
+        )
+    }
+
     func streamURL(trackID: String, format: String? = nil) throws -> URL {
         try DeemixAPIStreamURLResolver.streamURL(baseURL: baseURL, trackID: trackID, format: format)
     }
@@ -1178,6 +1358,7 @@ final class DeemixAPIProvider: MusicProviding {
     private static let arlEnvironmentKey = "NOIRWAVE_DEEZER_ARL"
     private let client: DeemixAPIClient
     private let downloadTimeout: TimeInterval
+    private let immediatePlaybackPrefetchTimeoutMs = 350
     private let sessionVault: DeemixAPISessionVault
     private var player: AVPlayer?
     private var lastPlaybackFileURL: URL?
@@ -1224,11 +1405,17 @@ final class DeemixAPIProvider: MusicProviding {
 
         switch scope {
         case .catalog:
-            let payloads = try await client.searchTracks(term: term, count: 30)
+            async let trackPayloads = client.searchTracks(term: term, count: 30)
+            async let artistPayloads = client.searchArtists(term: term, count: 6)
+
+            let payloads = try await trackPayloads
             let tracks = payloads.enumerated().compactMap { index, payload in
                 try? DeemixAPITrackMapper.map(payload, fallbackIndex: index)
             }
-            return DeemixAPITrackSorter.sortedByPopularity(tracks)
+            let artists = ((try? await artistPayloads) ?? []).enumerated().map { index, payload in
+                DeemixAPITrackMapper.mapArtist(payload, fallbackIndex: index)
+            }
+            return CatalogSearchResultComposer.catalogResults(term: term, tracks: tracks, artists: artists)
         case .library:
             let payloads = try await client.searchArtists(term: term, count: 30)
             let artists = payloads.enumerated().map { index, payload in
@@ -1333,10 +1520,36 @@ final class DeemixAPIProvider: MusicProviding {
         return response.available ? response.trackLyrics : TrackLyrics(text: "", lines: [], copyright: nil, writers: nil)
     }
 
+    func prepare(_ tracks: [Track]) async {
+        var seenTrackIDs = Set<String>()
+        let trackIDs = tracks.compactMap { track -> String? in
+            guard let trackID = deezerTrackID(from: track),
+                  seenTrackIDs.insert(trackID).inserted
+            else { return nil }
+
+            return trackID
+        }
+
+        guard !trackIDs.isEmpty else { return }
+        _ = try? await client.prefetch(trackIDs: trackIDs)
+    }
+
+    private func prepareForImmediatePlayback(_ track: Track) async {
+        guard let trackID = deezerTrackID(from: track) else { return }
+
+        _ = try? await client.prefetch(
+            trackIDs: [trackID],
+            waitForStartup: true,
+            timeoutMs: immediatePlaybackPrefetchTimeoutMs
+        )
+    }
+
     func play(_ track: Track) async throws {
         guard track.isPlayable else {
             throw MusicProviderError.trackUnavailable
         }
+
+        await prepareForImmediatePlayback(track)
 
         let playbackURL = try DeemixAPIStreamURLResolver.streamURL(baseURL: client.baseURL, track: track)
         let item = AVPlayerItem(url: playbackURL)
@@ -1390,7 +1603,7 @@ final class DeemixAPIProvider: MusicProviding {
             savedARL: savedARL
         )
         let qualityMessage = response.currentUser?.canStreamHQ == false
-            ? "MP3 128 fallback ready"
+            ? "MP3 320 required; session reports HQ unavailable"
             : "MP3 320 ready"
 
         return ProviderStatus(
@@ -1472,13 +1685,16 @@ final class DeemixAPIProvider: MusicProviding {
 
             switch item.status {
             case .readyToPlay:
-                return
+                if player.timeControlStatus == .playing {
+                    return
+                }
+                try await Task.sleep(for: .milliseconds(100))
             case .failed:
                 throw MusicProviderError.providerNotReady(
                     item.error?.localizedDescription.nonEmpty ?? "Backend stream failed before audio playback."
                 )
             case .unknown:
-                if player.timeControlStatus != .paused {
+                if player.timeControlStatus == .playing {
                     return
                 }
                 try await Task.sleep(for: .milliseconds(100))
@@ -1491,6 +1707,10 @@ final class DeemixAPIProvider: MusicProviding {
             throw MusicProviderError.providerNotReady(
                 item.error?.localizedDescription.nonEmpty ?? "Backend stream failed before audio playback."
             )
+        }
+
+        if player.timeControlStatus != .playing {
+            throw MusicProviderError.playbackDidNotStart(player.timeControlStatus.noirwaveDescription)
         }
     }
 
@@ -1641,5 +1861,20 @@ final class DeemixAPIProvider: MusicProviding {
         }
 
         return "Backend failed to cache \(track.artist) - \(track.title)."
+    }
+}
+
+private extension AVPlayer.TimeControlStatus {
+    var noirwaveDescription: String {
+        switch self {
+        case .paused:
+            "paused"
+        case .waitingToPlayAtSpecifiedRate:
+            "waiting for backend stream"
+        case .playing:
+            "playing"
+        @unknown default:
+            "unknown"
+        }
     }
 }

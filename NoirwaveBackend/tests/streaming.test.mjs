@@ -3,10 +3,13 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { Readable } from "node:stream";
 import {
+  cachedStartupPrefix,
+  cachedStartupRange,
   createByteRangeStream,
   isEncryptedStreamURL,
   isRetriableStreamError,
   parseRangeHeader,
+  upstreamRangeForRequest,
 } from "../src/streaming.mjs";
 
 test("detects encrypted Deezer media URLs", () => {
@@ -52,4 +55,72 @@ test("cuts byte range streams and ends after the requested bytes", async () => {
   await once(stream, "end");
 
   assert.equal(Buffer.concat(chunks).toString("utf8"), "bcd");
+});
+
+test("serves byte ranges from cached startup segments", () => {
+  const cached = { buffer: Buffer.from("startup-bytes") };
+
+  assert.equal(cachedStartupRange(cached, { start: 0, end: 6 }).toString("utf8"), "startup");
+  assert.equal(cachedStartupRange(cached, { start: 8, end: 12 }).toString("utf8"), "bytes");
+});
+
+test("does not serve ranges that exceed cached startup segments", () => {
+  const cached = { buffer: Buffer.from("startup") };
+
+  assert.equal(cachedStartupRange(cached, { start: 0, end: 99 }), null);
+  assert.equal(cachedStartupRange(null, { start: 0, end: 1 }), null);
+  assert.equal(cachedStartupRange(cached, "unsatisfiable"), null);
+});
+
+test("serves cached startup prefix before continuing a larger range", () => {
+  const cached = { buffer: Buffer.from("startup") };
+
+  assert.equal(cachedStartupPrefix(cached, { start: 0, end: 99 }).toString("utf8"), "startup");
+  assert.equal(cachedStartupPrefix(cached, { start: 2, end: 99 }), null);
+});
+
+test("passes plain byte ranges directly to non-encrypted streams", () => {
+  assert.deepEqual(
+    upstreamRangeForRequest(
+      { start: 196608, end: 999999, total: 2000000, contentLength: 803392 },
+      { encrypted: false }
+    ),
+    {
+      header: "bytes=196608-999999",
+      pipelineRange: null,
+      startsAtZero: false,
+    }
+  );
+});
+
+test("aligns encrypted continuation ranges to Deezer decrypt windows", () => {
+  assert.deepEqual(
+    upstreamRangeForRequest(
+      { start: 196608, end: 999999, total: 2000000, contentLength: 803392 },
+      { encrypted: true }
+    ),
+    {
+      header: "bytes=196608-1006143",
+      pipelineRange: {
+        start: 0,
+        end: 803391,
+      },
+      startsAtZero: false,
+    }
+  );
+
+  assert.deepEqual(
+    upstreamRangeForRequest(
+      { start: 197000, end: 200000, total: 300000, contentLength: 3001 },
+      { encrypted: true }
+    ),
+    {
+      header: "bytes=196608-206144",
+      pipelineRange: {
+        start: 392,
+        end: 3392,
+      },
+      startsAtZero: false,
+    }
+  );
 });

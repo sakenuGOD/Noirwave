@@ -23,10 +23,12 @@ final class PlayerStore: ObservableObject {
 
     let provider: MusicProviding
 
+    private let playbackContextLimit = 16
     private var searchTask: Task<Void, Never>?
     private var playbackTask: Task<Void, Never>?
     private var progressTask: Task<Void, Never>?
     private var lyricsTask: Task<Void, Never>?
+    private var preparationTask: Task<Void, Never>?
 
     init(provider: MusicProviding) {
         self.provider = provider
@@ -47,6 +49,7 @@ final class PlayerStore: ObservableObject {
         playbackTask?.cancel()
         progressTask?.cancel()
         lyricsTask?.cancel()
+        preparationTask?.cancel()
     }
 
     func bootstrap() async {
@@ -83,6 +86,9 @@ final class PlayerStore: ObservableObject {
             return
         }
 
+        let playbackContext = playbackQueue(after: item, in: visibleTracks, limit: playbackContextLimit)
+        queue = playbackContext
+        prepare(Array(([item] + playbackContext).prefix(playbackContextLimit)))
         play(item)
     }
 
@@ -157,6 +163,7 @@ final class PlayerStore: ObservableObject {
                 guard !Task.isCancelled else { return }
                 playbackState = .playing
                 startProgressTicker()
+                preparePlaybackContext()
             } catch {
                 guard !Task.isCancelled else { return }
                 handlePlaybackFailure(error)
@@ -210,6 +217,7 @@ final class PlayerStore: ObservableObject {
     func next() {
         if !queue.isEmpty {
             let nextTrack = queue.removeFirst()
+            prepare(Array(([nextTrack] + queue).prefix(playbackContextLimit)))
             play(nextTrack)
             refillQueue(after: nextTrack)
             return
@@ -221,7 +229,9 @@ final class PlayerStore: ObservableObject {
         else { return }
 
         let nextIndex = featuredTracks.index(after: index) % featuredTracks.count
-        play(featuredTracks[nextIndex])
+        let nextTrack = featuredTracks[nextIndex]
+        prepare([nextTrack] + playbackQueue(after: nextTrack, in: featuredTracks, limit: playbackContextLimit - 1))
+        play(nextTrack)
     }
 
     func previous() {
@@ -235,7 +245,9 @@ final class PlayerStore: ObservableObject {
         }
 
         let previousIndex = index == featuredTracks.startIndex ? featuredTracks.count - 1 : index - 1
-        play(featuredTracks[previousIndex])
+        let previousTrack = featuredTracks[previousIndex]
+        prepare([previousTrack] + playbackQueue(after: previousTrack, in: featuredTracks, limit: playbackContextLimit - 1))
+        play(previousTrack)
     }
 
     func enqueue(_ track: Track) {
@@ -244,10 +256,12 @@ final class PlayerStore: ObservableObject {
               track != currentTrack
         else { return }
         queue.append(track)
+        preparePlaybackContext()
     }
 
     func removeFromQueue(_ track: Track) {
         queue.removeAll { $0 == track }
+        preparePlaybackContext()
     }
 
     func seek(to fraction: Double) {
@@ -272,6 +286,7 @@ final class PlayerStore: ObservableObject {
 
     private func runSearch() async {
         let term = searchQuery.trimmed
+        let scope = selectedScope
 
         guard !term.isEmpty else {
             isSearching = false
@@ -279,6 +294,7 @@ final class PlayerStore: ObservableObject {
             resultTitle = "Catalog Tracks"
             resultSubtitle = nil
             visibleTracks = featuredTracks
+            preparePlaybackContext()
             return
         }
 
@@ -286,14 +302,20 @@ final class PlayerStore: ObservableObject {
         defer { isSearching = false }
 
         do {
-            let results = try await provider.search(term, scope: selectedScope)
+            let results = try await provider.search(term, scope: scope)
+            guard !Task.isCancelled,
+                  term == searchQuery.trimmed,
+                  scope == selectedScope
+            else { return }
             visibleTracks = results
-            resultTitle = selectedScope.resultsTitle
+            resultTitle = scope.resultsTitle
             resultSubtitle = nil
             errorMessage = nil
+            preparePlaybackContext()
         } catch {
+            guard !Task.isCancelled else { return }
             visibleTracks = []
-            resultTitle = selectedScope.resultsTitle
+            resultTitle = scope.resultsTitle
             resultSubtitle = nil
             errorMessage = error.localizedDescription
         }
@@ -383,7 +405,9 @@ final class PlayerStore: ObservableObject {
             resultSubtitle = nil
         }
         currentTrack = tracks.first
-        queue = Array(tracks.dropFirst().filter(\.isPlayable).prefix(5))
+        queue = tracks.first.map {
+            playbackQueue(after: $0, in: tracks, limit: playbackContextLimit)
+        } ?? []
         progress = 0
         playbackState = .idle
         if let currentTrack {
@@ -392,6 +416,7 @@ final class PlayerStore: ObservableObject {
             lyricsTask?.cancel()
             lyricsState = .idle
         }
+        preparePlaybackContext()
     }
 
     private func loadLyrics(for track: Track) {
@@ -439,13 +464,69 @@ final class PlayerStore: ObservableObject {
     }
 
     private func refillQueue(after track: Track) {
-        guard queue.count < 4,
-              let index = featuredTracks.firstIndex(of: track),
-              !featuredTracks.isEmpty
-        else { return }
+        guard queue.count < playbackContextLimit else { return }
 
-        let candidate = featuredTracks[(index + 3) % featuredTracks.count]
-        enqueue(candidate)
+        let context = visibleTracks.contains(track) ? visibleTracks : featuredTracks
+        let candidates = playbackQueue(after: track, in: context, limit: playbackContextLimit)
+
+        for candidate in candidates where queue.count < playbackContextLimit {
+            guard candidate != currentTrack,
+                  !queue.contains(candidate)
+            else { continue }
+
+            queue.append(candidate)
+        }
+
+        preparePlaybackContext()
+    }
+
+    private func preparePlaybackContext() {
+        prepare(playbackPreparationCandidates(limit: playbackContextLimit))
+    }
+
+    private func prepare(_ candidates: [Track]) {
+        preparationTask?.cancel()
+
+        guard !candidates.isEmpty else { return }
+
+        preparationTask = Task { [weak self, candidates] in
+            guard let self else { return }
+            await provider.prepare(candidates)
+        }
+    }
+
+    private func playbackPreparationCandidates(limit: Int) -> [Track] {
+        var result: [Track] = []
+        var seenIDs = Set<String>()
+
+        func append(_ tracks: [Track]) {
+            for track in tracks {
+                guard result.count < limit else { return }
+                guard track.isPlayable,
+                      track != currentTrack,
+                      seenIDs.insert(track.id).inserted
+                else { continue }
+
+                result.append(track)
+            }
+        }
+
+        append(queue)
+        append(visibleTracks)
+        append(featuredTracks)
+
+        return result
+    }
+
+    private func playbackQueue(after track: Track, in context: [Track], limit: Int) -> [Track] {
+        guard let index = context.firstIndex(of: track) else { return [] }
+
+        return Array(
+            context
+                .suffix(from: context.index(after: index))
+                .filter(\.isPlayable)
+                .prefix(limit)
+        )
     }
 
     private func messageNeedsBackendSession(_ message: String?) -> Bool {

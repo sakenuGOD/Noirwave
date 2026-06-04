@@ -109,9 +109,14 @@ def track_payload(track: Any, fallback_index: int = 0, album_context: Any | None
     cover = image_url(getattr(album, "cover", None))
     album_id = getattr(album, "id", None)
     album_title = getattr(album, "display_title", None) or getattr(album, "displayTitle", None)
+    media = getattr(track, "media", None)
+    media_token = getattr(getattr(media, "token", None), "payload", None)
+    media_sizes = getattr(media, "estimated_sizes", None)
+    media_rights_sub = getattr(getattr(media, "rights", None), "sub", None)
+
     return {
         "id": track_id,
-        "readable": getattr(getattr(getattr(getattr(track, "media", None), "rights", None), "sub", None), "available", True),
+        "readable": getattr(media_rights_sub, "available", True),
         "title": getattr(track, "title", None) or "Untitled Track",
         "title_short": getattr(track, "title", None) or "Untitled Track",
         "title_version": None,
@@ -122,6 +127,11 @@ def track_payload(track: Any, fallback_index: int = 0, album_context: Any | None
         "preview": None,
         "track_position": getattr(disk_info, "track_number", None),
         "disk_number": getattr(disk_info, "disk_number", None),
+        "mediaToken": media_token,
+        "mediaVersion": getattr(media, "version", None),
+        "estimatedSize128": getattr(media_sizes, "mp_3_128", None),
+        "estimatedSize320": getattr(media_sizes, "mp_3_320", None),
+        "canStreamSub": getattr(media_rights_sub, "available", True),
         "artist": {
             "id": artist.get("id"),
             "name": artist.get("name"),

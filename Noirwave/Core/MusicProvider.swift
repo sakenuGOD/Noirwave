@@ -134,6 +134,7 @@ protocol MusicProviding: AnyObject {
     func currentStatus() async throws -> ProviderStatus
     func configureBackendSession(arl: String) async throws -> ProviderStatus
     func lyrics(for track: Track) async throws -> TrackLyrics
+    func prepare(_ tracks: [Track]) async
     func play(_ track: Track) async throws
     func resume() async throws
     func pause() async

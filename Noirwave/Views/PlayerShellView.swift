@@ -625,6 +625,14 @@ private struct TrackListView: View {
         tracks.filter(\.isPlayable)
     }
 
+    private var artistItems: [Track] {
+        tracks.filter { $0.kind == .artist }
+    }
+
+    private var albumItems: [Track] {
+        tracks.filter { $0.kind == .album }
+    }
+
     private var mediaItems: [Track] {
         tracks.filter { !$0.isPlayable }
     }
@@ -642,7 +650,13 @@ private struct TrackListView: View {
             }
         } else {
             VStack(alignment: .leading, spacing: 18) {
-                ResultSection(title: "Popular Tracks") {
+                if !artistItems.isEmpty {
+                    ResultSection(title: artistItems.count == 1 ? "Artist" : "Artists") {
+                        MediaCardGridView(items: artistItems)
+                    }
+                }
+
+                ResultSection(title: "Tracks") {
                     VStack(spacing: 7) {
                         ForEach(playableTracks) { track in
                             TrackRowView(track: track)
@@ -650,8 +664,10 @@ private struct TrackListView: View {
                     }
                 }
 
-                ResultSection(title: "Albums") {
-                    MediaCardGridView(items: mediaItems)
+                if !albumItems.isEmpty {
+                    ResultSection(title: "Albums") {
+                        MediaCardGridView(items: albumItems)
+                    }
                 }
             }
         }

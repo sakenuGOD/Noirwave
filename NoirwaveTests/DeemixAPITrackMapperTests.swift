@@ -131,10 +131,40 @@ final class DeemixAPITrackMapperTests: XCTestCase {
     }
 
     func testRequestsHighQualityFullTrackBeforeFreeFallbackBitrate() {
-        XCTAssertEqual(DeemixAPIBitrate.fullTrackPlaybackPreferences, [3, 1])
+        XCTAssertEqual(DeemixAPIBitrate.fullTrackPlaybackPreferences, [3])
         XCTAssertEqual(DeemixAPIBitrate.displayLabel(for: 3), "320 kbps")
         XCTAssertEqual(DeemixAPIBitrate.displayLabel(for: 1), "128 kbps")
     }
+
+    @MainActor
+    func testBootstrapPreparesVisiblePlaybackContextForFastSkipping() async throws {
+        let tracks = (1...12).map(Self.makePlaybackTrack)
+        let provider = PrewarmRecordingProvider(tracks: tracks)
+        let store = PlayerStore(provider: provider)
+
+        await store.bootstrap()
+        try await Task.sleep(for: .milliseconds(80))
+
+        let preparedIDs = Array(provider.preparedBatches.flatMap { $0 }.prefix(11))
+        let expectedIDs = tracks.dropFirst().map(\.id)
+        XCTAssertEqual(preparedIDs, expectedIDs)
+    }
+
+    @MainActor
+    func testCancelledSearchDoesNotSurfaceProviderError() async throws {
+        let provider = CancelledSearchProvider()
+        let store = PlayerStore(provider: provider)
+
+        await store.bootstrap()
+        store.updateSearchQuery("first")
+        try await Task.sleep(for: .milliseconds(240))
+        store.updateSearchQuery("second")
+        try await Task.sleep(for: .milliseconds(700))
+
+        XCTAssertNil(store.errorMessage)
+        XCTAssertEqual(store.visibleTracks.map(\.title), ["Track 1"])
+    }
+
 
     func testDecodesBackendPlaybackFallbackResponse() throws {
         let data = Data("""
@@ -296,6 +326,64 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         XCTAssertEqual(SearchScope.playlists.rawValue, "Albums")
     }
 
+    func testCatalogSearchComposesArtistsAndTitleMatchedTracks() {
+        let artist = Track(
+            id: "deemix-artist.100",
+            title: "Арсений Креститель",
+            artist: "Арсений Креститель",
+            album: "Artist",
+            duration: 0,
+            palette: .fallback,
+            catalogID: "https://www.deezer.com/artist/100",
+            previewURL: nil,
+            kind: .artist,
+            fanCount: 25_000,
+            albumCount: 4
+        )
+        let titleMatch = Track(
+            id: "track.title",
+            title: "Арсений Креститель",
+            artist: "Other Artist",
+            album: "Singles",
+            duration: 180,
+            palette: .fallback,
+            catalogID: "https://www.deezer.com/track/1",
+            previewURL: nil,
+            rank: 10
+        )
+        let artistMatch = Track(
+            id: "track.artist",
+            title: "Город",
+            artist: "Арсений Креститель",
+            album: "Album",
+            duration: 180,
+            palette: .fallback,
+            catalogID: "https://www.deezer.com/track/2",
+            previewURL: nil,
+            rank: 950_000
+        )
+        let looseMatch = Track(
+            id: "track.loose",
+            title: "Popular But Loose",
+            artist: "Someone Else",
+            album: "Album",
+            duration: 180,
+            palette: .fallback,
+            catalogID: "https://www.deezer.com/track/3",
+            previewURL: nil,
+            rank: 990_000
+        )
+
+        let results = CatalogSearchResultComposer.catalogResults(
+            term: "арсений креститель",
+            tracks: [looseMatch, artistMatch, titleMatch],
+            artists: [artist]
+        )
+
+        XCTAssertEqual(results.map(\.id), ["deemix-artist.100", "track.title", "track.artist", "track.loose"])
+        XCTAssertEqual(results.first?.detailLabel, "25K listeners · 4 albums")
+    }
+
     func testNormalizesBackendSessionTokenBeforeLogin() {
         XCTAssertEqual(
             DeemixAPISessionSecret.normalizedARL("  \(String(repeating: "a", count: 192))\n"),
@@ -363,5 +451,131 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         XCTAssertEqual(lyrics.lines.count, 2)
         XCTAssertEqual(lyrics.lines[1].milliseconds, 2_500)
         XCTAssertEqual(lyrics.writers, "writer one")
+    }
+
+    fileprivate static func makePlaybackTrack(_ index: Int) -> Track {
+        Track(
+            id: "deemix-api.\(1000 + index)",
+            title: "Track \(index)",
+            artist: "Artist",
+            album: "Album",
+            duration: 180,
+            palette: .fallback,
+            catalogID: "https://www.deezer.com/track/\(1000 + index)",
+            previewURL: nil
+        )
+    }
+}
+
+@MainActor
+private final class PrewarmRecordingProvider: MusicProviding {
+    let sourceName = "Prewarm Test"
+    private let tracks: [Track]
+    private(set) var preparedBatches: [[String]] = []
+
+    init(tracks: [Track]) {
+        self.tracks = tracks
+    }
+
+    func featuredTracks() async throws -> [Track] {
+        tracks
+    }
+
+    func search(_ query: String, scope: SearchScope) async throws -> [Track] {
+        tracks
+    }
+
+    func catalogItems(for item: Track) async throws -> [Track] {
+        tracks
+    }
+
+    func requestAuthorization() async throws -> ProviderStatus {
+        ProviderStatus(authorization: .authorized, canPlayCatalogContent: true, message: nil)
+    }
+
+    func currentStatus() async throws -> ProviderStatus {
+        try await requestAuthorization()
+    }
+
+    func configureBackendSession(arl: String) async throws -> ProviderStatus {
+        try await requestAuthorization()
+    }
+
+    func lyrics(for track: Track) async throws -> TrackLyrics {
+        TrackLyrics(text: "", lines: [], copyright: nil, writers: nil)
+    }
+
+    func prepare(_ tracks: [Track]) async {
+        preparedBatches.append(tracks.map(\.id))
+    }
+
+    func play(_ track: Track) async throws {}
+
+    func resume() async throws {}
+
+    func pause() async {}
+
+    func stop() async {}
+
+    func seek(to time: TimeInterval) async {}
+
+    func currentPlaybackTime() -> TimeInterval? {
+        nil
+    }
+}
+
+@MainActor
+private final class CancelledSearchProvider: MusicProviding {
+    let sourceName = "Cancelled Search Test"
+    private var searchCount = 0
+
+    func featuredTracks() async throws -> [Track] {
+        []
+    }
+
+    func search(_ query: String, scope: SearchScope) async throws -> [Track] {
+        searchCount += 1
+        if searchCount == 1 {
+            try await Task.sleep(for: .milliseconds(500))
+            throw MusicProviderError.providerNotReady("catalog_cli exited with code 1")
+        }
+
+        return [DeemixAPITrackMapperTests.makePlaybackTrack(1)]
+    }
+
+    func catalogItems(for item: Track) async throws -> [Track] {
+        []
+    }
+
+    func requestAuthorization() async throws -> ProviderStatus {
+        ProviderStatus(authorization: .authorized, canPlayCatalogContent: true, message: nil)
+    }
+
+    func currentStatus() async throws -> ProviderStatus {
+        try await requestAuthorization()
+    }
+
+    func configureBackendSession(arl: String) async throws -> ProviderStatus {
+        try await requestAuthorization()
+    }
+
+    func lyrics(for track: Track) async throws -> TrackLyrics {
+        TrackLyrics(text: "", lines: [], copyright: nil, writers: nil)
+    }
+
+    func prepare(_ tracks: [Track]) async {}
+
+    func play(_ track: Track) async throws {}
+
+    func resume() async throws {}
+
+    func pause() async {}
+
+    func stop() async {}
+
+    func seek(to time: TimeInterval) async {}
+
+    func currentPlaybackTime() -> TimeInterval? {
+        nil
     }
 }

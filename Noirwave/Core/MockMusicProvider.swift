@@ -95,13 +95,37 @@ final class MockMusicProvider: MusicProviding {
         let term = query.trimmed.lowercased()
 
         guard !term.isEmpty else {
-            return tracks
+            switch scope {
+            case .catalog:
+                return tracks
+            case .library:
+                return artistCards
+            case .playlists:
+                return albumCards
+            }
         }
 
-        return tracks.filter { track in
+        let matchingTracks = tracks.filter { track in
             track.title.lowercased().contains(term)
                 || track.artist.lowercased().contains(term)
                 || track.album.lowercased().contains(term)
+        }
+
+        switch scope {
+        case .catalog:
+            let matchingArtists = artistCards.filter { artist in
+                artist.title.lowercased().contains(term)
+            }
+            return CatalogSearchResultComposer.catalogResults(term: query, tracks: matchingTracks, artists: matchingArtists)
+        case .library:
+            return artistCards.filter { artist in
+                artist.title.lowercased().contains(term)
+            }
+        case .playlists:
+            return albumCards.filter { album in
+                album.title.lowercased().contains(term)
+                    || album.artist.lowercased().contains(term)
+            }
         }
     }
 
@@ -153,6 +177,8 @@ final class MockMusicProvider: MusicProviding {
         )
     }
 
+    func prepare(_ tracks: [Track]) async {}
+
     func play(_ track: Track) async throws {
         try await Task.sleep(for: .milliseconds(120))
     }
@@ -169,5 +195,47 @@ final class MockMusicProvider: MusicProviding {
 
     func currentPlaybackTime() -> TimeInterval? {
         nil
+    }
+
+    private var artistCards: [Track] {
+        Dictionary(grouping: tracks, by: \.artist)
+            .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
+            .enumerated()
+            .map { index, group in
+                let albums = Set(group.value.map(\.album))
+                return Track(
+                    id: "mock-artist.\(index)",
+                    title: group.key,
+                    artist: group.key,
+                    album: "Artist",
+                    duration: 0,
+                    palette: group.value.first?.palette ?? .fallback,
+                    catalogID: nil,
+                    previewURL: nil,
+                    kind: .artist,
+                    albumCount: albums.count
+                )
+            }
+    }
+
+    private var albumCards: [Track] {
+        Dictionary(grouping: tracks, by: \.album)
+            .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
+            .enumerated()
+            .map { index, group in
+                let firstTrack = group.value.first
+                return Track(
+                    id: "mock-album.\(index)",
+                    title: group.key,
+                    artist: firstTrack?.artist ?? "Unknown Artist",
+                    album: "Album",
+                    duration: 0,
+                    palette: firstTrack?.palette ?? .fallback,
+                    catalogID: nil,
+                    previewURL: nil,
+                    kind: .album,
+                    trackCount: group.value.count
+                )
+            }
     }
 }
