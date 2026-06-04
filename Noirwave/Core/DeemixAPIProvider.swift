@@ -1340,7 +1340,7 @@ final class DeemixAPIProvider: MusicProviding {
 
         let playbackURL = try DeemixAPIStreamURLResolver.streamURL(baseURL: client.baseURL, track: track)
         let item = AVPlayerItem(url: playbackURL)
-        item.preferredForwardBufferDuration = 2
+        item.preferredForwardBufferDuration = 0.75
         item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
 
         let streamPlayer = AVPlayer(playerItem: item)
@@ -1349,7 +1349,7 @@ final class DeemixAPIProvider: MusicProviding {
         cleanupLastPlaybackFile()
         player = streamPlayer
         lastPlaybackFileURL = nil
-        streamPlayer.play()
+        streamPlayer.playImmediately(atRate: 1)
         try await waitUntilPlaybackAccepted(item, player: streamPlayer)
     }
 

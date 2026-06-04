@@ -1,6 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { isEncryptedStreamURL, isRetriableStreamError, parseRangeHeader } from "../src/streaming.mjs";
+import { once } from "node:events";
+import { Readable } from "node:stream";
+import {
+  createByteRangeStream,
+  isEncryptedStreamURL,
+  isRetriableStreamError,
+  parseRangeHeader,
+} from "../src/streaming.mjs";
 
 test("detects encrypted Deezer media URLs", () => {
   assert.equal(isEncryptedStreamURL("https://e-cdns-proxy-a.dzcdn.net/mobile/1/abc"), true);
@@ -33,4 +40,16 @@ test("rejects unsatisfiable byte ranges", () => {
   assert.equal(parseRangeHeader("bytes=1000-", 1000), "unsatisfiable");
   assert.equal(parseRangeHeader("items=0-1", 1000), null);
   assert.equal(parseRangeHeader("bytes=0-1", null), null);
+});
+
+test("cuts byte range streams and ends after the requested bytes", async () => {
+  const chunks = [];
+  const stream = Readable
+    .from([Buffer.from("abcdef")])
+    .pipe(createByteRangeStream({ start: 1, end: 3 }));
+
+  stream.on("data", (chunk) => chunks.push(chunk));
+  await once(stream, "end");
+
+  assert.equal(Buffer.concat(chunks).toString("utf8"), "bcd");
 });

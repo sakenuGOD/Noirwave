@@ -11,6 +11,48 @@ export const isRetriableStreamError = (error) =>
   /connection reset|socket hang up|timeout|timed out|econnreset|etimedout|econnrefused|eai_again|enetunreach/i
     .test(`${error?.code ?? ""} ${error?.message ?? ""}`);
 
+export const parseRangeHeader = (rangeHeader, totalSize) => {
+  const total = Number(totalSize);
+  if (!Number.isSafeInteger(total) || total <= 0) return null;
+
+  const match = /^bytes=(\d*)-(\d*)$/.exec(String(rangeHeader ?? "").trim());
+  if (!match) return null;
+
+  let start;
+  let end;
+  const [, rawStart, rawEnd] = match;
+
+  if (rawStart === "" && rawEnd === "") return null;
+
+  if (rawStart === "") {
+    const suffixLength = Number(rawEnd);
+    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return "unsatisfiable";
+    start = Math.max(total - suffixLength, 0);
+    end = total - 1;
+  } else {
+    start = Number(rawStart);
+    end = rawEnd === "" ? total - 1 : Number(rawEnd);
+  }
+
+  if (
+    !Number.isSafeInteger(start)
+    || !Number.isSafeInteger(end)
+    || start < 0
+    || end < start
+    || start >= total
+  ) {
+    return "unsatisfiable";
+  }
+
+  const boundedEnd = Math.min(end, total - 1);
+  return {
+    start,
+    end: boundedEnd,
+    total,
+    contentLength: boundedEnd - start + 1,
+  };
+};
+
 export const createStripeDecryptStream = ({ trackId, utils, encrypted }) => {
   if (!encrypted) return new Transform({
     transform(chunk, _encoding, callback) {
@@ -68,13 +110,59 @@ export const createDepadStream = () => {
   });
 };
 
-const applyAudioHeaders = (response) => {
+export const createByteRangeStream = ({ start = 0, end = Number.POSITIVE_INFINITY }) => {
+  let position = 0;
+  let closed = false;
+
+  return new Transform({
+    transform(chunk, _encoding, callback) {
+      if (closed) {
+        callback();
+        return;
+      }
+
+      const chunkStart = position;
+      const chunkEnd = position + chunk.length - 1;
+      position += chunk.length;
+
+      if (chunkEnd < start) {
+        callback();
+        return;
+      }
+
+      const sliceStart = Math.max(start - chunkStart, 0);
+      const sliceEnd = Math.min(end - chunkStart + 1, chunk.length);
+
+      if (sliceEnd <= sliceStart) {
+        callback();
+        return;
+      }
+
+      const output = chunk.subarray(sliceStart, sliceEnd);
+      if (chunkEnd >= end) {
+        closed = true;
+        this.push(output);
+        this.emit("rangeEnd");
+        this.push(null);
+        callback();
+        return;
+      }
+      callback(null, output);
+    },
+  });
+};
+
+const applyAudioHeaders = (response, range) => {
   if (response.headersSent) return;
-  response.status(200);
+  response.status(range ? 206 : 200);
   response.setHeader("Content-Type", "audio/mpeg");
   response.setHeader("Cache-Control", "no-store");
-  response.setHeader("Accept-Ranges", "none");
+  response.setHeader("Accept-Ranges", "bytes");
   response.setHeader("X-Content-Type-Options", "nosniff");
+  if (range) {
+    response.setHeader("Content-Range", `bytes ${range.start}-${range.end}/${range.total}`);
+    response.setHeader("Content-Length", String(range.contentLength));
+  }
 };
 
 const sendStreamFailure = (response, error) => {
@@ -94,11 +182,19 @@ const sendStreamFailure = (response, error) => {
   });
 };
 
-export const streamDeezerMedia = ({ mediaURL, trackId, response, utils, attempts = 3 }) => {
+export const streamDeezerMedia = ({
+  mediaURL,
+  trackId,
+  response,
+  utils,
+  range = null,
+  attempts = 3,
+}) => {
   const encrypted = isEncryptedStreamURL(mediaURL);
   let activeSource;
   let activeDecrypt;
   let activeDepad;
+  let activeRange;
   let didClose = false;
   let didStartAudio = false;
   let attempt = 0;
@@ -107,6 +203,7 @@ export const streamDeezerMedia = ({ mediaURL, trackId, response, utils, attempts
     activeSource?.destroy();
     activeDecrypt?.destroy();
     activeDepad?.destroy();
+    activeRange?.destroy();
   };
 
   const startAttempt = () => {
@@ -129,10 +226,12 @@ export const streamDeezerMedia = ({ mediaURL, trackId, response, utils, attempts
     });
     const decrypt = createStripeDecryptStream({ trackId, utils, encrypted });
     const depad = createDepadStream();
+    const rangeStream = range ? createByteRangeStream(range) : null;
 
     activeSource = source;
     activeDecrypt = decrypt;
     activeDepad = depad;
+    activeRange = rangeStream;
 
     const handlePipelineError = (error) => {
       destroyActivePipeline();
@@ -152,7 +251,7 @@ export const streamDeezerMedia = ({ mediaURL, trackId, response, utils, attempts
     };
 
     source.once("response", () => {
-      applyAudioHeaders(response);
+      applyAudioHeaders(response, range);
     });
     depad.once("data", () => {
       didStartAudio = true;
@@ -161,11 +260,18 @@ export const streamDeezerMedia = ({ mediaURL, trackId, response, utils, attempts
     source.once("error", handlePipelineError);
     decrypt.once("error", handlePipelineError);
     depad.once("error", handlePipelineError);
+    rangeStream?.once("error", handlePipelineError);
+    rangeStream?.once("rangeEnd", () => {
+      source.destroy();
+      decrypt.destroy();
+      depad.destroy();
+    });
 
-    source
+    let pipeline = source
       .pipe(decrypt)
-      .pipe(depad)
-      .pipe(response);
+      .pipe(depad);
+    if (rangeStream) pipeline = pipeline.pipe(rangeStream);
+    pipeline.pipe(response);
   };
 
   response.on("close", () => {
