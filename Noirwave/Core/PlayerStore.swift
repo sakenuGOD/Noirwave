@@ -21,6 +21,9 @@ final class PlayerStore: ObservableObject {
     @Published private(set) var likedTrackIDs: Set<String> = []
     @Published private(set) var likedTrackOrder: [String] = []
     @Published private(set) var likedTrackSnapshots: [String: Track] = [:]
+    @Published private(set) var savedCollectionIDs: Set<String> = []
+    @Published private(set) var savedCollectionOrder: [String] = []
+    @Published private(set) var savedCollectionSnapshots: [String: Track] = [:]
     @Published private(set) var listeningScores: [String: Int] = [:]
 
     @Published var searchQuery = ""
@@ -33,6 +36,9 @@ final class PlayerStore: ObservableObject {
     private static let likedTrackIDsKey = "noirwave.likedTrackIDs"
     private static let likedTrackOrderKey = "noirwave.likedTrackOrder"
     private static let likedTrackSnapshotsKey = "noirwave.likedTrackSnapshots"
+    private static let savedCollectionIDsKey = "noirwave.savedCollectionIDs"
+    private static let savedCollectionOrderKey = "noirwave.savedCollectionOrder"
+    private static let savedCollectionSnapshotsKey = "noirwave.savedCollectionSnapshots"
     private static let listeningScoresKey = "noirwave.listeningScores"
     private let playbackContextLimit = 16
     private let userDefaults: UserDefaults
@@ -52,6 +58,12 @@ final class PlayerStore: ObservableObject {
             likedIDs: likedTrackIDs
         )
         likedTrackSnapshots = Self.loadLikedTrackSnapshots(from: userDefaults, likedIDs: likedTrackIDs)
+        savedCollectionIDs = Set(userDefaults.stringArray(forKey: Self.savedCollectionIDsKey) ?? [])
+        savedCollectionOrder = Self.normalizedSavedCollectionOrder(
+            userDefaults.stringArray(forKey: Self.savedCollectionOrderKey) ?? [],
+            savedIDs: savedCollectionIDs
+        )
+        savedCollectionSnapshots = Self.loadSavedCollectionSnapshots(from: userDefaults, savedIDs: savedCollectionIDs)
         listeningScores = (userDefaults.dictionary(forKey: Self.listeningScoresKey) ?? [:]).reduce(into: [:]) { result, item in
             if let score = item.value as? Int {
                 result[item.key] = score
@@ -452,6 +464,50 @@ final class PlayerStore: ObservableObject {
         return Array(orderedTracks.prefix(limit))
     }
 
+    func isSavedCollection(_ item: Track) -> Bool {
+        savedCollectionIDs.contains(item.id)
+    }
+
+    func toggleSavedCollection(_ item: Track) {
+        guard !item.isPlayable else { return }
+
+        if savedCollectionIDs.contains(item.id) {
+            savedCollectionIDs.remove(item.id)
+            savedCollectionOrder.removeAll { $0 == item.id }
+            savedCollectionSnapshots.removeValue(forKey: item.id)
+        } else {
+            savedCollectionIDs.insert(item.id)
+            savedCollectionOrder.removeAll { $0 == item.id }
+            savedCollectionOrder.insert(item.id, at: savedCollectionOrder.startIndex)
+            savedCollectionSnapshots[item.id] = item
+        }
+
+        persistSavedCollections()
+    }
+
+    func savedCollections(limit: Int = 16) -> [Track] {
+        let knownItems = knownCollectionItems.filter { savedCollectionIDs.contains($0.id) }
+        var itemByID = savedCollectionSnapshots.filter { savedCollectionIDs.contains($0.key) }
+        for item in knownItems {
+            itemByID[item.id] = item
+        }
+        var seenIDs: Set<String> = []
+        var orderedItems: [Track] = []
+
+        for id in savedCollectionOrder where savedCollectionIDs.contains(id) {
+            guard let item = itemByID[id],
+                  seenIDs.insert(id).inserted
+            else { continue }
+            orderedItems.append(item)
+        }
+
+        for item in knownItems where seenIDs.insert(item.id).inserted {
+            orderedItems.append(item)
+        }
+
+        return Array(orderedItems.prefix(limit))
+    }
+
     func startWave() {
         let wave = smartWaveTracks(limit: playbackContextLimit)
         guard let firstTrack = wave.first else { return }
@@ -837,6 +893,16 @@ final class PlayerStore: ObservableObject {
         return uniquePlayableTracks(in: tracks)
     }
 
+    private var knownCollectionItems: [Track] {
+        var items: [Track] = []
+        if let catalogContext {
+            items.append(catalogContext)
+        }
+        items.append(contentsOf: visibleTracks)
+        items.append(contentsOf: featuredTracks)
+        return uniqueCollectionItems(in: items)
+    }
+
     private func shuffledPlaybackCandidates(excluding excludedTrack: Track?) -> [Track] {
         currentPlaybackContext
             .filter { track in
@@ -855,6 +921,20 @@ final class PlayerStore: ObservableObject {
             else { continue }
 
             result.append(track)
+        }
+
+        return result
+    }
+
+    private func uniqueCollectionItems(in items: [Track]) -> [Track] {
+        var result: [Track] = []
+        var seenIDs = Set<String>()
+
+        for item in items {
+            guard !item.isPlayable,
+                  seenIDs.insert(item.id).inserted
+            else { continue }
+            result.append(item)
         }
 
         return result
@@ -954,6 +1034,14 @@ final class PlayerStore: ObservableObject {
         Self.persistLikedTrackSnapshots(likedTrackSnapshots, to: userDefaults)
     }
 
+    private func persistSavedCollections() {
+        userDefaults.set(Array(savedCollectionIDs).sorted(), forKey: Self.savedCollectionIDsKey)
+        savedCollectionOrder = Self.normalizedSavedCollectionOrder(savedCollectionOrder, savedIDs: savedCollectionIDs)
+        userDefaults.set(savedCollectionOrder, forKey: Self.savedCollectionOrderKey)
+        savedCollectionSnapshots = savedCollectionSnapshots.filter { savedCollectionIDs.contains($0.key) }
+        Self.persistSavedCollectionSnapshots(savedCollectionSnapshots, to: userDefaults)
+    }
+
     private static func normalizedLikedTrackOrder(_ order: [String], likedIDs: Set<String>) -> [String] {
         var seenIDs: Set<String> = []
         var normalizedOrder = order.filter { id in
@@ -961,6 +1049,17 @@ final class PlayerStore: ObservableObject {
         }
 
         let missingIDs = likedIDs.subtracting(normalizedOrder)
+        normalizedOrder.append(contentsOf: missingIDs.sorted())
+        return normalizedOrder
+    }
+
+    private static func normalizedSavedCollectionOrder(_ order: [String], savedIDs: Set<String>) -> [String] {
+        var seenIDs: Set<String> = []
+        var normalizedOrder = order.filter { id in
+            savedIDs.contains(id) && seenIDs.insert(id).inserted
+        }
+
+        let missingIDs = savedIDs.subtracting(normalizedOrder)
         normalizedOrder.append(contentsOf: missingIDs.sorted())
         return normalizedOrder
     }
@@ -976,6 +1075,19 @@ final class PlayerStore: ObservableObject {
     private static func persistLikedTrackSnapshots(_ snapshots: [String: Track], to userDefaults: UserDefaults) {
         guard let data = try? JSONEncoder().encode(snapshots) else { return }
         userDefaults.set(data, forKey: Self.likedTrackSnapshotsKey)
+    }
+
+    private static func loadSavedCollectionSnapshots(from userDefaults: UserDefaults, savedIDs: Set<String>) -> [String: Track] {
+        guard let data = userDefaults.data(forKey: Self.savedCollectionSnapshotsKey),
+              let snapshots = try? JSONDecoder().decode([String: Track].self, from: data)
+        else { return [:] }
+
+        return snapshots.filter { savedIDs.contains($0.key) }
+    }
+
+    private static func persistSavedCollectionSnapshots(_ snapshots: [String: Track], to userDefaults: UserDefaults) {
+        guard let data = try? JSONEncoder().encode(snapshots) else { return }
+        userDefaults.set(data, forKey: Self.savedCollectionSnapshotsKey)
     }
 
     private func persistListeningScores() {
