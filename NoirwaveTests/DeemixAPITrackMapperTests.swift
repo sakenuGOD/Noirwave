@@ -869,6 +869,21 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         )
     }
 
+    func testShellContentRouteKeepsSidebarSelectionOverSearchQuery() {
+        XCTAssertEqual(
+            ShellContentRouteResolver.route(selection: .library, hasSearchQuery: true, hasCatalogContext: false),
+            .library
+        )
+        XCTAssertEqual(
+            ShellContentRouteResolver.route(selection: .listenNow, hasSearchQuery: true, hasCatalogContext: false),
+            .listenNow
+        )
+        XCTAssertEqual(
+            ShellContentRouteResolver.route(selection: .search, hasSearchQuery: true, hasCatalogContext: false),
+            .searchResults
+        )
+    }
+
     func testLibraryPlaylistShelfBuilderIncludesLikedSongsBeforeLocalPlaylists() {
         let likedTracks = [
             Self.makeLibraryTrack(1, title: "Alison", artist: "Slowdive", album: "Souvlaki"),
@@ -1065,6 +1080,39 @@ final class DeemixAPITrackMapperTests: XCTestCase {
             PlaylistTargetMenuBuilder.targetPlaylists([favorites, shoegaze, archive], excludingPlaylistID: "shoegaze").map(\.id),
             ["favorites", "archive"]
         )
+    }
+
+    func testPlaylistTargetMenuBuilderDeduplicatesAndCapsTargets() {
+        let playlists = [
+            LocalPlaylist(id: "sequenced-new", title: "Sequenced", tracks: [Self.makeLibraryTrack(1, title: "Alison", artist: "Slowdive", album: "Souvlaki")]),
+            LocalPlaylist(id: "night-drive", title: "Night Drive", tracks: [Self.makeLibraryTrack(2, title: "Joga", artist: "Bjork", album: "Homogenic")]),
+            LocalPlaylist(id: "sequenced-old", title: "Sequenced", tracks: [Self.makeLibraryTrack(3, title: "Xtal", artist: "Aphex Twin", album: "Selected Ambient Works 85-92")]),
+            LocalPlaylist(id: "focus", title: "Focus", tracks: [Self.makeLibraryTrack(4, title: "Cherry", artist: "Chromatics", album: "Night Drive")]),
+            LocalPlaylist(id: "archive", title: "Archive", tracks: [Self.makeLibraryTrack(5, title: "Angel", artist: "Massive Attack", album: "Mezzanine")]),
+            LocalPlaylist(id: "ambient", title: "Ambient", tracks: [Self.makeLibraryTrack(6, title: "Avril 14th", artist: "Aphex Twin", album: "Drukqs")]),
+            LocalPlaylist(id: "overflow", title: "Overflow", tracks: [Self.makeLibraryTrack(7, title: "Ceremony", artist: "New Order", album: "Substance")])
+        ]
+
+        XCTAssertEqual(
+            PlaylistTargetMenuBuilder.targetPlaylists(playlists, excludingPlaylistID: nil).map(\.id),
+            ["sequenced-new", "night-drive", "focus", "archive", "ambient"]
+        )
+    }
+
+    @MainActor
+    func testCreatePlaylistReusesEquivalentPlaylistInsteadOfSpawningDuplicates() {
+        let defaults = Self.makeIsolatedDefaults(name: "local-playlists-no-spawn")
+        let tracks = [
+            Self.makeLibraryTrack(1, title: "Alison", artist: "Slowdive", album: "Souvlaki"),
+            Self.makeLibraryTrack(2, title: "When the Sun Hits", artist: "Slowdive", album: "Souvlaki")
+        ]
+        let store = PlayerStore(provider: PrewarmRecordingProvider(tracks: tracks), userDefaults: defaults)
+
+        let first = store.createPlaylist(title: "Sequenced", tracks: tracks)
+        let second = store.createPlaylist(title: "  Sequenced  ", tracks: [tracks[0], tracks[1], tracks[0]])
+
+        XCTAssertEqual(first.id, second.id)
+        XCTAssertEqual(store.localPlaylists.map(\.id), [first.id])
     }
 
     @MainActor
