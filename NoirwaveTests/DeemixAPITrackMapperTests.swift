@@ -860,6 +860,55 @@ final class DeemixAPITrackMapperTests: XCTestCase {
     }
 
     @MainActor
+    func testLocalPlaylistsPersistSnapshotsNewestFirstAndIgnoreDuplicateAdds() {
+        let defaults = Self.makeIsolatedDefaults(name: "local-playlists-persist")
+        let tracks = [
+            Self.makeLibraryTrack(1, title: "Only Shallow", artist: "My Bloody Valentine", album: "Loveless"),
+            Self.makeLibraryTrack(2, title: "Alison", artist: "Slowdive", album: "Souvlaki"),
+            Self.makeLibraryTrack(3, title: "Cherry-Coloured Funk", artist: "Cocteau Twins", album: "Heaven or Las Vegas")
+        ]
+        let store = PlayerStore(provider: PrewarmRecordingProvider(tracks: tracks), userDefaults: defaults)
+
+        let shoegaze = store.createPlaylist(title: "Shoegaze", tracks: [tracks[0]])
+        let dreamPop = store.createPlaylist(title: "Dream Pop", tracks: [tracks[2]])
+
+        store.addToPlaylist(tracks[1], playlistID: shoegaze.id)
+        store.addToPlaylist(tracks[1], playlistID: shoegaze.id)
+
+        XCTAssertEqual(store.localPlaylists.map(\.id), [dreamPop.id, shoegaze.id])
+        XCTAssertEqual(store.playlistTracks(playlistID: shoegaze.id), [tracks[0], tracks[1]])
+
+        let restoredStore = PlayerStore(provider: PrewarmRecordingProvider(tracks: []), userDefaults: defaults)
+
+        XCTAssertEqual(restoredStore.localPlaylists.map(\.id), [dreamPop.id, shoegaze.id])
+        XCTAssertEqual(restoredStore.playlistTracks(playlistID: shoegaze.id), [tracks[0], tracks[1]])
+    }
+
+    @MainActor
+    func testLocalPlaylistsRenameRemoveAndDeleteWithoutTouchingLikedTracks() {
+        let defaults = Self.makeIsolatedDefaults(name: "local-playlists-edit")
+        let tracks = [
+            Self.makeLibraryTrack(1, title: "Digital Bath", artist: "Deftones", album: "White Pony"),
+            Self.makeLibraryTrack(2, title: "Joga", artist: "Bjork", album: "Homogenic")
+        ]
+        let store = PlayerStore(provider: PrewarmRecordingProvider(tracks: tracks), userDefaults: defaults)
+        let playlist = store.createPlaylist(title: "Late Night", tracks: tracks)
+
+        store.toggleLike(tracks[0])
+        store.renamePlaylist(playlistID: playlist.id, title: "After Dark")
+        store.removeFromPlaylist(tracks[0], playlistID: playlist.id)
+
+        XCTAssertEqual(store.localPlaylists.first?.title, "After Dark")
+        XCTAssertEqual(store.playlistTracks(playlistID: playlist.id), [tracks[1]])
+        XCTAssertTrue(store.isLiked(tracks[0]))
+
+        store.deletePlaylist(playlistID: playlist.id)
+
+        XCTAssertTrue(store.localPlaylists.isEmpty)
+        XCTAssertEqual(store.likedTracks(), [tracks[0]])
+    }
+
+    @MainActor
     func testVolumeIsClampedAndForwardedToProvider() {
         let provider = PrewarmRecordingProvider(tracks: [])
         let store = PlayerStore(provider: provider)
