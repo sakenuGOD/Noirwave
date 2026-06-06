@@ -46,6 +46,18 @@ private enum NowPlayingPanelMode: String, CaseIterable, Identifiable {
     }
 }
 
+enum LibraryPlaylistSelection: Equatable {
+    static let likedSongsID = "liked.songs"
+
+    case likedSongs
+    case localPlaylist(String)
+
+    var localPlaylistID: String? {
+        guard case let .localPlaylist(id) = self else { return nil }
+        return id
+    }
+}
+
 private typealias PlaylistCreationRequest = @MainActor @Sendable (Track) -> Void
 
 private struct PlaylistCreationRequestKey: EnvironmentKey {
@@ -62,7 +74,7 @@ private extension EnvironmentValues {
 struct PlayerShellView: View {
     @EnvironmentObject private var store: PlayerStore
     @State private var selectedDestination: ShellDestination = .listenNow
-    @State private var selectedLocalPlaylistID: String?
+    @State private var selectedPlaylist: LibraryPlaylistSelection?
     @State private var isShowingNowPlaying = false
     @State private var nowPlayingPanelMode: NowPlayingPanelMode = .lyrics
     @State private var playlistEditor: PlaylistEditor?
@@ -78,7 +90,7 @@ struct PlayerShellView: View {
                 HStack(spacing: 0) {
                     SidebarView(
                         selection: $selectedDestination,
-                        selectedLocalPlaylistID: $selectedLocalPlaylistID
+                        selectedPlaylist: $selectedPlaylist
                     )
                     .frame(width: 284)
 
@@ -94,7 +106,7 @@ struct PlayerShellView: View {
 
                     ContentDeckView(
                         selection: selectedDestination,
-                        selectedLocalPlaylistID: $selectedLocalPlaylistID
+                        selectedPlaylist: $selectedPlaylist
                     )
                     .environment(\.requestPlaylistCreationFromTrack) { track in
                         playlistEditor = PlaylistEditor(
@@ -124,7 +136,7 @@ struct PlayerShellView: View {
             PlaylistTitleSheet(title: editor.title, primaryLabel: "Create") { title in
                 let playlist = store.createPlaylist(title: title, tracks: editor.tracks)
                 selectedDestination = .library
-                selectedLocalPlaylistID = playlist.id
+                selectedPlaylist = .localPlaylist(playlist.id)
                 store.leaveCatalogContext()
                 playlistEditor = nil
             } onCancel: {
@@ -165,7 +177,7 @@ private struct DynamicStudioBackground: View {
 private struct SidebarView: View {
     @EnvironmentObject private var store: PlayerStore
     @Binding var selection: ShellDestination
-    @Binding var selectedLocalPlaylistID: String?
+    @Binding var selectedPlaylist: LibraryPlaylistSelection?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -199,7 +211,7 @@ private struct SidebarView: View {
                         active: selection == destination
                     ) {
                         selection = destination
-                        selectedLocalPlaylistID = nil
+                        selectedPlaylist = nil
                         store.leaveCatalogContext()
                     }
                 }
@@ -209,7 +221,7 @@ private struct SidebarView: View {
 
             SidebarPlaylistPreview(
                 selection: $selection,
-                selectedLocalPlaylistID: $selectedLocalPlaylistID
+                selectedPlaylist: $selectedPlaylist
             )
         }
         .padding(.horizontal, 12)
@@ -259,7 +271,7 @@ private struct SidebarLibraryCollection: Identifiable {
     let subtitle: String
     let symbol: String
     let tracks: [Track]
-    let localPlaylistID: String?
+    let selection: LibraryPlaylistSelection?
 
     init(
         id: String,
@@ -267,14 +279,14 @@ private struct SidebarLibraryCollection: Identifiable {
         subtitle: String,
         symbol: String,
         tracks: [Track],
-        localPlaylistID: String? = nil
+        selection: LibraryPlaylistSelection? = nil
     ) {
         self.id = id
         self.title = title
         self.subtitle = subtitle
         self.symbol = symbol
         self.tracks = tracks
-        self.localPlaylistID = localPlaylistID
+        self.selection = selection
     }
 
     var artworkTracks: [Track] {
@@ -285,7 +297,7 @@ private struct SidebarLibraryCollection: Identifiable {
 private struct SidebarPlaylistPreview: View {
     @EnvironmentObject private var store: PlayerStore
     @Binding var selection: ShellDestination
-    @Binding var selectedLocalPlaylistID: String?
+    @Binding var selectedPlaylist: LibraryPlaylistSelection?
 
     private var collections: [SidebarLibraryCollection] {
         let savedTracks = store.likedTracks(limit: 120).filter(\.isPlayable)
@@ -297,7 +309,7 @@ private struct SidebarPlaylistPreview: View {
                 subtitle: "\(playlist.trackCount) track\(playlist.trackCount == 1 ? "" : "s")",
                 symbol: "music.note.list",
                 tracks: tracks,
-                localPlaylistID: playlist.id
+                selection: .localPlaylist(playlist.id)
             )
         }
 
@@ -316,15 +328,16 @@ private struct SidebarPlaylistPreview: View {
             return Array((localCollections + discoveryCollections).prefix(3))
         }
 
-        var output: [SidebarLibraryCollection] = localCollections + [
+        var output: [SidebarLibraryCollection] = [
             SidebarLibraryCollection(
                 id: "liked.songs",
                 title: "Liked Songs",
                 subtitle: "\(savedTracks.count) saved",
                 symbol: "heart.fill",
-                tracks: savedTracks
+                tracks: savedTracks,
+                selection: .likedSongs
             )
-        ]
+        ] + localCollections
 
         if let album = topAlbumCollection(from: savedTracks) {
             output.append(album)
@@ -416,12 +429,12 @@ private struct SidebarPlaylistPreview: View {
             } else {
                 VStack(spacing: 6) {
                     ForEach(collections) { collection in
-                        let isSelected = collection.localPlaylistID != nil
+                        let isSelected = collection.selection != nil
                             && selection == .library
-                            && selectedLocalPlaylistID == collection.localPlaylistID
+                            && selectedPlaylist == collection.selection
                         SidebarPlaylistRow(collection: collection, isSelected: isSelected) {
-                            if let playlistID = collection.localPlaylistID {
-                                selectedLocalPlaylistID = playlistID
+                            if let playlistSelection = collection.selection {
+                                selectedPlaylist = playlistSelection
                                 selection = .library
                                 store.leaveCatalogContext()
                             } else {
@@ -638,7 +651,7 @@ private struct TopBarSourceControls: View {
 private struct ContentDeckView: View {
     @EnvironmentObject private var store: PlayerStore
     let selection: ShellDestination
-    @Binding var selectedLocalPlaylistID: String?
+    @Binding var selectedPlaylist: LibraryPlaylistSelection?
 
     var body: some View {
         ScrollView {
@@ -659,7 +672,7 @@ private struct ContentDeckView: View {
                     case .search:
                         SearchLandingView()
                     case .library:
-                        LibraryView(selectedPlaylistID: $selectedLocalPlaylistID)
+                        LibraryView(selectedPlaylistSelection: $selectedPlaylist)
                     }
                 }
             }
@@ -917,9 +930,80 @@ enum LibrarySurfaceLayout {
     }
 }
 
+struct LibraryPlaylistShelfItem: Identifiable, Equatable {
+    let id: String
+    let title: String
+    let subtitle: String
+    let symbol: String
+    let artworkTracks: [Track]
+    let searchText: String
+    let selection: LibraryPlaylistSelection
+}
+
+enum LibraryPlaylistShelfBuilder {
+    static func items(likedTracks: [Track], localPlaylists: [LocalPlaylist], query: String) -> [LibraryPlaylistShelfItem] {
+        let term = query.searchNormalized
+        let likedItem = likedSongsItem(from: likedTracks)
+        let localItems = localPlaylists.map(localPlaylistItem)
+        let items = ([likedItem].compactMap(\.self) + localItems)
+
+        guard !term.isEmpty else { return items }
+
+        return items.filter { item in
+            let searchableText = item.searchText.searchNormalized
+            let tokens = term.split(separator: " ").map(String.init)
+            return searchableText.contains(term)
+                || tokens.allSatisfy { searchableText.contains($0) }
+        }
+    }
+
+    private static func likedSongsItem(from tracks: [Track]) -> LibraryPlaylistShelfItem? {
+        let playableTracks = tracks.filter(\.isPlayable)
+        guard !playableTracks.isEmpty else { return nil }
+
+        return LibraryPlaylistShelfItem(
+            id: LibraryPlaylistSelection.likedSongsID,
+            title: "Liked Songs",
+            subtitle: "\(playableTracks.count) saved",
+            symbol: "heart.fill",
+            artworkTracks: Array(playableTracks.prefix(4)),
+            searchText: searchableText(
+                title: "Liked Songs",
+                subtitle: "\(playableTracks.count) saved",
+                aliases: ["Favorite Songs", "Favorites"],
+                tracks: playableTracks
+            ),
+            selection: .likedSongs
+        )
+    }
+
+    private static func localPlaylistItem(_ playlist: LocalPlaylist) -> LibraryPlaylistShelfItem {
+        let tracks = playlist.orderedTracks(preferredTracks: [])
+        return LibraryPlaylistShelfItem(
+            id: "playlist.\(playlist.id)",
+            title: playlist.title,
+            subtitle: "\(playlist.trackCount) track\(playlist.trackCount == 1 ? "" : "s")",
+            symbol: "music.note.list",
+            artworkTracks: Array(tracks.prefix(4)),
+            searchText: searchableText(
+                title: playlist.title,
+                subtitle: "\(playlist.trackCount) track\(playlist.trackCount == 1 ? "" : "s")",
+                aliases: [],
+                tracks: tracks
+            ),
+            selection: .localPlaylist(playlist.id)
+        )
+    }
+
+    private static func searchableText(title: String, subtitle: String, aliases: [String], tracks: [Track]) -> String {
+        ([title, subtitle] + aliases + tracks.flatMap { [$0.title, $0.artist, $0.album] })
+            .joined(separator: " ")
+    }
+}
+
 private struct LibraryView: View {
     @EnvironmentObject private var store: PlayerStore
-    @Binding var selectedPlaylistID: String?
+    @Binding var selectedPlaylistSelection: LibraryPlaylistSelection?
     @State private var libraryQuery = ""
     @State private var favoriteTracksQuery = ""
     @State private var librarySortMode: LibrarySortMode = .recentlyAdded
@@ -933,9 +1017,9 @@ private struct LibraryView: View {
         store.localPlaylists
     }
 
-    private var selectedPlaylist: LocalPlaylist? {
-        guard let selectedPlaylistID else { return nil }
-        return localPlaylists.first { $0.id == selectedPlaylistID }
+    private var selectedLocalPlaylist: LocalPlaylist? {
+        guard let playlistID = selectedPlaylistSelection?.localPlaylistID else { return nil }
+        return localPlaylists.first { $0.id == playlistID }
     }
 
     private var savedCollections: [Track] {
@@ -955,8 +1039,12 @@ private struct LibraryView: View {
         )
     }
 
-    private var filteredLocalPlaylists: [LocalPlaylist] {
-        filteredPlaylists(localPlaylists, query: libraryQuery)
+    private var playlistShelfItems: [LibraryPlaylistShelfItem] {
+        LibraryPlaylistShelfBuilder.items(
+            likedTracks: likedTracks,
+            localPlaylists: localPlaylists,
+            query: libraryQuery
+        )
     }
 
     private var filteredSavedCollections: [Track] {
@@ -975,24 +1063,32 @@ private struct LibraryView: View {
         LibrarySurfaceLayout.sections(
             hasTracks: !filteredTracks.isEmpty,
             hasSavedCollections: !filteredSavedCollections.isEmpty,
-            hasLocalPlaylists: !filteredLocalPlaylists.isEmpty
+            hasLocalPlaylists: !playlistShelfItems.isEmpty
         )
     }
 
     var body: some View {
-        if let selectedPlaylist {
+        if selectedPlaylistSelection == .likedSongs {
             LocalPlaylistDetailView(
-                playlist: selectedPlaylist,
-                tracks: store.playlistTracks(playlistID: selectedPlaylist.id),
+                playlist: .likedSongs(trackCount: likedTracks.count),
+                tracks: likedTracks,
                 onBack: {
-                    selectedPlaylistID = nil
+                    selectedPlaylistSelection = nil
+                }
+            )
+        } else if let selectedLocalPlaylist {
+            LocalPlaylistDetailView(
+                playlist: .local(selectedLocalPlaylist),
+                tracks: store.playlistTracks(playlistID: selectedLocalPlaylist.id),
+                onBack: {
+                    selectedPlaylistSelection = nil
                 },
                 onRename: {
-                    playlistEditor = PlaylistEditor(playlistID: selectedPlaylist.id, title: selectedPlaylist.title)
+                    playlistEditor = PlaylistEditor(playlistID: selectedLocalPlaylist.id, title: selectedLocalPlaylist.title)
                 },
                 onDelete: {
-                    store.deletePlaylist(playlistID: selectedPlaylist.id)
-                    selectedPlaylistID = nil
+                    store.deletePlaylist(playlistID: selectedLocalPlaylist.id)
+                    selectedPlaylistSelection = nil
                 }
             )
             .sheet(item: $playlistEditor) { editor in
@@ -1012,7 +1108,7 @@ private struct LibraryView: View {
             .sheet(item: $playlistEditor) { editor in
                 PlaylistTitleSheet(title: editor.title, primaryLabel: "Create") { title in
                     let playlist = store.createPlaylist(title: title)
-                    selectedPlaylistID = playlist.id
+                    selectedPlaylistSelection = .localPlaylist(playlist.id)
                     playlistEditor = nil
                 } onCancel: {
                     playlistEditor = nil
@@ -1024,12 +1120,12 @@ private struct LibraryView: View {
                     query: $libraryQuery,
                     sortMode: $librarySortMode,
                     totalCount: likedTracks.count + savedCollections.count + localPlaylists.count,
-                    filteredCount: filteredTracks.count + filteredSavedCollections.count + filteredLocalPlaylists.count
+                    filteredCount: filteredTracks.count + filteredSavedCollections.count + playlistShelfItems.count
                 ) {
                     playlistEditor = PlaylistEditor(playlistID: nil, title: LocalPlaylist.fallbackTitle)
                 }
 
-                LibraryStatsView(playlists: localPlaylists.count, artists: artists, albums: albums, tracks: filteredTracks)
+                LibraryStatsView(playlists: playlistShelfItems.count, artists: artists, albums: albums, tracks: filteredTracks)
 
                 if surfaceSections.isEmpty {
                     EmptyLibrarySearchPanel(query: libraryQuery)
@@ -1042,7 +1138,7 @@ private struct LibraryView: View {
             .sheet(item: $playlistEditor) { editor in
                 PlaylistTitleSheet(title: editor.title, primaryLabel: "Create") { title in
                     let playlist = store.createPlaylist(title: title)
-                    selectedPlaylistID = playlist.id
+                    selectedPlaylistSelection = .localPlaylist(playlist.id)
                     playlistEditor = nil
                 } onCancel: {
                     playlistEditor = nil
@@ -1070,27 +1166,12 @@ private struct LibraryView: View {
                 primaryLabel: "Play Favorites"
             )
         case .playlists:
-            LibraryPlaylistsShelf(localPlaylists: filteredLocalPlaylists) { playlistID in
-                selectedPlaylistID = playlistID
+            LibraryPlaylistsShelf(items: playlistShelfItems) { selection in
+                selectedPlaylistSelection = selection
             }
         }
     }
 
-    private func filteredPlaylists(_ playlists: [LocalPlaylist], query: String) -> [LocalPlaylist] {
-        let term = query.searchNormalized
-        guard !term.isEmpty else { return playlists }
-
-        let tokens = term.split(separator: " ").map(String.init)
-        return playlists.filter { playlist in
-            let tracks = store.playlistTracks(playlistID: playlist.id)
-            let searchableText = ([playlist.title] + tracks.flatMap { [$0.title, $0.artist, $0.album] })
-                .joined(separator: " ")
-                .searchNormalized
-
-            return searchableText.contains(term)
-                || tokens.allSatisfy { searchableText.contains($0) }
-        }
-    }
 }
 
 private struct EmptyLibraryPanel: View {
@@ -1174,16 +1255,58 @@ private struct PlaylistTitleSheet: View {
     }
 }
 
+private struct PlaylistDetailModel {
+    let id: String?
+    let title: String
+    let trackCount: Int
+    let kindLabel: String
+    let originLabel: String
+
+    static func local(_ playlist: LocalPlaylist) -> PlaylistDetailModel {
+        PlaylistDetailModel(
+            id: playlist.id,
+            title: playlist.title,
+            trackCount: playlist.trackCount,
+            kindLabel: "Playlist",
+            originLabel: "Local"
+        )
+    }
+
+    static func likedSongs(trackCount: Int) -> PlaylistDetailModel {
+        PlaylistDetailModel(
+            id: nil,
+            title: "Liked Songs",
+            trackCount: trackCount,
+            kindLabel: "Favorites",
+            originLabel: "Dynamic"
+        )
+    }
+}
+
 private struct LocalPlaylistDetailView: View {
     @EnvironmentObject private var store: PlayerStore
     @State private var playlistQuery = ""
     @State private var playlistSortMode: PlaylistSortMode = .playlistOrder
     @State private var isConfirmingDelete = false
-    let playlist: LocalPlaylist
+    let playlist: PlaylistDetailModel
     let tracks: [Track]
     let onBack: () -> Void
-    let onRename: () -> Void
-    let onDelete: () -> Void
+    let onRename: (() -> Void)?
+    let onDelete: (() -> Void)?
+
+    init(
+        playlist: PlaylistDetailModel,
+        tracks: [Track],
+        onBack: @escaping () -> Void,
+        onRename: (() -> Void)? = nil,
+        onDelete: (() -> Void)? = nil
+    ) {
+        self.playlist = playlist
+        self.tracks = tracks
+        self.onBack = onBack
+        self.onRename = onRename
+        self.onDelete = onDelete
+    }
 
     private var accent: Color {
         tracks.first?.palette.accent ?? store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent
@@ -1227,7 +1350,7 @@ private struct LocalPlaylistDetailView: View {
                     .shadow(color: accent.opacity(0.26), radius: 26, x: 0, y: 18)
 
                 VStack(alignment: .leading, spacing: 14) {
-                    InfoPill(symbol: "music.note.list", text: "Playlist")
+                    InfoPill(symbol: "music.note.list", text: playlist.kindLabel)
 
                     Text(playlist.title)
                         .font(.system(size: 44, weight: .bold, design: .rounded))
@@ -1237,7 +1360,7 @@ private struct LocalPlaylistDetailView: View {
 
                     HStack(spacing: 8) {
                         InfoPill(symbol: "music.note", text: trackCountLabel)
-                        InfoPill(symbol: "clock.arrow.circlepath", text: "Local")
+                        InfoPill(symbol: "clock.arrow.circlepath", text: playlist.originLabel)
                     }
 
                     LocalPlaylistActionBar(
@@ -1245,7 +1368,7 @@ private struct LocalPlaylistDetailView: View {
                         accent: accent,
                         isFiltered: isFiltering,
                         onRename: onRename,
-                        onDelete: {
+                        onDelete: onDelete == nil ? nil : {
                             isConfirmingDelete = true
                         }
                     )
@@ -1290,7 +1413,9 @@ private struct LocalPlaylistDetailView: View {
             }
         }
         .confirmationDialog("Delete playlist?", isPresented: $isConfirmingDelete) {
-            Button("Delete Playlist", role: .destructive, action: onDelete)
+            Button("Delete Playlist", role: .destructive) {
+                onDelete?()
+            }
             Button("Cancel", role: .cancel) {}
         }
     }
@@ -1332,8 +1457,8 @@ private struct LocalPlaylistActionBar: View {
     let tracks: [Track]
     let accent: Color
     let isFiltered: Bool
-    let onRename: () -> Void
-    let onDelete: () -> Void
+    let onRename: (() -> Void)?
+    let onDelete: (() -> Void)?
 
     private var playableTracks: [Track] {
         tracks.filter(\.isPlayable)
@@ -1412,26 +1537,34 @@ private struct LocalPlaylistActionBar: View {
                 .help(queueHelp)
             }
 
-            Menu {
-                Button(action: onRename) {
-                    Label("Rename", systemImage: "pencil")
-                }
+            if onRename != nil || onDelete != nil {
+                Menu {
+                    if let onRename {
+                        Button(action: onRename) {
+                            Label("Rename", systemImage: "pencil")
+                        }
+                    }
 
-                Divider()
+                    if onRename != nil, onDelete != nil {
+                        Divider()
+                    }
 
-                Button(role: .destructive, action: onDelete) {
-                    Label("Delete Playlist", systemImage: "trash")
+                    if let onDelete {
+                        Button(role: .destructive, action: onDelete) {
+                            Label("Delete Playlist", systemImage: "trash")
+                        }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.78))
+                        .frame(width: 36, height: 36)
+                        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 }
-            } label: {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundStyle(.white.opacity(0.78))
-                    .frame(width: 36, height: 36)
-                    .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .help("Playlist actions")
             }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .help("Playlist actions")
         }
     }
 }
@@ -1881,29 +2014,28 @@ private struct LibraryCollectionsShelf: View {
 
 private struct LibraryPlaylistsShelf: View {
     @EnvironmentObject private var store: PlayerStore
-    let localPlaylists: [LocalPlaylist]
-    let onSelectPlaylist: (String) -> Void
+    let items: [LibraryPlaylistShelfItem]
+    let onSelectPlaylist: (LibraryPlaylistSelection) -> Void
 
     var body: some View {
-        if !localPlaylists.isEmpty {
+        if !items.isEmpty {
             VStack(alignment: .leading, spacing: 12) {
-                SectionTitle(title: "Плейлисты", subtitle: "\(localPlaylists.count)")
+                SectionTitle(title: "Плейлисты", subtitle: "\(items.count)")
 
                 ScrollView(.horizontal) {
                     HStack(alignment: .top, spacing: 14) {
-                        ForEach(localPlaylists.prefix(10)) { playlist in
-                            let playlistTracks = store.playlistTracks(playlistID: playlist.id)
-                            let accent = playlistTracks.first?.palette.accent
+                        ForEach(items.prefix(10)) { item in
+                            let accent = item.artworkTracks.first?.palette.accent
                                 ?? store.currentTrack?.palette.accent
                                 ?? NoirwaveTheme.primaryAccent
                             LibraryCollectionCard(
-                                title: playlist.title,
-                                subtitle: "\(playlist.trackCount) track\(playlist.trackCount == 1 ? "" : "s")",
-                                symbol: "music.note.list",
-                                artworkTracks: Array(playlistTracks.prefix(4)),
+                                title: item.title,
+                                subtitle: item.subtitle,
+                                symbol: item.symbol,
+                                artworkTracks: item.artworkTracks,
                                 accent: accent
                             ) {
-                                onSelectPlaylist(playlist.id)
+                                onSelectPlaylist(item.selection)
                             }
                         }
                     }
