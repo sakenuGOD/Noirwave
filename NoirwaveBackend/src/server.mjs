@@ -4,6 +4,18 @@ import { callCatalog } from "./pythonCatalog.mjs";
 import { loadDeemixModules } from "./deemixModules.mjs";
 import { readARL, setRuntimeARL } from "./session.mjs";
 import {
+  publicDeezerAlbumDetail,
+  publicDeezerArtistDetail,
+  publicDeezerSearch,
+} from "./publicDeezerSearch.mjs";
+import {
+  bitrateByFormat,
+  defaultFormatForSession,
+  fallbackFormatForSession,
+  normalizeFormat,
+  selectFormatsForSession,
+} from "./playbackFormat.mjs";
+import {
   cachedStartupPrefix,
   cachedStartupRange,
   parseRangeHeader,
@@ -11,6 +23,10 @@ import {
   streamDeezerMedia,
 } from "./streaming.mjs";
 import { normalizeLyricsPayload } from "./lyricsMapper.mjs";
+import {
+  isWeakSearchPayload,
+  shouldPreferFallbackSearchPayload,
+} from "./searchFallback.mjs";
 
 const app = express();
 const port = Number(process.env.NOIRWAVE_BACKEND_PORT ?? 6605);
@@ -23,17 +39,20 @@ const prefetchConcurrency = Math.max(1, Number(process.env.NOIRWAVE_PREFETCH_CON
 const backgroundPrefetchLimit = Math.max(0, Number(process.env.NOIRWAVE_BACKGROUND_PREFETCH_TRACKS) || 16);
 const foregroundPrefetchLimit = Math.max(0, Number(process.env.NOIRWAVE_FOREGROUND_PREFETCH_TRACKS) || 8);
 const foregroundPrefetchTimeoutMs = Math.max(0, Number(process.env.NOIRWAVE_FOREGROUND_PREFETCH_TIMEOUT_MS) || 0);
-const bitrateByFormat = new Map([
-  ["MP3_320", 3],
-  ["MP3_128", 1],
-]);
+const publicSearchFallbackDelayMs = Math.max(0, Number(process.env.NOIRWAVE_PUBLIC_SEARCH_FALLBACK_DELAY_MS) || 350);
+const publicDetailFallbackDelayMs = Math.max(0, Number(process.env.NOIRWAVE_PUBLIC_DETAIL_FALLBACK_DELAY_MS) || 250);
+const detailPayloadCacheTTLms = Math.max(30_000, Number(process.env.NOIRWAVE_DETAIL_CACHE_TTL_MS) || 10 * 60 * 1000);
+const sdkLoginTimeoutMs = Math.max(1000, Number(process.env.NOIRWAVE_SDK_LOGIN_TIMEOUT_MS) || 6000);
 
 let sdkState = null;
+let sdkInflight = null;
 const mediaURLCache = new Map();
 const mediaURLFailureCache = new Map();
 const mediaURLInflight = new Map();
 const trackMediaCache = new Map();
 const trackMediaInflight = new Map();
+const detailPayloadCache = new Map();
+const detailPayloadInflight = new Map();
 const startupSegmentCache = new Map();
 const startupSegmentInflight = new Map();
 const startupPrefetchQueue = [];
@@ -43,13 +62,6 @@ let activeStartupPrefetches = 0;
 app.use(express.json());
 
 const isValidTrackId = (value) => /^\d+$/.test(String(value ?? ""));
-
-const normalizeFormat = (value) => {
-  const requestedFormat = String(value ?? preferredFormat).trim();
-  return bitrateByFormat.has(requestedFormat) ? requestedFormat : preferredFormat;
-};
-
-const selectFormatsForSession = (_currentUser, requestedFormat) => [normalizeFormat(requestedFormat)];
 
 const estimatedSizeForFormat = (media, format) => {
   const size = format === "MP3_320"
@@ -84,6 +96,275 @@ const withTransientRetry = async (
 
   throw lastError;
 };
+
+const searchCatalog = async ({ term, scope, count }) => {
+  let catalogSucceeded = false;
+  let catalogPayload = null;
+  const catalogPromise = callCatalog([
+    "search",
+    "--query",
+    term,
+    "--scope",
+    scope,
+    "--limit",
+    String(count),
+  ], { timeoutMs: 9000, attempts: 1 })
+    .then((payload) => {
+      catalogSucceeded = true;
+      catalogPayload = payload;
+      return { source: "catalog", payload };
+    })
+    .catch((error) => ({ source: "catalog", error }));
+
+  const fallbackPromise = delay(publicSearchFallbackDelayMs).then(async () => {
+    if (catalogSucceeded && !isWeakSearchPayload(catalogPayload)) {
+      return { source: "fallback", skipped: true };
+    }
+    try {
+      const fallback = await publicDeezerSearch({ query: term, scope, count });
+      return { source: "fallback", payload: fallback };
+    } catch (fallbackError) {
+      return { source: "fallback", error: fallbackError };
+    }
+  });
+
+  const first = await Promise.race([catalogPromise, fallbackPromise]);
+  if (first.payload && !isWeakSearchPayload(first.payload)) {
+    if (first.source === "fallback") {
+      console.warn("[search] using public Deezer fallback", {
+        scope,
+        count: first.payload.data.length,
+      });
+    }
+    return first.payload;
+  }
+
+  const second = first.source === "catalog" ? await fallbackPromise : await catalogPromise;
+  if (
+    first.source === "catalog"
+    && first.payload
+    && second.source === "fallback"
+    && shouldPreferFallbackSearchPayload(first.payload, second.payload)
+  ) {
+    console.warn("[search] using public Deezer fallback for weak catalog payload", {
+      scope,
+      catalogCount: first.payload.data.length,
+      fallbackCount: second.payload.data.length,
+    });
+    return second.payload;
+  }
+
+  if (second.payload) {
+    if (second.source === "fallback") {
+      console.warn("[search] using public Deezer fallback", {
+        scope,
+        count: second.payload.data.length,
+        catalogError: first.error?.name,
+      });
+    }
+    return second.payload;
+  }
+
+  if (first.payload) {
+    return first.payload;
+  }
+
+  const catalogError = first.source === "catalog" ? first.error : second.error;
+  const fallbackError = first.source === "fallback" ? first.error : second.error;
+  console.warn("[search] public Deezer fallback failed", {
+    scope,
+    catalogError: catalogError?.name,
+    fallbackError: fallbackError?.name,
+  });
+  throw catalogError ?? fallbackError;
+};
+
+const albumDeclaredTrackCount = (payload) => {
+  const count = Number(payload?.nb_tracks ?? payload?.trackCount ?? payload?.tracks_count);
+  return Number.isFinite(count) && count > 0 ? count : 0;
+};
+
+const albumPayloadTracks = (payload) => Array.isArray(payload?.tracks) ? payload.tracks : [];
+
+const setCachedDetailPayload = (key, payload) => {
+  detailPayloadCache.set(key, {
+    payload,
+    expiresAt: Date.now() + detailPayloadCacheTTLms,
+  });
+};
+
+const cachedDetailPayload = async (key, producer) => {
+  const cached = detailPayloadCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.payload;
+  }
+
+  if (detailPayloadInflight.has(key)) {
+    return detailPayloadInflight.get(key);
+  }
+
+  const promise = producer()
+    .then((payload) => {
+      setCachedDetailPayload(key, payload);
+      return payload;
+    })
+    .finally(() => {
+      detailPayloadInflight.delete(key);
+    });
+
+  detailPayloadInflight.set(key, promise);
+  return promise;
+};
+
+const shouldRefreshAlbumDetail = (payload) => {
+  const declaredCount = albumDeclaredTrackCount(payload);
+  if (declaredCount === 0) return false;
+  const trackCount = albumPayloadTracks(payload).length;
+  if (trackCount < Math.min(declaredCount, 100)) return true;
+
+  const recordType = String(payload?.record_type ?? "").toLowerCase();
+  const title = String(payload?.title ?? "").toLowerCase();
+  const looksLikeFullAlbum = recordType === "studio" || recordType === "album";
+  const hasVariantMarker = /\b(single|ep|live|deluxe|anniversary|edition|expanded|demo|outtake)\b/u.test(title);
+  return looksLikeFullAlbum && !hasVariantMarker && trackCount > 0 && trackCount < 6;
+};
+
+const albumDetailPayload = async (id) => {
+  let catalogPayload;
+  let catalogError;
+
+  try {
+    catalogPayload = await callCatalog(["album", "--id", id], { timeoutMs: 30000 });
+  } catch (error) {
+    catalogError = error;
+  }
+
+  if (!catalogPayload || shouldRefreshAlbumDetail(catalogPayload)) {
+    try {
+      const fallbackPayload = await publicDeezerAlbumDetail({ id });
+      if (
+        !catalogPayload
+        || albumPayloadTracks(fallbackPayload).length > albumPayloadTracks(catalogPayload).length
+      ) {
+        console.warn("[tracklist] using public Deezer album detail fallback", {
+          id,
+          catalogTracks: albumPayloadTracks(catalogPayload).length,
+          fallbackTracks: albumPayloadTracks(fallbackPayload).length,
+          catalogError: catalogError?.name,
+        });
+        return fallbackPayload;
+      }
+    } catch (fallbackError) {
+      if (!catalogPayload) throw catalogError ?? fallbackError;
+      console.warn("[tracklist] public Deezer album detail fallback failed", {
+        id,
+        catalogTracks: albumPayloadTracks(catalogPayload).length,
+        fallbackError: fallbackError?.name,
+      });
+    }
+  }
+
+  if (!catalogPayload) throw catalogError;
+  return catalogPayload;
+};
+
+const artistPayloadTopTracks = (payload) =>
+  Array.isArray(payload?.top_tracks)
+    ? payload.top_tracks
+    : Array.isArray(payload?.topTracks)
+      ? payload.topTracks
+      : [];
+
+const artistPayloadReleaseBuckets = (payload) =>
+  payload?.releases && typeof payload.releases === "object" ? payload.releases : {};
+
+const artistPayloadReleaseCount = (payload) => {
+  const releases = artistPayloadReleaseBuckets(payload);
+  if (Array.isArray(releases.all)) return releases.all.length;
+  return Object.values(releases).reduce((count, bucket) => count + (Array.isArray(bucket) ? bucket.length : 0), 0);
+};
+
+const artistDeclaredAlbumCount = (payload) => {
+  const count = Number(payload?.nb_album ?? payload?.albumCount ?? payload?.albums_count);
+  return Number.isFinite(count) && count > 0 ? count : 0;
+};
+
+const shouldRefreshArtistDetail = (payload) => {
+  if (!payload) return true;
+  const topTrackCount = artistPayloadTopTracks(payload).length;
+  const releaseCount = artistPayloadReleaseCount(payload);
+  const declaredAlbumCount = artistDeclaredAlbumCount(payload);
+  if (topTrackCount === 0 && releaseCount === 0) return true;
+  return declaredAlbumCount > 0 && releaseCount === 0;
+};
+
+const isFallbackArtistDetailBetter = (fallbackPayload, catalogPayload) => {
+  if (!fallbackPayload) return false;
+  if (!catalogPayload) return true;
+  const fallbackScore = artistPayloadTopTracks(fallbackPayload).length + artistPayloadReleaseCount(fallbackPayload);
+  const catalogScore = artistPayloadTopTracks(catalogPayload).length + artistPayloadReleaseCount(catalogPayload);
+  return fallbackScore > catalogScore;
+};
+
+const artistDetailPayload = async (id) => cachedDetailPayload(`artist:${id}`, async () => {
+  const cacheKey = `artist:${id}`;
+  let catalogSucceeded = false;
+  const catalogPromise = callCatalog(["artist", "--id", id], { timeoutMs: 12_000, attempts: 1 })
+    .then((payload) => {
+      catalogSucceeded = true;
+      return { source: "catalog", payload };
+    })
+    .catch((error) => ({ source: "catalog", error }));
+
+  const fallbackPromise = delay(publicDetailFallbackDelayMs).then(async () => {
+    if (catalogSucceeded) return { source: "fallback", skipped: true };
+    try {
+      const fallbackPayload = await publicDeezerArtistDetail({ id });
+      return { source: "fallback", payload: fallbackPayload };
+    } catch (error) {
+      return { source: "fallback", error };
+    }
+  });
+
+  const first = await Promise.race([catalogPromise, fallbackPromise]);
+  if (first.payload) {
+    if (first.source === "fallback") {
+      catalogPromise.then((catalogResult) => {
+        if (catalogResult.payload && isFallbackArtistDetailBetter(catalogResult.payload, first.payload)) {
+          setCachedDetailPayload(cacheKey, catalogResult.payload);
+        }
+      }).catch(() => {});
+      console.warn("[tracklist] using public Deezer artist detail fallback", {
+        id,
+        releases: artistPayloadReleaseCount(first.payload),
+        topTracks: artistPayloadTopTracks(first.payload).length,
+      });
+      return first.payload;
+    }
+
+    if (!shouldRefreshArtistDetail(first.payload)) {
+      return first.payload;
+    }
+  }
+
+  const second = first.source === "catalog" ? await fallbackPromise : await catalogPromise;
+  if (second.payload && (first.source !== "catalog" || isFallbackArtistDetailBetter(second.payload, first.payload))) {
+    if (second.source === "fallback") {
+      console.warn("[tracklist] using public Deezer artist detail fallback", {
+        id,
+        catalogReleases: artistPayloadReleaseCount(first.payload),
+        fallbackReleases: artistPayloadReleaseCount(second.payload),
+        catalogTopTracks: artistPayloadTopTracks(first.payload).length,
+        fallbackTopTracks: artistPayloadTopTracks(second.payload).length,
+        catalogError: first.error?.name,
+      });
+    }
+    return second.payload;
+  }
+
+  if (first.payload) return first.payload;
+  throw first.error ?? second.error;
+});
 
 const isRetryableMediaResolutionError = (error) =>
   isTransientNetworkError(error) || error?.name === "MediaURLNotFound";
@@ -297,12 +578,16 @@ const resolveTrackMedia = async (dz, trackId) => {
   return promise;
 };
 
-const loginViaArlWithRetry = async (dz, arl, attempts = 3) => {
+const loginViaArlWithRetry = async (dz, arl, attempts = 1) => {
   let lastError;
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
-      return await dz.loginViaArl(arl);
+      return await withRejectTimeout(
+        dz.loginViaArl(arl),
+        sdkLoginTimeoutMs,
+        "Deezer SDK login timed out."
+      );
     } catch (error) {
       lastError = error;
       if (attempt >= attempts - 1 || !isTransientNetworkError(error)) throw error;
@@ -366,25 +651,32 @@ const logStreamRequest = (request, { resolved, range, status, startupCache = nul
 
 const ensureSDK = async () => {
   if (sdkState) return sdkState;
+  if (sdkInflight) return sdkInflight;
 
-  const arl = readARL();
-  if (!arl) {
-    const error = new Error("No Deezer session configured.");
-    error.statusCode = 401;
-    throw error;
-  }
+  sdkInflight = (async () => {
+    const arl = readARL();
+    if (!arl) {
+      const error = new Error("No Deezer session configured.");
+      error.statusCode = 401;
+      throw error;
+    }
 
-  const modules = await loadDeemixModules();
-  const dz = new modules.deezerSdk.Deezer();
-  const loggedIn = await loginViaArlWithRetry(dz, arl);
-  if (!loggedIn) {
-    const error = new Error("Deezer session login failed.");
-    error.statusCode = 401;
-    throw error;
-  }
+    const modules = await loadDeemixModules();
+    const dz = new modules.deezerSdk.Deezer();
+    const loggedIn = await loginViaArlWithRetry(dz, arl);
+    if (!loggedIn) {
+      const error = new Error("Deezer session login failed.");
+      error.statusCode = 401;
+      throw error;
+    }
 
-  sdkState = { ...modules, dz };
-  return sdkState;
+    sdkState = { ...modules, dz };
+    return sdkState;
+  })().finally(() => {
+    sdkInflight = null;
+  });
+
+  return sdkInflight;
 };
 
 const resolveMediaURLForFormat = async (dz, media, trackId, selectedFormat) => {
@@ -489,6 +781,7 @@ const prefetchStartupSegment = async (trackId, requestedFormat = preferredFormat
       () => resolveMediaURL(trackId, format),
       { attempts: 3, delayMs: 500, shouldRetry: isRetryableMediaResolutionError }
     );
+    const resolvedCacheKey = startupSegmentKey(trackId, resolved.format);
     const { deemix } = await ensureSDK();
     const buffer = await withTransientRetry(
       () => readDeezerStartupSegment({
@@ -504,7 +797,7 @@ const prefetchStartupSegment = async (trackId, requestedFormat = preferredFormat
       buffer,
       expiresAt: Math.min(resolved.expiresAt, Date.now() + 10 * 60 * 1000),
     };
-    setCachedStartupSegment(cacheKey, startup);
+    setCachedStartupSegment(resolvedCacheKey, startup);
     return { ...startup, cacheHit: false };
   })().finally(() => {
     startupSegmentInflight.delete(cacheKey);
@@ -653,6 +946,7 @@ const warmForegroundPrefetch = async (trackIds, format = preferredFormat) => {
 
 app.get("/api/connect", asyncHandler(async (_request, response) => {
   const sdk = await ensureSDK();
+  const sessionFormat = defaultFormatForSession(sdk.dz.currentUser, preferredFormat);
   response.json({
     result: true,
     deezerAvailable: "yes",
@@ -666,8 +960,8 @@ app.get("/api/connect", asyncHandler(async (_request, response) => {
     },
     source: "Noirwave Backend",
     playback: "deezer-sdk",
-    format: preferredFormat,
-    fallbackFormat: null,
+    format: sessionFormat,
+    fallbackFormat: fallbackFormatForSession(sdk.dz.currentUser, preferredFormat),
   });
 }));
 
@@ -713,20 +1007,14 @@ app.get("/api/search", asyncHandler(async (request, response) => {
     return;
   }
 
-  const payload = await callCatalog([
-    "search",
-    "--query",
-    term,
-    "--scope",
-    scope,
-    "--limit",
-    String(count),
-  ]);
+  const payload = await searchCatalog({ term, scope, count });
   if (scope === "track") {
     cacheTrackMediaFromPayload(payload);
-    const trackIds = extractTrackIds(payload);
-    await warmForegroundPrefetch(trackIds, preferredFormat);
-    scheduleBackgroundPrefetch(trackIds, preferredFormat);
+    if (payload.source !== "deezer-public-search") {
+      const trackIds = extractTrackIds(payload);
+      await warmForegroundPrefetch(trackIds, preferredFormat);
+      scheduleBackgroundPrefetch(trackIds, preferredFormat);
+    }
   }
 
   response.json(payload);
@@ -740,7 +1028,9 @@ app.get("/api/getTracklist", asyncHandler(async (request, response) => {
     return;
   }
 
-  const payload = await callCatalog([type, "--id", id], { timeoutMs: 30000 });
+  const payload = type === "album"
+    ? await cachedDetailPayload(`album:${id}`, () => albumDetailPayload(id))
+    : await artistDetailPayload(id);
   cacheTrackMediaFromPayload(payload);
   response.json(payload);
   scheduleBackgroundPrefetch(extractTrackIds(payload), preferredFormat);

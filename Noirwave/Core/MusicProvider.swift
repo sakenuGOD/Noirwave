@@ -1,6 +1,7 @@
 import Foundation
 
 enum SearchScope: String, CaseIterable, Identifiable {
+    case smart = "Smart"
     case catalog = "Tracks"
     case library = "Artists"
     case playlists = "Albums"
@@ -9,6 +10,8 @@ enum SearchScope: String, CaseIterable, Identifiable {
 
     var systemImage: String {
         switch self {
+        case .smart:
+            "magnifyingglass"
         case .catalog:
             "square.grid.2x2"
         case .library:
@@ -20,6 +23,8 @@ enum SearchScope: String, CaseIterable, Identifiable {
 
     var resultsTitle: String {
         switch self {
+        case .smart:
+            "Best Matches"
         case .catalog:
             "Track Results"
         case .library:
@@ -36,6 +41,34 @@ enum PlaybackState: Equatable {
     case playing
     case paused
     case failed(String)
+}
+
+enum RepeatMode: String, CaseIterable, Identifiable {
+    case off = "Off"
+    case all = "All"
+    case one = "One"
+
+    var id: String { rawValue }
+
+    var systemImage: String {
+        switch self {
+        case .off, .all:
+            "repeat"
+        case .one:
+            "repeat.1"
+        }
+    }
+
+    var next: RepeatMode {
+        switch self {
+        case .off:
+            .all
+        case .all:
+            .one
+        case .one:
+            .off
+        }
+    }
 }
 
 struct TrackLyricsLine: Identifiable, Equatable, Hashable {
@@ -140,6 +173,7 @@ protocol MusicProviding: AnyObject {
     func pause() async
     func stop() async
     func seek(to time: TimeInterval) async
+    func setVolume(_ volume: Double)
     func currentPlaybackTime() -> TimeInterval?
 }
 

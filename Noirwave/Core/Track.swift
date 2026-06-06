@@ -106,6 +106,356 @@ struct Track: Identifiable, Hashable {
     }
 }
 
+struct ArtistReleaseGroups: Equatable {
+    let studioAlbums: [Track]
+    let otherReleases: [Track]
+}
+
+enum ArtistReleaseClassifier {
+    private static let liveMarkers = Set(["live", "unplugged", "session", "sessions"])
+    private static let reissueMarkers = Set(["deluxe", "expanded", "anniversary", "edition", "bonus", "demo", "demos", "outtake", "outtakes"])
+    private static let compilationMarkers = Set(["collection", "anthology", "rarities"])
+
+    static func groups(from releases: [Track]) -> ArtistReleaseGroups {
+        var studioKeys: [String] = []
+        var studioByKey: [String: Track] = [:]
+        var otherReleases: [Track] = []
+
+        for release in releases where release.kind == .album {
+            let key = canonicalReleaseKey(release.title)
+            guard !key.isEmpty, isStudioAlbumCandidate(release) else {
+                otherReleases.append(release)
+                continue
+            }
+
+            if let current = studioByKey[key] {
+                if prefersStudioRelease(release, over: current) {
+                    studioByKey[key] = release
+                    otherReleases.append(current)
+                } else {
+                    otherReleases.append(release)
+                }
+            } else {
+                studioKeys.append(key)
+                studioByKey[key] = release
+            }
+        }
+
+        let studioAlbums = studioKeys.compactMap { studioByKey[$0] }
+        return ArtistReleaseGroups(studioAlbums: studioAlbums, otherReleases: otherReleases)
+    }
+
+    private static func isStudioAlbumCandidate(_ release: Track) -> Bool {
+        let recordType = release.recordType?.searchNormalized ?? "album"
+        let titleTokens = tokens(in: release.title)
+
+        if recordType.contains("single") || recordType == "ep" || recordType.contains("compilation") {
+            return false
+        }
+
+        if recordType.contains("live") || recordType.contains("reissue") {
+            return false
+        }
+
+        if intersects(titleTokens, liveMarkers) || intersects(titleTokens, reissueMarkers) || intersects(titleTokens, compilationMarkers) {
+            return false
+        }
+
+        if release.trackCount.map({ $0 < 6 }) == true {
+            return false
+        }
+
+        return recordType.contains("studio") || recordType == "album"
+    }
+
+    private static func canonicalReleaseKey(_ title: String) -> String {
+        tokenList(in: title)
+            .filter { token in
+                !liveMarkers.contains(token)
+                    && !reissueMarkers.contains(token)
+                    && !compilationMarkers.contains(token)
+                    && !["remaster", "remastered", "super", "special", "explicit", "clean", "version"].contains(token)
+                    && !isOrdinalToken(token)
+            }
+            .joined(separator: " ")
+    }
+
+    private static func prefersStudioRelease(_ candidate: Track, over current: Track) -> Bool {
+        let candidatePenalty = variantPenalty(candidate)
+        let currentPenalty = variantPenalty(current)
+        if candidatePenalty != currentPenalty {
+            return candidatePenalty < currentPenalty
+        }
+
+        if let candidateDate = candidate.releaseDate?.nonEmpty,
+           let currentDate = current.releaseDate?.nonEmpty,
+           candidateDate != currentDate {
+            return candidateDate < currentDate
+        }
+
+        let candidateTracks = candidate.trackCount ?? 0
+        let currentTracks = current.trackCount ?? 0
+        if candidateTracks != currentTracks {
+            return candidateTracks > currentTracks
+        }
+
+        return candidate.title.localizedCaseInsensitiveCompare(current.title) == .orderedAscending
+    }
+
+    private static func variantPenalty(_ release: Track) -> Int {
+        let titleTokens = tokens(in: release.title)
+        var penalty = release.title.contains("(") || release.title.contains("[") ? 2 : 0
+        if intersects(titleTokens, reissueMarkers) || titleTokens.contains(where: isOrdinalToken) {
+            penalty += 4
+        }
+        if intersects(titleTokens, liveMarkers) {
+            penalty += 8
+        }
+        return penalty
+    }
+
+    private static func tokens(in value: String) -> Set<String> {
+        Set(tokenList(in: value))
+    }
+
+    private static func tokenList(in value: String) -> [String] {
+        value.searchNormalized.split(separator: " ").map(String.init)
+    }
+
+    private static func intersects(_ tokens: Set<String>, _ markers: Set<String>) -> Bool {
+        !tokens.isDisjoint(with: markers)
+    }
+
+    private static func isOrdinalToken(_ token: String) -> Bool {
+        token.range(of: #"^\d+(st|nd|rd|th)$"#, options: .regularExpression) != nil
+    }
+}
+
+enum SmartSearchRanker {
+    private static let weakArtistPrefixMinimumFans = 5_000
+    private static let weakArtistContainsMinimumFans = 50_000
+
+    static func ranked(
+        query: String,
+        artists: [Track],
+        tracks: [Track],
+        albums: [Track],
+        limit: Int = 50
+    ) -> [Track] {
+        let term = query.searchNormalized
+        guard !term.isEmpty else { return [] }
+
+        let uniqueArtists = deduplicatedArtists(artists)
+            .filter { allowsArtist($0, term: term) }
+        let uniqueTracks = deduplicatedItems(tracks)
+        let uniqueAlbums = deduplicatedItems(albums)
+        let dominantArtists = Set(
+            (
+                uniqueArtists
+                .filter { $0.title.searchNormalized == term }
+                .sorted { ($0.fanCount ?? 0) > ($1.fanCount ?? 0) }
+                .prefix(3)
+                .map { $0.title.searchNormalized }
+            )
+            + inferredDominantArtistNames(term: term, tracks: uniqueTracks, albums: uniqueAlbums)
+        )
+
+        let items = uniqueArtists + uniqueTracks + uniqueAlbums
+        return items
+            .compactMap { item -> (item: Track, score: Int)? in
+                guard let score = score(item, term: term, dominantArtists: dominantArtists) else {
+                    return nil
+                }
+                return (item, score)
+            }
+            .sorted { lhs, rhs in
+                if lhs.score == rhs.score {
+                    return lhs.item.title.localizedCaseInsensitiveCompare(rhs.item.title) == .orderedAscending
+                }
+                return lhs.score > rhs.score
+            }
+            .prefix(limit)
+            .map(\.item)
+    }
+
+    private static func score(_ item: Track, term: String, dominantArtists: Set<String>) -> Int? {
+        let titleScore = matchScore(term: term, text: item.title)
+        let artistScore = matchScore(term: term, text: item.artist)
+        let albumScore = matchScore(term: term, text: item.album)
+        guard max(titleScore, artistScore, albumScore) > 0 else { return nil }
+
+        switch item.kind {
+        case .artist:
+            return 1_700_000 + titleScore + audienceWeight(item.fanCount)
+        case .track:
+            let normalizedArtist = item.artist.searchNormalized
+            var score = 480_000
+                + max(titleScore, albumScore / 2)
+                + artistScore
+                + popularityWeight(item.rank)
+
+            if dominantArtists.contains(normalizedArtist) {
+                score += 650_000
+            } else if !dominantArtists.isEmpty, titleScore >= 700_000 {
+                score -= 520_000
+            }
+
+            return score
+        case .album:
+            let normalizedArtist = item.artist.searchNormalized
+            var score = 360_000
+                + max(titleScore, artistScore)
+                + popularityWeight(item.rank)
+                + audienceWeight(item.fanCount) / 2
+
+            if dominantArtists.contains(normalizedArtist) {
+                score += 300_000
+            }
+
+            return score
+        }
+    }
+
+    private static func allowsArtist(_ artist: Track, term: String) -> Bool {
+        let name = artist.title.searchNormalized
+        guard matchScore(term: term, text: artist.title) > 0 else { return false }
+        if name == term {
+            return true
+        }
+
+        if name.hasPrefix("\(term) ") {
+            return (artist.fanCount ?? 0) >= weakArtistPrefixMinimumFans
+        }
+
+        return (artist.fanCount ?? 0) >= weakArtistContainsMinimumFans
+    }
+
+    private static func inferredDominantArtistNames(term: String, tracks: [Track], albums: [Track]) -> [String] {
+        var scoreByArtist: [String: Int] = [:]
+
+        for track in tracks where track.artist.searchNormalized == term {
+            scoreByArtist[term, default: 0] += 220_000 + popularityWeight(track.rank)
+        }
+
+        for album in albums where album.artist.searchNormalized == term {
+            scoreByArtist[term, default: 0] += 120_000 + popularityWeight(album.rank)
+        }
+
+        return scoreByArtist
+            .sorted { lhs, rhs in
+                if lhs.value == rhs.value {
+                    return lhs.key < rhs.key
+                }
+                return lhs.value > rhs.value
+            }
+            .prefix(3)
+            .map(\.key)
+    }
+
+    private static func matchScore(term: String, text: String) -> Int {
+        let value = text.searchNormalized
+        guard !value.isEmpty else { return 0 }
+
+        if value == term {
+            return 700_000
+        }
+
+        if value.hasPrefix(term) {
+            return 500_000
+        }
+
+        if value.containsWholePhrase(term) {
+            return 300_000
+        }
+
+        let termTokens = term.split(separator: " ").map(String.init)
+        let valueTokens = Set(value.split(separator: " ").map(String.init))
+        guard !termTokens.isEmpty else { return 0 }
+
+        if termTokens.allSatisfy({ valueTokens.contains($0) || value.contains($0) }) {
+            return 180_000 + (termTokens.count * 20_000)
+        }
+
+        let hits = termTokens.filter { valueTokens.contains($0) || value.contains($0) }.count
+        return hits > 0 ? hits * 30_000 : 0
+    }
+
+    private static func audienceWeight(_ count: Int?) -> Int {
+        min(max(count ?? 0, 0) / 80, 350_000)
+    }
+
+    private static func popularityWeight(_ rank: Int?) -> Int {
+        min(max(rank ?? 0, 0) / 8, 160_000)
+    }
+
+    private static func deduplicatedArtists(_ artists: [Track]) -> [Track] {
+        deduplicated(artists, key: { $0.title.searchNormalized }) { candidate, current in
+            let candidateFans = candidate.fanCount ?? 0
+            let currentFans = current.fanCount ?? 0
+            if candidateFans == currentFans {
+                return (candidate.albumCount ?? 0) > (current.albumCount ?? 0)
+            }
+            return candidateFans > currentFans
+        }
+    }
+
+    private static func deduplicatedItems(_ items: [Track]) -> [Track] {
+        deduplicated(items, key: { item in
+            item.catalogID?.nonEmpty ?? "\(item.kind.rawValue).\(item.title.searchNormalized).\(item.artist.searchNormalized)"
+        }) { candidate, current in
+            let candidateRank = candidate.rank ?? candidate.fanCount ?? 0
+            let currentRank = current.rank ?? current.fanCount ?? 0
+            return candidateRank > currentRank
+        }
+    }
+
+    private static func deduplicated(
+        _ items: [Track],
+        key: (Track) -> String,
+        prefers candidate: (Track, Track) -> Bool
+    ) -> [Track] {
+        var keys: [String] = []
+        var bestByKey: [String: Track] = [:]
+
+        for item in items {
+            let itemKey = key(item)
+            guard !itemKey.isEmpty else { continue }
+
+            if let current = bestByKey[itemKey] {
+                if candidate(item, current) {
+                    bestByKey[itemKey] = item
+                }
+            } else {
+                keys.append(itemKey)
+                bestByKey[itemKey] = item
+            }
+        }
+
+        return keys.compactMap { bestByKey[$0] }
+    }
+}
+
+enum LibrarySearchFilter {
+    static func filteredTracks(_ tracks: [Track], query: String) -> [Track] {
+        let term = query.searchNormalized
+        guard !term.isEmpty else { return tracks }
+
+        let tokens = term.split(separator: " ").map(String.init)
+        return tracks.filter { track in
+            let searchableText = [
+                track.title,
+                track.artist,
+                track.album
+            ]
+            .joined(separator: " ")
+            .searchNormalized
+
+            return searchableText.containsWholePhrase(term)
+                || tokens.allSatisfy { searchableText.contains($0) }
+        }
+    }
+}
+
 extension Int {
     var compactCountLabel: String {
         let value = Double(self)
@@ -196,7 +546,13 @@ extension String {
     }
 
     var displayRecordType: String {
-        switch lowercased() {
+        switch searchNormalized {
+        case "studio", "studio album":
+            "Studio Album"
+        case "live", "live album":
+            "Live Album"
+        case "reissue":
+            "Reissue"
         case "single":
             "Single"
         case "ep":
@@ -214,6 +570,20 @@ extension String {
         }
 
         return self
+    }
+
+    var searchNormalized: String {
+        folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+            .lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    fileprivate func containsWholePhrase(_ phrase: String) -> Bool {
+        let paddedValue = " \(self) "
+        let paddedPhrase = " \(phrase) "
+        return paddedValue.contains(paddedPhrase)
     }
 }
 

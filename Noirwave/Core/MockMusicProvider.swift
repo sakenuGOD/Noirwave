@@ -96,6 +96,8 @@ final class MockMusicProvider: MusicProviding {
 
         guard !term.isEmpty else {
             switch scope {
+            case .smart:
+                return SmartSearchRanker.ranked(query: query, artists: artistCards, tracks: tracks, albums: albumCards)
             case .catalog:
                 return tracks
             case .library:
@@ -112,6 +114,20 @@ final class MockMusicProvider: MusicProviding {
         }
 
         switch scope {
+        case .smart:
+            let matchingArtists = artistCards.filter { artist in
+                artist.title.lowercased().contains(term)
+            }
+            let matchingAlbums = albumCards.filter { album in
+                album.title.lowercased().contains(term)
+                    || album.artist.lowercased().contains(term)
+            }
+            return SmartSearchRanker.ranked(
+                query: query,
+                artists: matchingArtists,
+                tracks: matchingTracks,
+                albums: matchingAlbums
+            )
         case .catalog:
             let matchingArtists = artistCards.filter { artist in
                 artist.title.lowercased().contains(term)
@@ -192,6 +208,8 @@ final class MockMusicProvider: MusicProviding {
     func stop() async {}
 
     func seek(to time: TimeInterval) async {}
+
+    func setVolume(_ volume: Double) {}
 
     func currentPlaybackTime() -> TimeInterval? {
         nil

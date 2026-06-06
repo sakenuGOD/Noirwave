@@ -15,23 +15,41 @@ final class PlayerStore: ObservableObject {
     @Published private(set) var errorMessage: String?
     @Published private(set) var resultTitle = "Catalog Tracks"
     @Published private(set) var resultSubtitle: String?
+    @Published private(set) var catalogContext: Track?
+    @Published private(set) var isShuffled = false
+    @Published private(set) var repeatMode: RepeatMode = .off
+    @Published private(set) var likedTrackIDs: Set<String> = []
+    @Published private(set) var listeningScores: [String: Int] = [:]
 
     @Published var searchQuery = ""
-    @Published var selectedScope: SearchScope = .catalog
+    @Published var selectedScope: SearchScope = .smart
     @Published var progress: TimeInterval = 0
     @Published var volume: Double = 0.78
 
     let provider: MusicProviding
 
+    private static let likedTrackIDsKey = "noirwave.likedTrackIDs"
+    private static let listeningScoresKey = "noirwave.listeningScores"
     private let playbackContextLimit = 16
+    private let userDefaults: UserDefaults
     private var searchTask: Task<Void, Never>?
     private var playbackTask: Task<Void, Never>?
     private var progressTask: Task<Void, Never>?
     private var lyricsTask: Task<Void, Never>?
     private var preparationTask: Task<Void, Never>?
+    private var lastAudibleVolume: Double = 0.78
 
-    init(provider: MusicProviding) {
+    init(provider: MusicProviding, userDefaults: UserDefaults = .standard) {
         self.provider = provider
+        self.userDefaults = userDefaults
+        likedTrackIDs = Set(userDefaults.stringArray(forKey: Self.likedTrackIDsKey) ?? [])
+        listeningScores = (userDefaults.dictionary(forKey: Self.listeningScoresKey) ?? [:]).reduce(into: [:]) { result, item in
+            if let score = item.value as? Int {
+                result[item.key] = score
+            } else if let score = item.value as? NSNumber {
+                result[item.key] = score.intValue
+            }
+        }
     }
 
     var needsBackendSession: Bool {
@@ -71,6 +89,7 @@ final class PlayerStore: ObservableObject {
     }
 
     func updateSearchQuery(_ query: String) {
+        selectedScope = .smart
         searchQuery = query
         scheduleSearch()
     }
@@ -78,6 +97,20 @@ final class PlayerStore: ObservableObject {
     func setScope(_ scope: SearchScope) {
         selectedScope = scope
         scheduleSearch()
+    }
+
+    func leaveCatalogContext() {
+        guard catalogContext != nil else { return }
+        catalogContext = nil
+        resultSubtitle = nil
+
+        if searchQuery.trimmed.isEmpty {
+            resultTitle = "Catalog Tracks"
+            visibleTracks = featuredTracks
+        } else {
+            resultTitle = SearchScope.smart.resultsTitle
+            scheduleSearch()
+        }
     }
 
     func activate(_ item: Track) {
@@ -90,6 +123,25 @@ final class PlayerStore: ObservableObject {
         queue = playbackContext
         prepare(Array(([item] + playbackContext).prefix(playbackContextLimit)))
         play(item)
+    }
+
+    func playAll(_ tracks: [Track]) {
+        let playableTracks = uniquePlayableTracks(in: tracks)
+        guard let firstTrack = playableTracks.first else { return }
+
+        queue = Array(playableTracks.dropFirst())
+        prepare(Array(playableTracks.prefix(playbackContextLimit)))
+        play(firstTrack)
+    }
+
+    func shufflePlay(_ tracks: [Track]) {
+        let playableTracks = uniquePlayableTracks(in: tracks).shuffled()
+        guard let firstTrack = playableTracks.first else { return }
+
+        isShuffled = true
+        queue = Array(playableTracks.dropFirst())
+        prepare(Array(playableTracks.prefix(playbackContextLimit)))
+        play(firstTrack)
     }
 
     func connectProvider() {
@@ -161,6 +213,7 @@ final class PlayerStore: ObservableObject {
             do {
                 try await provider.play(track)
                 guard !Task.isCancelled else { return }
+                recordListening(track)
                 playbackState = .playing
                 startProgressTicker()
                 preparePlaybackContext()
@@ -175,7 +228,10 @@ final class PlayerStore: ObservableObject {
         switch playbackState {
         case .playing:
             pause()
-        case .paused, .idle, .failed(_):
+        case .failed(_):
+            guard let currentTrack else { return }
+            play(currentTrack)
+        case .paused, .idle:
             guard let currentTrack else { return }
             if progress > 0 {
                 resume()
@@ -215,6 +271,12 @@ final class PlayerStore: ObservableObject {
     }
 
     func next() {
+        if repeatMode == .one, let currentTrack {
+            prepare([currentTrack])
+            play(currentTrack)
+            return
+        }
+
         if !queue.isEmpty {
             let nextTrack = queue.removeFirst()
             prepare(Array(([nextTrack] + queue).prefix(playbackContextLimit)))
@@ -223,30 +285,72 @@ final class PlayerStore: ObservableObject {
             return
         }
 
+        if isShuffled,
+           let nextTrack = shuffledPlaybackCandidates(excluding: currentTrack).first {
+            queue = Array(shuffledPlaybackCandidates(excluding: nextTrack).prefix(playbackContextLimit))
+            prepare(Array(([nextTrack] + queue).prefix(playbackContextLimit)))
+            play(nextTrack)
+            return
+        }
+
+        let context = currentPlaybackContext
         guard let currentTrack,
-              let index = featuredTracks.firstIndex(of: currentTrack),
-              !featuredTracks.isEmpty
-        else { return }
-
-        let nextIndex = featuredTracks.index(after: index) % featuredTracks.count
-        let nextTrack = featuredTracks[nextIndex]
-        prepare([nextTrack] + playbackQueue(after: nextTrack, in: featuredTracks, limit: playbackContextLimit - 1))
-        play(nextTrack)
-    }
-
-    func previous() {
-        guard progress < 4,
-              let currentTrack,
-              let index = featuredTracks.firstIndex(of: currentTrack),
-              !featuredTracks.isEmpty
+              let index = context.firstIndex(of: currentTrack),
+              !context.isEmpty
         else {
+            if repeatMode == .all,
+               let nextTrack = context.first(where: \.isPlayable) {
+                play(nextTrack)
+            }
+            return
+        }
+
+        let isLastTrack = context.index(after: index) == context.endIndex
+        guard !isLastTrack || repeatMode == .all else {
+            playbackState = .idle
             progress = 0
             return
         }
 
-        let previousIndex = index == featuredTracks.startIndex ? featuredTracks.count - 1 : index - 1
-        let previousTrack = featuredTracks[previousIndex]
-        prepare([previousTrack] + playbackQueue(after: previousTrack, in: featuredTracks, limit: playbackContextLimit - 1))
+        let nextIndex = isLastTrack ? context.startIndex : context.index(after: index)
+        let nextTrack = context[nextIndex]
+        prepare([nextTrack] + playbackQueue(after: nextTrack, in: context, limit: playbackContextLimit - 1))
+        play(nextTrack)
+    }
+
+    func previous() {
+        guard progress < 4 else {
+            progress = 0
+            Task {
+                await provider.seek(to: 0)
+            }
+            return
+        }
+
+        let context = currentPlaybackContext
+        guard let currentTrack,
+              let index = context.firstIndex(of: currentTrack),
+              !context.isEmpty
+        else {
+            progress = 0
+            Task {
+                await provider.seek(to: 0)
+            }
+            return
+        }
+
+        let isFirstTrack = index == context.startIndex
+        guard !isFirstTrack || repeatMode == .all else {
+            progress = 0
+            Task {
+                await provider.seek(to: 0)
+            }
+            return
+        }
+
+        let previousIndex = isFirstTrack ? context.index(before: context.endIndex) : context.index(before: index)
+        let previousTrack = context[previousIndex]
+        prepare([previousTrack] + playbackQueue(after: previousTrack, in: context, limit: playbackContextLimit - 1))
         play(previousTrack)
     }
 
@@ -259,9 +363,100 @@ final class PlayerStore: ObservableObject {
         preparePlaybackContext()
     }
 
+    func playNext(_ track: Track) {
+        guard track.isPlayable,
+              track != currentTrack
+        else { return }
+
+        queue.removeAll { $0 == track }
+        queue.insert(track, at: queue.startIndex)
+        preparePlaybackContext()
+    }
+
+    func enqueue(_ tracks: [Track]) {
+        let playableTracks = uniquePlayableTracks(in: tracks)
+        guard !playableTracks.isEmpty else { return }
+
+        for track in playableTracks {
+            guard track != currentTrack,
+                  !queue.contains(track)
+            else { continue }
+
+            queue.append(track)
+        }
+
+        preparePlaybackContext()
+    }
+
+    func playNext(_ tracks: [Track]) {
+        let playableTracks = uniquePlayableTracks(in: tracks)
+            .filter { $0 != currentTrack }
+        guard !playableTracks.isEmpty else { return }
+
+        let nextIDs = Set(playableTracks.map(\.id))
+        queue.removeAll { nextIDs.contains($0.id) }
+        queue.insert(contentsOf: playableTracks, at: queue.startIndex)
+        preparePlaybackContext()
+    }
+
+    func isLiked(_ track: Track) -> Bool {
+        likedTrackIDs.contains(track.id)
+    }
+
+    func toggleLike(_ track: Track) {
+        guard track.isPlayable else { return }
+
+        if likedTrackIDs.contains(track.id) {
+            likedTrackIDs.remove(track.id)
+        } else {
+            likedTrackIDs.insert(track.id)
+        }
+
+        persistLikedTracks()
+    }
+
+    func likedTracks(limit: Int = 12) -> [Track] {
+        Array(
+            knownPlaybackTracks
+                .filter { likedTrackIDs.contains($0.id) }
+                .prefix(limit)
+        )
+    }
+
+    func startWave() {
+        let wave = smartWaveTracks(limit: playbackContextLimit)
+        guard let firstTrack = wave.first else { return }
+
+        queue = Array(wave.dropFirst())
+        prepare(Array(wave.prefix(playbackContextLimit)))
+        play(firstTrack)
+    }
+
     func removeFromQueue(_ track: Track) {
         queue.removeAll { $0 == track }
         preparePlaybackContext()
+    }
+
+    func clearQueue() {
+        queue.removeAll()
+        preparePlaybackContext()
+    }
+
+    func toggleShuffle() {
+        isShuffled.toggle()
+        guard isShuffled else {
+            guard let currentTrack else { return }
+            queue = playbackQueue(after: currentTrack, in: currentPlaybackContext, limit: playbackContextLimit)
+            preparePlaybackContext()
+            return
+        }
+
+        queue = Array(shuffledPlaybackCandidates(excluding: currentTrack).prefix(playbackContextLimit))
+        preparePlaybackContext()
+    }
+
+    func cycleRepeatMode() {
+        repeatMode = repeatMode.next
     }
 
     func seek(to fraction: Double) {
@@ -271,6 +466,22 @@ final class PlayerStore: ObservableObject {
         let targetTime = progress
         Task {
             await provider.seek(to: targetTime)
+        }
+    }
+
+    func setVolume(_ value: Double) {
+        volume = min(max(value, 0), 1)
+        if volume > 0 {
+            lastAudibleVolume = volume
+        }
+        provider.setVolume(volume)
+    }
+
+    func toggleMute() {
+        if volume > 0 {
+            setVolume(0)
+        } else {
+            setVolume(max(lastAudibleVolume, 0.1))
         }
     }
 
@@ -286,13 +497,14 @@ final class PlayerStore: ObservableObject {
 
     private func runSearch() async {
         let term = searchQuery.trimmed
-        let scope = selectedScope
+        let scope = SearchScope.smart
 
         guard !term.isEmpty else {
             isSearching = false
             errorMessage = nil
             resultTitle = "Catalog Tracks"
             resultSubtitle = nil
+            catalogContext = nil
             visibleTracks = featuredTracks
             preparePlaybackContext()
             return
@@ -304,12 +516,12 @@ final class PlayerStore: ObservableObject {
         do {
             let results = try await provider.search(term, scope: scope)
             guard !Task.isCancelled,
-                  term == searchQuery.trimmed,
-                  scope == selectedScope
+                  term == searchQuery.trimmed
             else { return }
             visibleTracks = results
             resultTitle = scope.resultsTitle
             resultSubtitle = nil
+            catalogContext = nil
             errorMessage = nil
             preparePlaybackContext()
         } catch {
@@ -317,6 +529,7 @@ final class PlayerStore: ObservableObject {
             visibleTracks = []
             resultTitle = scope.resultsTitle
             resultSubtitle = nil
+            catalogContext = nil
             errorMessage = error.localizedDescription
         }
     }
@@ -324,10 +537,11 @@ final class PlayerStore: ObservableObject {
     private func drillIntoCatalog(from item: Track) {
         searchTask?.cancel()
         selectedScope = .catalog
-        searchQuery = item.title
+        let optimisticItems = optimisticCatalogItems(for: item, in: visibleTracks)
         resultTitle = item.title
         resultSubtitle = item.detailLabel
-        visibleTracks = []
+        catalogContext = item
+        visibleTracks = optimisticItems
         isSearching = true
         errorMessage = nil
 
@@ -353,12 +567,40 @@ final class PlayerStore: ObservableObject {
         }
     }
 
+    private func optimisticCatalogItems(for item: Track, in candidates: [Track]) -> [Track] {
+        let itemTitle = item.title.searchNormalized
+        let itemArtist = item.artist.searchNormalized
+
+        switch item.kind {
+        case .track:
+            return [item]
+        case .artist:
+            return candidates.filter { candidate in
+                guard candidate != item else { return false }
+                return candidate.artist.searchNormalized == itemTitle
+            }
+        case .album:
+            return candidates.filter { candidate in
+                guard candidate.kind == .track else { return false }
+                let sameAlbum = candidate.album.searchNormalized == itemTitle
+                let sameArtist = itemArtist.isEmpty || itemArtist == "unknown artist" || candidate.artist.searchNormalized == itemArtist
+                return sameAlbum && sameArtist
+            }
+        }
+    }
+
     private func handlePlaybackFailure(_ error: Error) {
         let message = error.localizedDescription
         playbackState = .failed(message)
 
         if message.localizedCaseInsensitiveContains("backend session") {
             providerStatus.message = message
+            errorMessage = nil
+            return
+        }
+
+        if message.localizedCaseInsensitiveContains("not available from the current music provider")
+            || message.localizedCaseInsensitiveContains("cannot stream") {
             errorMessage = nil
             return
         }
@@ -403,6 +645,7 @@ final class PlayerStore: ObservableObject {
         if searchQuery.trimmed.isEmpty {
             resultTitle = "Catalog Tracks"
             resultSubtitle = nil
+            catalogContext = nil
         }
         currentTrack = tracks.first
         queue = tracks.first.map {
@@ -466,12 +709,29 @@ final class PlayerStore: ObservableObject {
     private func refillQueue(after track: Track) {
         guard queue.count < playbackContextLimit else { return }
 
+        var queuedIDs = Set(queue.map(\.id))
+        queuedIDs.insert(track.id)
+        if let currentTrack {
+            queuedIDs.insert(currentTrack.id)
+        }
+
+        let smartCandidates = smartWaveTracks(
+            limit: playbackContextLimit,
+            excludingIDs: queuedIDs
+        )
+        for candidate in smartCandidates where queue.count < playbackContextLimit {
+            guard !queue.contains(candidate) else { continue }
+            queue.append(candidate)
+            queuedIDs.insert(candidate.id)
+        }
+
         let context = visibleTracks.contains(track) ? visibleTracks : featuredTracks
         let candidates = playbackQueue(after: track, in: context, limit: playbackContextLimit)
 
         for candidate in candidates where queue.count < playbackContextLimit {
             guard candidate != currentTrack,
-                  !queue.contains(candidate)
+                  !queue.contains(candidate),
+                  !queuedIDs.contains(candidate.id)
             else { continue }
 
             queue.append(candidate)
@@ -516,6 +776,139 @@ final class PlayerStore: ObservableObject {
         append(featuredTracks)
 
         return result
+    }
+
+    private var currentPlaybackContext: [Track] {
+        let playableVisibleTracks = visibleTracks.filter(\.isPlayable)
+        return playableVisibleTracks.isEmpty ? featuredTracks.filter(\.isPlayable) : playableVisibleTracks
+    }
+
+    private var knownPlaybackTracks: [Track] {
+        var tracks: [Track] = []
+        if let currentTrack {
+            tracks.append(currentTrack)
+        }
+        tracks.append(contentsOf: featuredTracks)
+        tracks.append(contentsOf: visibleTracks)
+        tracks.append(contentsOf: queue)
+        return uniquePlayableTracks(in: tracks)
+    }
+
+    private func shuffledPlaybackCandidates(excluding excludedTrack: Track?) -> [Track] {
+        currentPlaybackContext
+            .filter { track in
+                track.isPlayable && track != excludedTrack
+            }
+            .shuffled()
+    }
+
+    private func uniquePlayableTracks(in tracks: [Track]) -> [Track] {
+        var result: [Track] = []
+        var seenIDs = Set<String>()
+
+        for track in tracks {
+            guard track.isPlayable,
+                  seenIDs.insert(track.id).inserted
+            else { continue }
+
+            result.append(track)
+        }
+
+        return result
+    }
+
+    private func smartWaveTracks(limit: Int, excludingIDs: Set<String> = []) -> [Track] {
+        let tracks = knownPlaybackTracks.filter { !excludingIDs.contains($0.id) }
+        guard !tracks.isEmpty else { return [] }
+
+        let likedTracks = tracks.filter { likedTrackIDs.contains($0.id) }
+        let likedArtists = Set(likedTracks.map { $0.artist.searchNormalized })
+        let likedAlbums = Set(likedTracks.map { $0.album.searchNormalized })
+        let listenedArtists = Set(
+            tracks
+                .filter { (listeningScores[$0.id] ?? 0) > 0 }
+                .map { $0.artist.searchNormalized }
+        )
+        let listenedAlbums = Set(
+            tracks
+                .filter { (listeningScores[$0.id] ?? 0) > 0 }
+                .map { $0.album.searchNormalized }
+        )
+
+        return Array(
+            tracks
+                .sorted { lhs, rhs in
+                    let lhsScore = smartScore(
+                        for: lhs,
+                        likedArtists: likedArtists,
+                        likedAlbums: likedAlbums,
+                        listenedArtists: listenedArtists,
+                        listenedAlbums: listenedAlbums
+                    )
+                    let rhsScore = smartScore(
+                        for: rhs,
+                        likedArtists: likedArtists,
+                        likedAlbums: likedAlbums,
+                        listenedArtists: listenedArtists,
+                        listenedAlbums: listenedAlbums
+                    )
+
+                    if lhsScore != rhsScore {
+                        return lhsScore > rhsScore
+                    }
+
+                    return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+                }
+                .prefix(limit)
+        )
+    }
+
+    private func smartScore(
+        for track: Track,
+        likedArtists: Set<String>,
+        likedAlbums: Set<String>,
+        listenedArtists: Set<String>,
+        listenedAlbums: Set<String>
+    ) -> Int {
+        var score = 0
+
+        if likedTrackIDs.contains(track.id) {
+            score += 1_000
+        }
+
+        let artistKey = track.artist.searchNormalized
+        let albumKey = track.album.searchNormalized
+
+        if likedArtists.contains(artistKey) {
+            score += 160
+        }
+        if likedAlbums.contains(albumKey) {
+            score += 120
+        }
+        if listenedArtists.contains(artistKey) {
+            score += 90
+        }
+        if listenedAlbums.contains(albumKey) {
+            score += 70
+        }
+
+        score += min((listeningScores[track.id] ?? 0) * 45, 360)
+        score += min((track.rank ?? 0) / 12_000, 80)
+
+        return score
+    }
+
+    private func recordListening(_ track: Track) {
+        listeningScores[track.id, default: 0] += 1
+        persistListeningScores()
+    }
+
+    private func persistLikedTracks() {
+        userDefaults.set(Array(likedTrackIDs).sorted(), forKey: Self.likedTrackIDsKey)
+    }
+
+    private func persistListeningScores() {
+        userDefaults.set(listeningScores, forKey: Self.listeningScoresKey)
     }
 
     private func playbackQueue(after track: Track, in context: [Track], limit: Int) -> [Track] {

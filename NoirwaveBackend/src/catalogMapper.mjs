@@ -5,12 +5,143 @@ export const firstArtist = (contributors) => {
   return edge?.node ?? null;
 };
 
-export const recordTypeLabel = (type) => {
+const normalizeReleaseText = (value) =>
+  String(value ?? "")
+    .normalize("NFKD")
+    .replace(/\p{Diacritic}/gu, "")
+    .toLocaleLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+
+const hasReleaseMarker = (title, markers) => {
+  const normalized = ` ${normalizeReleaseText(title)} `;
+  return markers.some((marker) => marker.test(normalized));
+};
+
+const liveReleaseMarkers = [
+  /\blive\b/u,
+  /\bunplugged\b/u,
+  /\bsession(s)?\b/u,
+  /\blive at\b/u,
+  /\blive in\b/u,
+  /\blive on\b/u,
+];
+
+const reissueReleaseMarkers = [
+  /\bdeluxe\b/u,
+  /\bsuper deluxe\b/u,
+  /\bexpanded\b/u,
+  /\banniversary\b/u,
+  /\bedition\b/u,
+  /\bbonus\b/u,
+  /\bdemo(s)?\b/u,
+  /\bouttake(s)?\b/u,
+  /\b\d+(st|nd|rd|th)\b/u,
+];
+
+const compilationReleaseMarkers = [
+  /\bbest of\b/u,
+  /\bgreatest hits\b/u,
+  /\bcollection\b/u,
+  /\banthology\b/u,
+  /\brarities\b/u,
+];
+
+export const canonicalReleaseKey = (title) => {
+  const stripped = String(title ?? "")
+    .replace(/\([^)]*\)/gu, " ")
+    .replace(/\[[^\]]*\]/gu, " ");
+  return normalizeReleaseText(stripped)
+    .replace(/\b(remaster(ed)?|deluxe|edition|anniversary|expanded|bonus|live|super|special|explicit|clean|version|demo(s)?|outtake(s)?)\b/gu, " ")
+    .replace(/\b\d+(st|nd|rd|th)\b/gu, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+};
+
+export const recordTypeLabel = (type, title = "") => {
   const value = String(type ?? "").toLowerCase();
+  if (value.includes("studio")) return "studio";
+  if (value.includes("live")) return "live";
+  if (value.includes("reissue")) return "reissue";
   if (value.includes("single")) return "single";
   if (value.includes("ep")) return "ep";
   if (value.includes("compilation")) return "compilation";
-  return "album";
+
+  if (hasReleaseMarker(title, liveReleaseMarkers)) return "live";
+  if (hasReleaseMarker(title, compilationReleaseMarkers)) return "compilation";
+  if (hasReleaseMarker(title, reissueReleaseMarkers)) return "reissue";
+  return "studio";
+};
+
+export const releaseRecordType = (album) =>
+  recordTypeLabel(
+    album?.type_ ?? album?.type ?? album?.record_type,
+    album?.display_title ?? album?.displayTitle ?? album?.title
+  );
+
+const releaseVariantPenalty = (album) => {
+  const title = album?.title ?? album?.display_title ?? album?.displayTitle;
+  let penalty = 0;
+  if (/\([^)]*\)|\[[^\]]*\]/u.test(String(title ?? ""))) penalty += 2;
+  if (hasReleaseMarker(title, reissueReleaseMarkers)) penalty += 4;
+  if (hasReleaseMarker(title, liveReleaseMarkers)) penalty += 8;
+  return penalty;
+};
+
+const prefersStudioRelease = (candidate, current) => {
+  const candidatePenalty = releaseVariantPenalty(candidate);
+  const currentPenalty = releaseVariantPenalty(current);
+  if (candidatePenalty !== currentPenalty) return candidatePenalty < currentPenalty;
+
+  const candidateDate = String(candidate?.release_date ?? "");
+  const currentDate = String(current?.release_date ?? "");
+  if (candidateDate && currentDate && candidateDate !== currentDate) {
+    return candidateDate < currentDate;
+  }
+
+  const candidateTracks = Number(candidate?.nb_tracks ?? 0);
+  const currentTracks = Number(current?.nb_tracks ?? 0);
+  if (candidateTracks !== currentTracks) return candidateTracks > currentTracks;
+
+  return String(candidate?.title ?? "").localeCompare(String(current?.title ?? "")) < 0;
+};
+
+export const splitArtistReleases = (releases) => {
+  const studioByKey = new Map();
+  const studioKeys = [];
+  const other = [];
+
+  for (const release of releases ?? []) {
+    const key = canonicalReleaseKey(release?.title);
+    const recordType = recordTypeLabel(release?.record_type, release?.title);
+    const isStudio = recordType === "studio" || recordType === "album";
+
+    if (!key || !isStudio) {
+      other.push(release);
+      continue;
+    }
+
+    const current = studioByKey.get(key);
+    if (!current) {
+      studioByKey.set(key, release);
+      studioKeys.push(key);
+      continue;
+    }
+
+    if (prefersStudioRelease(release, current)) {
+      studioByKey.set(key, release);
+      other.push(current);
+    } else {
+      other.push(release);
+    }
+  }
+
+  const studio = studioKeys
+    .map((key) => studioByKey.get(key))
+    .filter(Boolean);
+
+  return { studio, other };
 };
 
 export const trackPayload = (track, fallbackIndex = 0, albumContext = null) => {
@@ -65,7 +196,7 @@ export const trackPayload = (track, fallbackIndex = 0, albumContext = null) => {
           nb_tracks: album.tracks_count ?? album.tracksCount ?? null,
           fans: album.fans_count ?? album.fansCount ?? null,
           release_date: album.release_date ?? album.releaseDate ?? null,
-          record_type: recordTypeLabel(album.type_ ?? album.type),
+          record_type: releaseRecordType(album),
           rank,
           tracklist: `https://api.deezer.com/album/${album.id}/tracks`,
         }
@@ -110,7 +241,7 @@ export const albumPayload = (album, fallbackIndex = 0, artistContext = null) => 
     nb_tracks: album?.tracks_count ?? album?.tracksCount ?? null,
     fans: album?.fans_count ?? album?.fansCount ?? null,
     release_date: album?.release_date ?? album?.releaseDate ?? null,
-    record_type: recordTypeLabel(album?.type_ ?? album?.type),
+    record_type: releaseRecordType(album),
     rank: null,
     tracklist: album?.id ? `https://api.deezer.com/album/${album.id}/tracks` : null,
   };

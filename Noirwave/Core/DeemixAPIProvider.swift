@@ -27,6 +27,8 @@ struct DeemixAPIConnectResponse: Decodable {
     let autologin: Bool?
     let currentUser: DeemixAPILoginUser?
     let deezerAvailable: String?
+    let format: String?
+    let fallbackFormat: String?
     let settingsData: DeemixAPISettingsData?
     let singleUser: DeemixAPISingleUserCredentials?
 }
@@ -1007,8 +1009,16 @@ enum DeemixAPIPlaybackURLResolver {
         return url
     }
 
-    static func shouldUsePreviewFallback(after _: Error) -> Bool {
-        false
+    static func shouldUsePreviewFallback(after error: Error) -> Bool {
+        let message = error.localizedDescription
+        if message.localizedCaseInsensitiveContains("session inactive")
+            || message.localizedCaseInsensitiveContains("no deezer session") {
+            return false
+        }
+
+        return message.localizedCaseInsensitiveContains("timed out")
+            || message.localizedCaseInsensitiveContains("network")
+            || message.localizedCaseInsensitiveContains("cannot stream")
     }
 }
 
@@ -1363,6 +1373,7 @@ final class DeemixAPIProvider: MusicProviding {
     private var player: AVPlayer?
     private var lastPlaybackFileURL: URL?
     private var didAttemptDownloadLogin = false
+    private var currentVolume: Double = 0.78
 
     private let seedQueries = [
         "Daft Punk Around the World",
@@ -1404,6 +1415,21 @@ final class DeemixAPIProvider: MusicProviding {
         }
 
         switch scope {
+        case .smart:
+            async let artistPayloads = (try? await client.searchArtists(term: term, count: 10)) ?? []
+            async let trackPayloads = (try? await client.searchTracks(term: term, count: 30)) ?? []
+            async let albumPayloads = (try? await client.searchAlbums(term: term, count: 12)) ?? []
+            let (artistsPayload, tracksPayload, albumsPayload) = await (artistPayloads, trackPayloads, albumPayloads)
+            let artists = artistsPayload.enumerated().map { index, payload in
+                DeemixAPITrackMapper.mapArtist(payload, fallbackIndex: index)
+            }
+            let tracks = tracksPayload.enumerated().compactMap { index, payload in
+                try? DeemixAPITrackMapper.map(payload, fallbackIndex: index)
+            }
+            let albums = albumsPayload.enumerated().map { index, payload in
+                DeemixAPITrackMapper.mapAlbum(payload, fallbackIndex: index)
+            }
+            return SmartSearchRanker.ranked(query: term, artists: artists, tracks: tracks, albums: albums)
         case .catalog:
             async let trackPayloads = client.searchTracks(term: term, count: 30)
             async let artistPayloads = client.searchArtists(term: term, count: 6)
@@ -1450,14 +1476,22 @@ final class DeemixAPIProvider: MusicProviding {
             } else {
                 popularTracks = try await artistTopTracks(artistPayload)
             }
-            let releases = (detail.releases?["all"] ?? detail.releases?.values.flatMap { $0 } ?? [])
+            let releaseBuckets = detail.releases ?? [:]
+            let groupedReleases = (releaseBuckets["studio"] ?? []) + (releaseBuckets["other"] ?? [])
+            let usesGroupedReleaseOrder = !groupedReleases.isEmpty
+            let releases = usesGroupedReleaseOrder
+                ? groupedReleases
+                : (releaseBuckets["all"] ?? releaseBuckets.values.flatMap { $0 })
             let uniqueAlbums = deduplicatedAlbums(releases)
             let albums = uniqueAlbums.enumerated().map { index, payload in
                 DeemixAPITrackMapper.mapAlbum(payload, fallbackIndex: index, artistContext: artistPayload)
             }
+            let orderedAlbums = usesGroupedReleaseOrder
+                ? albums
+                : DeemixAPIMediaSorter.sortedAlbumsForArtist(albums)
 
             let topTracks = Array(DeemixAPITrackSorter.sortedByPopularity(popularTracks).prefix(12))
-            return topTracks + DeemixAPIMediaSorter.sortedAlbumsForArtist(albums)
+            return topTracks + orderedAlbums
         case .album:
             guard let albumID = deemixID(from: item, prefix: "deemix-album.") else {
                 return try await search([item.title, item.artist].joined(separator: " "), scope: .catalog)
@@ -1490,6 +1524,14 @@ final class DeemixAPIProvider: MusicProviding {
                     authorization: .authorized,
                     canPlayCatalogContent: false,
                     message: "Backend session inactive."
+                )
+            }
+
+            if Self.isTransientBackendPlaybackError(error) {
+                return ProviderStatus(
+                    authorization: .authorized,
+                    canPlayCatalogContent: true,
+                    message: "Backend online; Deezer login timed out"
                 )
             }
 
@@ -1551,12 +1593,24 @@ final class DeemixAPIProvider: MusicProviding {
 
         await prepareForImmediatePlayback(track)
 
-        let playbackURL = try DeemixAPIStreamURLResolver.streamURL(baseURL: client.baseURL, track: track)
+        let playbackURL: URL
+        do {
+            playbackURL = try await fullTrackURL(for: track)
+        } catch {
+            guard DeemixAPIPlaybackURLResolver.shouldUsePreviewFallback(after: error),
+                  let previewURL = DeemixAPIPlaybackURLResolver.previewURL(for: track)
+            else {
+                throw error
+            }
+
+            playbackURL = previewURL
+        }
         let item = AVPlayerItem(url: playbackURL)
         item.preferredForwardBufferDuration = 0.75
         item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
 
         let streamPlayer = AVPlayer(playerItem: item)
+        streamPlayer.volume = Float(currentVolume)
         streamPlayer.automaticallyWaitsToMinimizeStalling = false
 
         cleanupLastPlaybackFile()
@@ -1588,13 +1642,17 @@ final class DeemixAPIProvider: MusicProviding {
         await player?.seek(to: CMTime(seconds: max(time, 0), preferredTimescale: 600))
     }
 
+    func setVolume(_ volume: Double) {
+        currentVolume = min(max(volume, 0), 1)
+        player?.volume = Float(currentVolume)
+    }
+
     func currentPlaybackTime() -> TimeInterval? {
         let seconds = player?.currentTime().seconds
         return seconds?.isFinite == true ? seconds : nil
     }
 
     private func providerStatus(from response: DeemixAPIConnectResponse) -> ProviderStatus {
-        let available = response.deezerAvailable ?? "unknown"
         let savedARL = ProcessInfo.processInfo.environment[Self.arlEnvironmentKey]
             ?? (try? sessionVault.savedARL())
             ?? response.singleUser?.arl
@@ -1602,14 +1660,10 @@ final class DeemixAPIProvider: MusicProviding {
             autologin: response.autologin,
             savedARL: savedARL
         )
-        let qualityMessage = response.currentUser?.canStreamHQ == false
-            ? "MP3 320 required; session reports HQ unavailable"
-            : "MP3 320 ready"
-
         return ProviderStatus(
             authorization: .authorized,
             canPlayCatalogContent: true,
-            message: "Source ready: \(available), \(loginMessage), \(qualityMessage)"
+            message: loginMessage.localizedCaseInsensitiveContains("ready") ? nil : loginMessage
         )
     }
 
@@ -1643,6 +1697,13 @@ final class DeemixAPIProvider: MusicProviding {
             || message.localizedCaseInsensitiveContains("session inactive")
             || message.localizedCaseInsensitiveContains("session token")
             || message.localizedCaseInsensitiveContains("notloggedin")
+    }
+
+    private static func isTransientBackendPlaybackError(_ error: Error) -> Bool {
+        let message = error.localizedDescription
+        return message.localizedCaseInsensitiveContains("timed out")
+            || message.localizedCaseInsensitiveContains("network")
+            || message.localizedCaseInsensitiveContains("temporarily unavailable")
     }
 
     private static func defaultBaseURL() -> URL {
