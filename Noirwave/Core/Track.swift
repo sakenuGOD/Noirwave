@@ -798,9 +798,17 @@ struct TrackPalette: Codable, Hashable {
     static let fallback = TrackPalette(
         baseHex: "#101014",
         midHex: "#28312D",
-        accentHex: "#E45D73",
+        accentHex: NoirwaveTheme.primaryAccentHex,
         inkHex: "#F4F0EA"
     )
+}
+
+enum NoirwaveTheme {
+    static let primaryAccentHex = "#5EE0C2"
+
+    static var primaryAccent: Color {
+        Color(hex: primaryAccentHex)
+    }
 }
 
 extension Color {

@@ -172,7 +172,7 @@ private struct SidebarView: View {
             HStack(spacing: 10) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill((store.currentTrack?.palette.accent ?? Color(hex: "#FF4F72")).opacity(0.95))
+                        .fill((store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent).opacity(0.95))
                     Image(systemName: "waveform")
                         .font(.system(size: 16, weight: .bold))
                         .foregroundStyle(.black)
@@ -243,7 +243,7 @@ private struct SidebarItem: View {
             .frame(height: 34)
             .background(
                 active
-                    ? (store.currentTrack?.palette.accent ?? Color(hex: "#FF4F72"))
+                    ? (store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent)
                     : .white.opacity(0.045),
                 in: RoundedRectangle(cornerRadius: 6, style: .continuous)
             )
@@ -814,7 +814,7 @@ private struct SearchLandingView: View {
                 SearchPromptStage()
                 CollectionActionCluster(
                     tracks: tracks,
-                    accent: store.currentTrack?.palette.accent ?? .white,
+                    accent: store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent,
                     primaryLabel: "Play"
                 )
                 FeaturedTrackShelf(title: "Можно включить", tracks: tracks)
@@ -871,7 +871,7 @@ private struct SearchResultsView: View {
                 EntityShelf(title: "Релизы", items: albums, cardSize: 190, roundArtists: false)
                 CollectionActionCluster(
                     tracks: tracks,
-                    accent: store.currentTrack?.palette.accent ?? .white,
+                    accent: store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent,
                     primaryLabel: "Play"
                 )
                 TrackListSection(title: "Треки", subtitle: "\(tracks.count)", tracks: tracks, numbered: false)
@@ -890,6 +890,30 @@ private struct PlaylistEditor: Identifiable {
         self.playlistID = playlistID
         self.title = title
         self.tracks = tracks
+    }
+}
+
+enum LibrarySurfaceSection: String, Identifiable, Equatable {
+    case collections
+    case favoriteTracks
+    case playlists
+
+    var id: String { rawValue }
+}
+
+enum LibrarySurfaceLayout {
+    static func sections(hasTracks: Bool, hasSavedCollections: Bool, hasLocalPlaylists: Bool) -> [LibrarySurfaceSection] {
+        var sections: [LibrarySurfaceSection] = []
+        if hasTracks || hasSavedCollections {
+            sections.append(.collections)
+        }
+        if hasTracks {
+            sections.append(.favoriteTracks)
+        }
+        if hasLocalPlaylists {
+            sections.append(.playlists)
+        }
+        return sections
     }
 }
 
@@ -935,6 +959,14 @@ private struct LibraryView: View {
 
     private var artists: [Track] {
         DerivedLibraryEntities.artists(from: filteredTracks)
+    }
+
+    private var surfaceSections: [LibrarySurfaceSection] {
+        LibrarySurfaceLayout.sections(
+            hasTracks: !filteredTracks.isEmpty,
+            hasSavedCollections: !filteredSavedCollections.isEmpty,
+            hasLocalPlaylists: !filteredLocalPlaylists.isEmpty
+        )
     }
 
     var body: some View {
@@ -988,25 +1020,13 @@ private struct LibraryView: View {
                 }
 
                 LibraryStatsView(playlists: localPlaylists.count, artists: artists, albums: albums, tracks: filteredTracks)
-                LibraryCollectionsShelf(
-                    localPlaylists: filteredLocalPlaylists,
-                    tracks: filteredTracks,
-                    savedCollections: filteredSavedCollections,
-                    albums: albums,
-                    artists: artists
-                ) { playlistID in
-                    selectedPlaylistID = playlistID
-                }
 
-                if filteredTracks.isEmpty && filteredSavedCollections.isEmpty && filteredLocalPlaylists.isEmpty {
+                if surfaceSections.isEmpty {
                     EmptyLibrarySearchPanel(query: libraryQuery)
-                } else if !filteredTracks.isEmpty {
-                    CollectionActionCluster(
-                        tracks: filteredTracks,
-                        accent: store.currentTrack?.palette.accent ?? .white,
-                        primaryLabel: "Play Favorites"
-                    )
-                    TrackListSection(title: "Любимые треки", subtitle: "\(filteredTracks.count)", tracks: filteredTracks, numbered: true)
+                } else {
+                    ForEach(surfaceSections) { section in
+                        librarySurfaceSection(section)
+                    }
                 }
             }
             .sheet(item: $playlistEditor) { editor in
@@ -1017,6 +1037,30 @@ private struct LibraryView: View {
                 } onCancel: {
                     playlistEditor = nil
                 }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func librarySurfaceSection(_ section: LibrarySurfaceSection) -> some View {
+        switch section {
+        case .collections:
+            LibraryCollectionsShelf(
+                tracks: filteredTracks,
+                savedCollections: filteredSavedCollections,
+                albums: albums,
+                artists: artists
+            )
+        case .favoriteTracks:
+            CollectionActionCluster(
+                tracks: filteredTracks,
+                accent: store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent,
+                primaryLabel: "Play Favorites"
+            )
+            TrackListSection(title: "Любимые треки", subtitle: "\(filteredTracks.count)", tracks: filteredTracks, numbered: true)
+        case .playlists:
+            LibraryPlaylistsShelf(localPlaylists: filteredLocalPlaylists) { playlistID in
+                selectedPlaylistID = playlistID
             }
         }
     }
@@ -1058,7 +1102,7 @@ private struct EmptyLibraryPanel: View {
                     .foregroundStyle(.black)
                     .padding(.horizontal, 14)
                     .frame(height: 36)
-                    .background(Color(hex: "#FF4F72"), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .background(NoirwaveTheme.primaryAccent, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
             .buttonStyle(.plain)
             .padding(.top, 8)
@@ -1131,7 +1175,7 @@ private struct LocalPlaylistDetailView: View {
     let onDelete: () -> Void
 
     private var accent: Color {
-        tracks.first?.palette.accent ?? store.currentTrack?.palette.accent ?? Color(hex: "#FF4F72")
+        tracks.first?.palette.accent ?? store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent
     }
 
     private var trackCountLabel: String {
@@ -1459,7 +1503,7 @@ private struct LibraryCreatePlaylistMenu: View {
     let onCreatePlaylist: () -> Void
 
     private var accent: Color {
-        store.currentTrack?.palette.accent ?? Color(hex: "#FF4F72")
+        store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent
     }
 
     var body: some View {
@@ -1485,7 +1529,7 @@ private struct LibrarySortMenu: View {
     @Binding var selection: LibrarySortMode
 
     private var accent: Color {
-        store.currentTrack?.palette.accent ?? .white
+        store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent
     }
 
     var body: some View {
@@ -1532,7 +1576,7 @@ private struct PlaylistSortMenu: View {
     @Binding var selection: PlaylistSortMode
 
     private var accent: Color {
-        store.currentTrack?.palette.accent ?? .white
+        store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent
     }
 
     var body: some View {
@@ -1617,52 +1661,36 @@ private struct LocalLibrarySearchField: View {
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke((store.currentTrack?.palette.accent ?? .white).opacity(0.18), lineWidth: 1)
+                .stroke((store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent).opacity(0.18), lineWidth: 1)
         )
     }
 }
 
 private struct LibraryCollectionsShelf: View {
     @EnvironmentObject private var store: PlayerStore
-    let localPlaylists: [LocalPlaylist]
     let tracks: [Track]
     let savedCollections: [Track]
     let albums: [Track]
     let artists: [Track]
-    let onSelectPlaylist: (String) -> Void
 
     private var collectionCount: Int {
-        min(localPlaylists.count, 10) + min(savedCollections.count, 10) + (tracks.isEmpty ? 0 : 1) + min(albums.count, 8) + min(artists.count, 6)
+        min(savedCollections.count, 10) + (tracks.isEmpty ? 0 : 1) + min(albums.count, 8) + min(artists.count, 6)
     }
 
     var body: some View {
-        if !tracks.isEmpty || !savedCollections.isEmpty || !localPlaylists.isEmpty {
+        if !tracks.isEmpty || !savedCollections.isEmpty {
             VStack(alignment: .leading, spacing: 12) {
-                SectionTitle(title: "Плейлисты и коллекции", subtitle: "\(collectionCount)")
+                SectionTitle(title: "Коллекции", subtitle: "\(collectionCount)")
 
                 ScrollView(.horizontal) {
                     HStack(alignment: .top, spacing: 14) {
-                        ForEach(localPlaylists.prefix(10)) { playlist in
-                            let playlistTracks = store.playlistTracks(playlistID: playlist.id)
-                            let accent = playlistTracks.first?.palette.accent ?? store.currentTrack?.palette.accent ?? .white
-                            LibraryCollectionCard(
-                                title: playlist.title,
-                                subtitle: "\(playlist.trackCount) track\(playlist.trackCount == 1 ? "" : "s")",
-                                symbol: "music.note.list",
-                                artworkTracks: Array(playlistTracks.prefix(4)),
-                                accent: accent
-                            ) {
-                                onSelectPlaylist(playlist.id)
-                            }
-                        }
-
                         if !tracks.isEmpty {
                             LibraryCollectionCard(
                                 title: "Любимые треки",
                                 subtitle: "\(tracks.count) tracks",
                                 symbol: "heart.fill",
                                 artworkTracks: Array(tracks.prefix(4)),
-                                accent: store.currentTrack?.palette.accent ?? tracks.first?.palette.accent ?? .white
+                                accent: store.currentTrack?.palette.accent ?? tracks.first?.palette.accent ?? NoirwaveTheme.primaryAccent
                             ) {
                                 store.playAll(tracks)
                             }
@@ -1748,6 +1776,42 @@ private struct LibraryCollectionsShelf: View {
             return "Saved album"
         case .track:
             return collection.detailLabel
+        }
+    }
+}
+
+private struct LibraryPlaylistsShelf: View {
+    @EnvironmentObject private var store: PlayerStore
+    let localPlaylists: [LocalPlaylist]
+    let onSelectPlaylist: (String) -> Void
+
+    var body: some View {
+        if !localPlaylists.isEmpty {
+            VStack(alignment: .leading, spacing: 12) {
+                SectionTitle(title: "Плейлисты", subtitle: "\(localPlaylists.count)")
+
+                ScrollView(.horizontal) {
+                    HStack(alignment: .top, spacing: 14) {
+                        ForEach(localPlaylists.prefix(10)) { playlist in
+                            let playlistTracks = store.playlistTracks(playlistID: playlist.id)
+                            let accent = playlistTracks.first?.palette.accent
+                                ?? store.currentTrack?.palette.accent
+                                ?? NoirwaveTheme.primaryAccent
+                            LibraryCollectionCard(
+                                title: playlist.title,
+                                subtitle: "\(playlist.trackCount) track\(playlist.trackCount == 1 ? "" : "s")",
+                                symbol: "music.note.list",
+                                artworkTracks: Array(playlistTracks.prefix(4)),
+                                accent: accent
+                            ) {
+                                onSelectPlaylist(playlist.id)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+                .scrollIndicators(.hidden)
+            }
         }
     }
 }
@@ -2853,7 +2917,7 @@ private struct PlayerPanelButtonLabel: View {
             .frame(width: 32, height: 32)
             .background(
                 active
-                    ? (store.currentTrack?.palette.accent ?? .white)
+                    ? (store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent)
                     : .white.opacity(0.08),
                 in: RoundedRectangle(cornerRadius: 9, style: .continuous)
             )
@@ -2935,7 +2999,7 @@ private struct VolumeControl: View {
                 ),
                 in: 0...1
             )
-            .tint(store.currentTrack?.palette.accent ?? .white)
+            .tint(store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent)
             .frame(width: 104)
         }
         .help("Volume")
@@ -2997,7 +3061,7 @@ private struct PlayerModeButton: View {
                 .frame(width: 30, height: 30)
                 .background(
                     active
-                        ? (store.currentTrack?.palette.accent ?? .white)
+                        ? (store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent)
                         : .white.opacity(0.07),
                     in: Circle()
                 )
@@ -3022,7 +3086,7 @@ private struct PlayerIconButton: View {
                 .frame(width: size, height: size)
                 .background(
                     primary
-                        ? (store.currentTrack?.palette.accent ?? .white)
+                        ? (store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent)
                         : .white.opacity(0.1),
                     in: Circle()
                 )
@@ -3573,7 +3637,7 @@ private struct SessionSettingsSheet: View {
             HStack(alignment: .top, spacing: 12) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill((store.currentTrack?.palette.accent ?? .white).opacity(0.92))
+                        .fill((store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent).opacity(0.92))
                     Image(systemName: "key.fill")
                         .font(.system(size: 17, weight: .bold))
                         .foregroundStyle(.black)
@@ -3646,7 +3710,7 @@ private struct SessionSettingsSheet: View {
                     .frame(maxWidth: .infinity)
                     .frame(height: 38)
                     .background(
-                        (store.currentTrack?.palette.accent ?? .white).opacity(canSubmit ? 1 : 0.5),
+                        (store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent).opacity(canSubmit ? 1 : 0.5),
                         in: RoundedRectangle(cornerRadius: 8, style: .continuous)
                     )
                 }
@@ -3815,7 +3879,7 @@ private struct MusicConnectPanel: View {
                 .foregroundStyle(.black)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
-                .background((store.currentTrack?.palette.accent ?? .white), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .background((store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
             .buttonStyle(.plain)
             .help(actionTitle)
