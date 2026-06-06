@@ -869,6 +869,55 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         )
     }
 
+    func testLibraryPlaylistShelfBuilderIncludesLikedSongsBeforeLocalPlaylists() {
+        let likedTracks = [
+            Self.makeLibraryTrack(1, title: "Alison", artist: "Slowdive", album: "Souvlaki"),
+            Self.makeLibraryTrack(2, title: "Xtal", artist: "Aphex Twin", album: "Selected Ambient Works 85-92")
+        ]
+        let localPlaylist = LocalPlaylist(
+            id: "road-trip",
+            title: "Road Trip",
+            tracks: [Self.makeLibraryTrack(3, title: "Joga", artist: "Bjork", album: "Homogenic")]
+        )
+
+        let items = LibraryPlaylistShelfBuilder.items(
+            likedTracks: likedTracks,
+            localPlaylists: [localPlaylist],
+            query: ""
+        )
+
+        XCTAssertEqual(items.map(\.id), ["liked.songs", "playlist.road-trip"])
+        XCTAssertEqual(items.first?.title, "Liked Songs")
+        XCTAssertEqual(items.first?.subtitle, "2 saved")
+        XCTAssertEqual(items.first?.selection, .likedSongs)
+        XCTAssertEqual(items.last?.selection, .localPlaylist("road-trip"))
+    }
+
+    func testLibraryPlaylistShelfBuilderFiltersLikedSongsByTitleAndTrackMetadata() {
+        let likedTracks = [
+            Self.makeLibraryTrack(1, title: "Digital Bath", artist: "Deftones", album: "White Pony"),
+            Self.makeLibraryTrack(2, title: "Only Shallow", artist: "My Bloody Valentine", album: "Loveless")
+        ]
+        let localPlaylist = LocalPlaylist(
+            id: "dream-pop",
+            title: "Dream Pop",
+            tracks: [Self.makeLibraryTrack(3, title: "Cherry-Coloured Funk", artist: "Cocteau Twins", album: "Heaven or Las Vegas")]
+        )
+
+        XCTAssertEqual(
+            LibraryPlaylistShelfBuilder.items(likedTracks: likedTracks, localPlaylists: [localPlaylist], query: "liked").map(\.selection),
+            [.likedSongs]
+        )
+        XCTAssertEqual(
+            LibraryPlaylistShelfBuilder.items(likedTracks: likedTracks, localPlaylists: [localPlaylist], query: "white pony").map(\.selection),
+            [.likedSongs]
+        )
+        XCTAssertEqual(
+            LibraryPlaylistShelfBuilder.items(likedTracks: likedTracks, localPlaylists: [localPlaylist], query: "cocteau").map(\.selection),
+            [.localPlaylist("dream-pop")]
+        )
+    }
+
     func testLibraryTrackOrganizerSortsByTitleArtistAlbumAndDuration() {
         let slowdive = Self.makeLibraryTrack(1, title: "Alison", artist: "Slowdive", album: "Souvlaki", duration: 171)
         let aphex = Self.makeLibraryTrack(2, title: "Xtal", artist: "Aphex Twin", album: "Selected Ambient Works 85-92", duration: 293)
