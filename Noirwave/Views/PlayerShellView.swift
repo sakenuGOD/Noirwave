@@ -46,12 +46,26 @@ private enum NowPlayingPanelMode: String, CaseIterable, Identifiable {
     }
 }
 
+private typealias PlaylistCreationRequest = @MainActor @Sendable (Track) -> Void
+
+private struct PlaylistCreationRequestKey: EnvironmentKey {
+    static let defaultValue: PlaylistCreationRequest = { _ in }
+}
+
+private extension EnvironmentValues {
+    var requestPlaylistCreationFromTrack: PlaylistCreationRequest {
+        get { self[PlaylistCreationRequestKey.self] }
+        set { self[PlaylistCreationRequestKey.self] = newValue }
+    }
+}
+
 struct PlayerShellView: View {
     @EnvironmentObject private var store: PlayerStore
     @State private var selectedDestination: ShellDestination = .listenNow
     @State private var selectedLocalPlaylistID: String?
     @State private var isShowingNowPlaying = false
     @State private var nowPlayingPanelMode: NowPlayingPanelMode = .lyrics
+    @State private var playlistEditor: PlaylistEditor?
 
     private var palette: TrackPalette {
         store.currentTrack?.palette ?? .fallback
@@ -82,6 +96,13 @@ struct PlayerShellView: View {
                         selection: selectedDestination,
                         selectedLocalPlaylistID: $selectedLocalPlaylistID
                     )
+                    .environment(\.requestPlaylistCreationFromTrack) { track in
+                        playlistEditor = PlaylistEditor(
+                            playlistID: nil,
+                            title: LocalPlaylist.fallbackTitle,
+                            tracks: [track]
+                        )
+                    }
 
                     MiniPlayerBar(
                         selectedPanel: $nowPlayingPanelMode,
@@ -98,6 +119,17 @@ struct PlayerShellView: View {
                 .environmentObject(store)
                 .frame(minWidth: 900, idealWidth: 980, minHeight: 680, idealHeight: 760)
                 .background(.regularMaterial)
+        }
+        .sheet(item: $playlistEditor) { editor in
+            PlaylistTitleSheet(title: editor.title, primaryLabel: "Create") { title in
+                let playlist = store.createPlaylist(title: title, tracks: editor.tracks)
+                selectedDestination = .library
+                selectedLocalPlaylistID = playlist.id
+                store.leaveCatalogContext()
+                playlistEditor = nil
+            } onCancel: {
+                playlistEditor = nil
+            }
         }
     }
 }
@@ -384,7 +416,10 @@ private struct SidebarPlaylistPreview: View {
             } else {
                 VStack(spacing: 6) {
                     ForEach(collections) { collection in
-                        SidebarPlaylistRow(collection: collection) {
+                        let isSelected = collection.localPlaylistID != nil
+                            && selection == .library
+                            && selectedLocalPlaylistID == collection.localPlaylistID
+                        SidebarPlaylistRow(collection: collection, isSelected: isSelected) {
                             if let playlistID = collection.localPlaylistID {
                                 selectedLocalPlaylistID = playlistID
                                 selection = .library
@@ -403,6 +438,7 @@ private struct SidebarPlaylistPreview: View {
 private struct SidebarPlaylistRow: View {
     @EnvironmentObject private var store: PlayerStore
     let collection: SidebarLibraryCollection
+    let isSelected: Bool
     let action: () -> Void
 
     private var accent: Color {
@@ -417,11 +453,11 @@ private struct SidebarPlaylistRow: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(collection.title)
                         .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.84))
+                        .foregroundStyle(isSelected ? .black : .white.opacity(0.84))
                         .lineLimit(1)
                     Text(collection.subtitle)
                         .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.45))
+                        .foregroundStyle(isSelected ? .black.opacity(0.6) : .white.opacity(0.45))
                         .lineLimit(1)
                 }
 
@@ -429,13 +465,19 @@ private struct SidebarPlaylistRow: View {
 
                 Image(systemName: collection.symbol)
                     .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(accent.opacity(0.86))
+                    .foregroundStyle(isSelected ? .black.opacity(0.82) : accent.opacity(0.86))
                     .frame(width: 22, height: 22)
-                    .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .background(
+                        isSelected ? .black.opacity(0.14) : .white.opacity(0.07),
+                        in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    )
             }
             .padding(.horizontal, 8)
             .frame(height: 46)
-            .background(.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .background(
+                isSelected ? accent.opacity(0.92) : .white.opacity(0.045),
+                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+            )
         }
         .buttonStyle(.plain)
         .help(collection.title)
@@ -842,6 +884,13 @@ private struct PlaylistEditor: Identifiable {
     let id = UUID()
     let playlistID: String?
     let title: String
+    let tracks: [Track]
+
+    init(playlistID: String?, title: String, tracks: [Track] = []) {
+        self.playlistID = playlistID
+        self.title = title
+        self.tracks = tracks
+    }
 }
 
 private struct LibraryView: View {
@@ -1100,7 +1149,7 @@ private struct LocalPlaylistDetailView: View {
             .buttonStyle(.plain)
             .help("Back to Library")
 
-            HStack(alignment: .center, spacing: 22) {
+            HStack(alignment: .top, spacing: 24) {
                 LibraryMosaicArtwork(tracks: Array(tracks.prefix(4)), size: 188, accent: accent)
                     .shadow(color: accent.opacity(0.26), radius: 26, x: 0, y: 18)
 
@@ -1117,47 +1166,21 @@ private struct LocalPlaylistDetailView: View {
                         InfoPill(symbol: "music.note", text: trackCountLabel)
                         InfoPill(symbol: "clock.arrow.circlepath", text: "Local")
                     }
+
+                    LocalPlaylistActionBar(
+                        tracks: tracks,
+                        accent: accent,
+                        onRename: onRename,
+                        onDelete: {
+                            isConfirmingDelete = true
+                        }
+                    )
+                    .padding(.top, 4)
                 }
 
                 Spacer(minLength: 12)
-
-                HStack(spacing: 8) {
-                    CollectionActionCluster(
-                        tracks: tracks,
-                        accent: accent,
-                        primaryLabel: "Play Playlist"
-                    )
-
-                    Button(action: onRename) {
-                        Image(systemName: "pencil")
-                            .font(.system(size: 13, weight: .bold))
-                            .frame(width: 38, height: 38)
-                            .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.white.opacity(0.78))
-                    .help("Rename playlist")
-
-                    Button {
-                        isConfirmingDelete = true
-                    } label: {
-                        Image(systemName: "trash")
-                            .font(.system(size: 13, weight: .bold))
-                            .frame(width: 38, height: 38)
-                            .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(Color(hex: "#FF6B80"))
-                    .help("Delete playlist")
-                }
-                .frame(maxWidth: 440, alignment: .trailing)
             }
-            .padding(18)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(.white.opacity(0.1), lineWidth: 1)
-            )
+            .padding(.top, 2)
 
             if tracks.isEmpty {
                 EmptyPlaylistTracksPanel(accent: accent)
@@ -1174,6 +1197,94 @@ private struct LocalPlaylistDetailView: View {
         .confirmationDialog("Delete playlist?", isPresented: $isConfirmingDelete) {
             Button("Delete Playlist", role: .destructive, action: onDelete)
             Button("Cancel", role: .cancel) {}
+        }
+    }
+}
+
+private struct LocalPlaylistActionBar: View {
+    @EnvironmentObject private var store: PlayerStore
+    let tracks: [Track]
+    let accent: Color
+    let onRename: () -> Void
+    let onDelete: () -> Void
+
+    private var playableTracks: [Track] {
+        tracks.filter(\.isPlayable)
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if !playableTracks.isEmpty {
+                Button {
+                    store.playAll(playableTracks)
+                } label: {
+                    Label("Play", systemImage: "play.fill")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 14)
+                        .frame(height: 36)
+                        .background(accent, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .help("Play playlist")
+
+                Button {
+                    store.shufflePlay(playableTracks)
+                } label: {
+                    Image(systemName: "shuffle")
+                        .font(.system(size: 12, weight: .bold))
+                        .frame(width: 36, height: 36)
+                        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white.opacity(0.78))
+                .help("Shuffle playlist")
+
+                Button {
+                    store.playNext(playableTracks)
+                } label: {
+                    Image(systemName: "forward.end.fill")
+                        .font(.system(size: 12, weight: .bold))
+                        .frame(width: 36, height: 36)
+                        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white.opacity(0.78))
+                .help("Play next")
+
+                Button {
+                    store.enqueue(playableTracks)
+                } label: {
+                    Image(systemName: "text.badge.plus")
+                        .font(.system(size: 12, weight: .bold))
+                        .frame(width: 36, height: 36)
+                        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white.opacity(0.78))
+                .help("Add playlist to queue")
+            }
+
+            Menu {
+                Button(action: onRename) {
+                    Label("Rename", systemImage: "pencil")
+                }
+
+                Divider()
+
+                Button(role: .destructive, action: onDelete) {
+                    Label("Delete Playlist", systemImage: "trash")
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.78))
+                    .frame(width: 36, height: 36)
+                    .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .help("Playlist actions")
         }
     }
 }
@@ -2224,6 +2335,7 @@ private struct TrackRowView: View {
 
 private struct AddToPlaylistMenu: View {
     @EnvironmentObject private var store: PlayerStore
+    @Environment(\.requestPlaylistCreationFromTrack) private var requestPlaylistCreationFromTrack
     let track: Track
     let excludingPlaylistID: String?
 
@@ -2246,9 +2358,9 @@ private struct AddToPlaylistMenu: View {
             }
 
             Button {
-                _ = store.createPlaylist(title: LocalPlaylist.fallbackTitle, tracks: [track])
+                requestPlaylistCreationFromTrack(track)
             } label: {
-                Label("New Playlist", systemImage: "plus")
+                Label("New Playlist...", systemImage: "plus")
             }
         } label: {
             Label("Add to Playlist", systemImage: "music.note.list")
