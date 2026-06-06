@@ -574,6 +574,61 @@ enum PlaylistTrackFilter {
     }
 }
 
+enum PlaylistSortMode: String, CaseIterable, Identifiable {
+    case playlistOrder
+    case title
+    case artist
+    case album
+    case duration
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .playlistOrder:
+            "Playlist Order"
+        case .title:
+            "Title"
+        case .artist:
+            "Artist"
+        case .album:
+            "Album"
+        case .duration:
+            "Duration"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .playlistOrder:
+            "line.3.horizontal"
+        case .title:
+            "textformat"
+        case .artist:
+            "music.mic"
+        case .album:
+            "square.stack"
+        case .duration:
+            "timer"
+        }
+    }
+
+    fileprivate var librarySortMode: LibrarySortMode? {
+        switch self {
+        case .playlistOrder:
+            nil
+        case .title:
+            .title
+        case .artist:
+            .artist
+        case .album:
+            .album
+        case .duration:
+            .duration
+        }
+    }
+}
+
 enum LibrarySortMode: String, CaseIterable, Identifiable {
     case recentlyAdded
     case title
@@ -616,13 +671,23 @@ enum LibrarySortMode: String, CaseIterable, Identifiable {
 
 enum LibraryTrackOrganizer {
     static func tracks(_ tracks: [Track], query: String, sortMode: LibrarySortMode) -> [Track] {
-        sortedTracks(
+        TrackSortOrder.sortedTracks(
             LibrarySearchFilter.filteredTracks(tracks, query: query),
             sortMode: sortMode
         )
     }
+}
 
-    private static func sortedTracks(_ tracks: [Track], sortMode: LibrarySortMode) -> [Track] {
+enum PlaylistTrackOrganizer {
+    static func tracks(_ tracks: [Track], query: String, sortMode: PlaylistSortMode) -> [Track] {
+        let filteredTracks = PlaylistTrackFilter.filteredTracks(tracks, query: query)
+        guard let librarySortMode = sortMode.librarySortMode else { return filteredTracks }
+        return TrackSortOrder.sortedTracks(filteredTracks, sortMode: librarySortMode)
+    }
+}
+
+enum TrackSortOrder {
+    static func sortedTracks(_ tracks: [Track], sortMode: LibrarySortMode) -> [Track] {
         switch sortMode {
         case .recentlyAdded:
             return tracks
