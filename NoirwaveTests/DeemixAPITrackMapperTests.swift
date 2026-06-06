@@ -1027,6 +1027,47 @@ final class DeemixAPITrackMapperTests: XCTestCase {
     }
 
     @MainActor
+    func testBulkVisibleTracksAddToPlaylistKeepsVisibleOrderAndSkipsDuplicates() {
+        let defaults = Self.makeIsolatedDefaults(name: "local-playlists-bulk-visible")
+        let tracks = [
+            Self.makeLibraryTrack(1, title: "Alison", artist: "Slowdive", album: "Souvlaki"),
+            Self.makeLibraryTrack(2, title: "When the Sun Hits", artist: "Slowdive", album: "Souvlaki"),
+            Self.makeLibraryTrack(3, title: "Joga", artist: "Bjork", album: "Homogenic"),
+            Self.makeLibraryTrack(4, title: "Xtal", artist: "Aphex Twin", album: "Selected Ambient Works 85-92")
+        ]
+        let store = PlayerStore(provider: PrewarmRecordingProvider(tracks: tracks), userDefaults: defaults)
+        let playlist = store.createPlaylist(title: "Night Drive", tracks: [tracks[2]])
+        let visibleTracks = [tracks[1], tracks[2], tracks[0], tracks[1]]
+
+        store.addToPlaylist(visibleTracks, playlistID: playlist.id)
+
+        XCTAssertEqual(store.playlistTracks(playlistID: playlist.id), [tracks[2], tracks[1], tracks[0]])
+    }
+
+    func testPlaylistTargetMenuBuilderExcludesCurrentPlaylistAndKeepsLibraryOrder() {
+        let shoegaze = LocalPlaylist(
+            id: "shoegaze",
+            title: "Shoegaze",
+            tracks: [Self.makeLibraryTrack(1, title: "Alison", artist: "Slowdive", album: "Souvlaki")]
+        )
+        let favorites = LocalPlaylist(
+            id: "favorites",
+            title: "Favorites",
+            tracks: [Self.makeLibraryTrack(2, title: "Joga", artist: "Bjork", album: "Homogenic")]
+        )
+        let archive = LocalPlaylist(
+            id: "archive",
+            title: "Archive",
+            tracks: [Self.makeLibraryTrack(3, title: "Xtal", artist: "Aphex Twin", album: "Selected Ambient Works 85-92")]
+        )
+
+        XCTAssertEqual(
+            PlaylistTargetMenuBuilder.targetPlaylists([favorites, shoegaze, archive], excludingPlaylistID: "shoegaze").map(\.id),
+            ["favorites", "archive"]
+        )
+    }
+
+    @MainActor
     func testLocalPlaylistsRenameRemoveAndDeleteWithoutTouchingLikedTracks() {
         let defaults = Self.makeIsolatedDefaults(name: "local-playlists-edit")
         let tracks = [
