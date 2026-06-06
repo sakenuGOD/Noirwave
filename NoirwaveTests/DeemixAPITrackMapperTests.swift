@@ -776,6 +776,28 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         )
     }
 
+    func testPlaylistTrackFilterKeepsPlaylistOrderAndMatchesTrackMetadata() {
+        let tracks = [
+            Self.makeLibraryTrack(1, title: "Only Shallow", artist: "My Bloody Valentine", album: "Loveless"),
+            Self.makeLibraryTrack(2, title: "Alison", artist: "Slowdive", album: "Souvlaki"),
+            Self.makeLibraryTrack(3, title: "Cherry-Coloured Funk", artist: "Cocteau Twins", album: "Heaven or Las Vegas"),
+            Self.makeLibraryTrack(4, title: "When the Sun Hits", artist: "Slowdive", album: "Souvlaki")
+        ]
+
+        XCTAssertEqual(
+            PlaylistTrackFilter.filteredTracks(tracks, query: "").map(\.id),
+            tracks.map(\.id)
+        )
+        XCTAssertEqual(
+            PlaylistTrackFilter.filteredTracks(tracks, query: "slowdive souvlaki").map(\.id),
+            [tracks[1].id, tracks[3].id]
+        )
+        XCTAssertEqual(
+            PlaylistTrackFilter.filteredTracks(tracks, query: "cherry").map(\.id),
+            [tracks[2].id]
+        )
+    }
+
     func testLibraryTrackOrganizerSortsByTitleArtistAlbumAndDuration() {
         let slowdive = Self.makeLibraryTrack(1, title: "Alison", artist: "Slowdive", album: "Souvlaki", duration: 171)
         let aphex = Self.makeLibraryTrack(2, title: "Xtal", artist: "Aphex Twin", album: "Selected Ambient Works 85-92", duration: 293)
