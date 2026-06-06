@@ -338,7 +338,7 @@ private struct SidebarPlaylistPreview: View {
     }
 
     private var accent: Color {
-        store.currentTrack?.palette.accent ?? collections.first?.tracks.first?.palette.accent ?? .white
+        store.currentTrack?.palette.accent ?? collections.first?.tracks.first?.palette.accent ?? NoirwaveTheme.primaryAccent
     }
 
     private func topAlbumCollection(from tracks: [Track]) -> SidebarLibraryCollection? {
@@ -442,7 +442,7 @@ private struct SidebarPlaylistRow: View {
     let action: () -> Void
 
     private var accent: Color {
-        store.currentTrack?.palette.accent ?? collection.tracks.first?.palette.accent ?? .white
+        store.currentTrack?.palette.accent ?? collection.tracks.first?.palette.accent ?? NoirwaveTheme.primaryAccent
     }
 
     var body: some View {
