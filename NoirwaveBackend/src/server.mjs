@@ -6,7 +6,6 @@ import { readARL, setRuntimeARL } from "./session.mjs";
 import {
   publicDeezerAlbumDetail,
   publicDeezerArtistDetail,
-  publicDeezerArtistTracks,
   publicDeezerSearch,
 } from "./publicDeezerSearch.mjs";
 import {
@@ -28,6 +27,9 @@ import {
   isWeakSearchPayload,
   shouldPreferFallbackSearchPayload,
 } from "./searchFallback.mjs";
+import { applySearchResponsePrefetch } from "./searchResponsePrefetch.mjs";
+import { normalizeCatalogLimit } from "./requestLimits.mjs";
+import { yandexLikedTracksForImport } from "./yandexImport.mjs";
 
 const app = express();
 const port = Number(process.env.NOIRWAVE_BACKEND_PORT ?? 6605);
@@ -35,13 +37,17 @@ const host = process.env.NOIRWAVE_BACKEND_HOST ?? "127.0.0.1";
 const preferredFormat = process.env.NOIRWAVE_DEEZER_FORMAT ?? "MP3_320";
 const startupSegmentBytes = Math.max(64 * 1024, Number(process.env.NOIRWAVE_STARTUP_CACHE_BYTES) || 384 * 1024);
 const startupSegmentMaxEntries = Math.max(1, Number(process.env.NOIRWAVE_STARTUP_CACHE_TRACKS) || 64);
-const startupJoinTimeoutMs = Math.max(100, Number(process.env.NOIRWAVE_STARTUP_JOIN_TIMEOUT_MS) || 650);
+const startupJoinTimeoutMs = Math.max(60, Number(process.env.NOIRWAVE_STARTUP_JOIN_TIMEOUT_MS) || 100);
 const prefetchConcurrency = Math.max(1, Number(process.env.NOIRWAVE_PREFETCH_CONCURRENCY) || 4);
 const backgroundPrefetchLimit = Math.max(0, Number(process.env.NOIRWAVE_BACKGROUND_PREFETCH_TRACKS) || 16);
 const foregroundPrefetchLimit = Math.max(0, Number(process.env.NOIRWAVE_FOREGROUND_PREFETCH_TRACKS) || 8);
 const foregroundPrefetchTimeoutMs = Math.max(0, Number(process.env.NOIRWAVE_FOREGROUND_PREFETCH_TIMEOUT_MS) || 0);
-const publicSearchFallbackDelayMs = Math.max(0, Number(process.env.NOIRWAVE_PUBLIC_SEARCH_FALLBACK_DELAY_MS) || 350);
-const publicDetailFallbackDelayMs = Math.max(0, Number(process.env.NOIRWAVE_PUBLIC_DETAIL_FALLBACK_DELAY_MS) || 250);
+const publicSearchFallbackDelayMs = Math.max(0, Number(process.env.NOIRWAVE_PUBLIC_SEARCH_FALLBACK_DELAY_MS) || 0);
+const publicDetailFallbackDelayMs = Math.max(0, Number(process.env.NOIRWAVE_PUBLIC_DETAIL_FALLBACK_DELAY_MS) || 0);
+const publicSearchTimeoutMs = Math.max(600, Number(process.env.NOIRWAVE_PUBLIC_SEARCH_TIMEOUT_MS) || 2200);
+const publicDetailTimeoutMs = Math.max(1000, Number(process.env.NOIRWAVE_PUBLIC_DETAIL_TIMEOUT_MS) || 3500);
+const searchPayloadCacheTTLms = Math.max(5_000, Number(process.env.NOIRWAVE_SEARCH_CACHE_TTL_MS) || 5 * 60 * 1000);
+const searchPayloadCacheMaxEntries = Math.max(20, Number(process.env.NOIRWAVE_SEARCH_CACHE_ENTRIES) || 160);
 const detailPayloadCacheTTLms = Math.max(30_000, Number(process.env.NOIRWAVE_DETAIL_CACHE_TTL_MS) || 10 * 60 * 1000);
 const sdkLoginTimeoutMs = Math.max(1000, Number(process.env.NOIRWAVE_SDK_LOGIN_TIMEOUT_MS) || 6000);
 
@@ -54,6 +60,8 @@ const trackMediaCache = new Map();
 const trackMediaInflight = new Map();
 const detailPayloadCache = new Map();
 const detailPayloadInflight = new Map();
+const searchPayloadCache = new Map();
+const searchPayloadInflight = new Map();
 const startupSegmentCache = new Map();
 const startupSegmentInflight = new Map();
 const startupPrefetchQueue = [];
@@ -63,7 +71,6 @@ let activeStartupPrefetches = 0;
 app.use(express.json());
 
 const isValidTrackId = (value) => /^\d+$/.test(String(value ?? ""));
-const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 
 const estimatedSizeForFormat = (media, format) => {
   const size = format === "MP3_320"
@@ -99,6 +106,35 @@ const withTransientRetry = async (
   throw lastError;
 };
 
+const cachedSearchPayload = async (key, producer) => {
+  const cached = searchPayloadCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.payload;
+  }
+
+  const inflight = searchPayloadInflight.get(key);
+  if (inflight) return inflight;
+
+  const promise = producer()
+    .then((payload) => {
+      searchPayloadCache.set(key, {
+        payload,
+        expiresAt: Date.now() + searchPayloadCacheTTLms,
+      });
+      if (searchPayloadCache.size > searchPayloadCacheMaxEntries) {
+        const oldestKey = searchPayloadCache.keys().next().value;
+        if (oldestKey) searchPayloadCache.delete(oldestKey);
+      }
+      return payload;
+    })
+    .finally(() => {
+      searchPayloadInflight.delete(key);
+    });
+
+  searchPayloadInflight.set(key, promise);
+  return promise;
+};
+
 const searchCatalog = async ({ term, scope, count }) => {
   let catalogSucceeded = false;
   let catalogPayload = null;
@@ -110,7 +146,7 @@ const searchCatalog = async ({ term, scope, count }) => {
     scope,
     "--limit",
     String(count),
-  ], { timeoutMs: 9000, attempts: 1 })
+  ], { timeoutMs: 2500, attempts: 1 })
     .then((payload) => {
       catalogSucceeded = true;
       catalogPayload = payload;
@@ -119,11 +155,11 @@ const searchCatalog = async ({ term, scope, count }) => {
     .catch((error) => ({ source: "catalog", error }));
 
   const fallbackPromise = delay(publicSearchFallbackDelayMs).then(async () => {
-    if (catalogSucceeded && !isWeakSearchPayload(catalogPayload, count)) {
+    if (catalogSucceeded && !isWeakSearchPayload(catalogPayload)) {
       return { source: "fallback", skipped: true };
     }
     try {
-      const fallback = await publicDeezerSearch({ query: term, scope, count });
+      const fallback = await publicDeezerSearch({ query: term, scope, count }, { timeoutMs: publicSearchTimeoutMs });
       return { source: "fallback", payload: fallback };
     } catch (fallbackError) {
       return { source: "fallback", error: fallbackError };
@@ -131,7 +167,7 @@ const searchCatalog = async ({ term, scope, count }) => {
   });
 
   const first = await Promise.race([catalogPromise, fallbackPromise]);
-  if (first.payload && !isWeakSearchPayload(first.payload, count)) {
+  if (first.payload && !isWeakSearchPayload(first.payload)) {
     if (first.source === "fallback") {
       console.warn("[search] using public Deezer fallback", {
         scope,
@@ -146,7 +182,7 @@ const searchCatalog = async ({ term, scope, count }) => {
     first.source === "catalog"
     && first.payload
     && second.source === "fallback"
-    && shouldPreferFallbackSearchPayload(first.payload, second.payload, count)
+    && shouldPreferFallbackSearchPayload(first.payload, second.payload)
   ) {
     console.warn("[search] using public Deezer fallback for weak catalog payload", {
       scope,
@@ -222,7 +258,7 @@ const shouldRefreshAlbumDetail = (payload) => {
   const declaredCount = albumDeclaredTrackCount(payload);
   if (declaredCount === 0) return false;
   const trackCount = albumPayloadTracks(payload).length;
-  if (trackCount < Math.min(declaredCount, 500)) return true;
+  if (trackCount < Math.min(declaredCount, 100)) return true;
 
   const recordType = String(payload?.record_type ?? "").toLowerCase();
   const title = String(payload?.title ?? "").toLowerCase();
@@ -232,42 +268,65 @@ const shouldRefreshAlbumDetail = (payload) => {
 };
 
 const albumDetailPayload = async (id) => {
-  let catalogPayload;
-  let catalogError;
+  const cacheKey = `album:${id}`;
+  let catalogSucceeded = false;
+  const catalogPromise = callCatalog(["album", "--id", id], { timeoutMs: 4000, attempts: 1 })
+    .then((payload) => {
+      catalogSucceeded = true;
+      return { source: "catalog", payload };
+    })
+    .catch((error) => ({ source: "catalog", error }));
 
-  try {
-    catalogPayload = await callCatalog(["album", "--id", id], { timeoutMs: 30000 });
-  } catch (error) {
-    catalogError = error;
-  }
-
-  if (!catalogPayload || shouldRefreshAlbumDetail(catalogPayload)) {
+  const fallbackPromise = delay(publicDetailFallbackDelayMs).then(async () => {
+    if (catalogSucceeded) return { source: "fallback", skipped: true };
     try {
-      const fallbackPayload = await publicDeezerAlbumDetail({ id });
-      if (
-        !catalogPayload
-        || albumPayloadTracks(fallbackPayload).length > albumPayloadTracks(catalogPayload).length
-      ) {
-        console.warn("[tracklist] using public Deezer album detail fallback", {
-          id,
-          catalogTracks: albumPayloadTracks(catalogPayload).length,
-          fallbackTracks: albumPayloadTracks(fallbackPayload).length,
-          catalogError: catalogError?.name,
-        });
-        return fallbackPayload;
-      }
-    } catch (fallbackError) {
-      if (!catalogPayload) throw catalogError ?? fallbackError;
-      console.warn("[tracklist] public Deezer album detail fallback failed", {
+      const fallbackPayload = await publicDeezerAlbumDetail({ id }, { timeoutMs: publicDetailTimeoutMs });
+      return { source: "fallback", payload: fallbackPayload };
+    } catch (error) {
+      return { source: "fallback", error };
+    }
+  });
+
+  const first = await Promise.race([catalogPromise, fallbackPromise]);
+  if (first.payload && !shouldRefreshAlbumDetail(first.payload)) {
+    if (first.source === "fallback") {
+      catalogPromise.then((catalogResult) => {
+        if (
+          catalogResult.payload
+          && albumPayloadTracks(catalogResult.payload).length > albumPayloadTracks(first.payload).length
+        ) {
+          setCachedDetailPayload(cacheKey, catalogResult.payload);
+        }
+      }).catch(() => {});
+      console.warn("[tracklist] using public Deezer album detail fallback", {
         id,
-        catalogTracks: albumPayloadTracks(catalogPayload).length,
-        fallbackError: fallbackError?.name,
+        tracks: albumPayloadTracks(first.payload).length,
       });
     }
+    return first.payload;
   }
 
-  if (!catalogPayload) throw catalogError;
-  return catalogPayload;
+  const second = first.source === "catalog" ? await fallbackPromise : await catalogPromise;
+  if (
+    second.payload
+    && (
+      !first.payload
+      || albumPayloadTracks(second.payload).length >= albumPayloadTracks(first.payload).length
+    )
+  ) {
+    if (second.source === "fallback") {
+      console.warn("[tracklist] using public Deezer album detail fallback", {
+        id,
+        catalogTracks: albumPayloadTracks(first.payload).length,
+        fallbackTracks: albumPayloadTracks(second.payload).length,
+        catalogError: first.error?.name,
+      });
+    }
+    return second.payload;
+  }
+
+  if (first.payload) return first.payload;
+  throw first.error ?? second.error;
 };
 
 const artistPayloadTopTracks = (payload) =>
@@ -297,7 +356,7 @@ const shouldRefreshArtistDetail = (payload) => {
   const releaseCount = artistPayloadReleaseCount(payload);
   const declaredAlbumCount = artistDeclaredAlbumCount(payload);
   if (topTrackCount === 0 && releaseCount === 0) return true;
-  return declaredAlbumCount > 0 && releaseCount < Math.min(declaredAlbumCount, 500);
+  return declaredAlbumCount > 0 && releaseCount === 0;
 };
 
 const isFallbackArtistDetailBetter = (fallbackPayload, catalogPayload) => {
@@ -321,7 +380,7 @@ const artistDetailPayload = async (id) => cachedDetailPayload(`artist:${id}`, as
   const fallbackPromise = delay(publicDetailFallbackDelayMs).then(async () => {
     if (catalogSucceeded) return { source: "fallback", skipped: true };
     try {
-      const fallbackPayload = await publicDeezerArtistDetail({ id });
+      const fallbackPayload = await publicDeezerArtistDetail({ id }, { timeoutMs: publicDetailTimeoutMs });
       return { source: "fallback", payload: fallbackPayload };
     } catch (error) {
       return { source: "fallback", error };
@@ -366,22 +425,6 @@ const artistDetailPayload = async (id) => cachedDetailPayload(`artist:${id}`, as
 
   if (first.payload) return first.payload;
   throw first.error ?? second.error;
-});
-
-const artistTracksPayload = async (id) => cachedDetailPayload(`artist-tracks:${id}`, async () => {
-  try {
-    const payload = await callCatalog(["artist-tracks", "--id", id], { timeoutMs: 45_000, attempts: 1 });
-    cacheTrackMediaFromPayload(payload);
-    return payload;
-  } catch (catalogError) {
-    const payload = await publicDeezerArtistTracks({ id }, { timeoutMs: 20_000 });
-    console.warn("[tracklist] using public Deezer artist tracks fallback", {
-      id,
-      tracks: Array.isArray(payload?.data) ? payload.data.length : 0,
-      catalogError: catalogError?.name,
-    });
-    return payload;
-  }
 });
 
 const isRetryableMediaResolutionError = (error) =>
@@ -1019,21 +1062,25 @@ app.post("/api/loginArl", asyncHandler(async (request, response) => {
 app.get("/api/search", asyncHandler(async (request, response) => {
   const term = String(request.query.term ?? "").trim();
   const scope = String(request.query.type ?? "track");
-  const count = clamp(Number.parseInt(String(request.query.nb ?? 30), 10) || 30, 1, 500);
+  const count = normalizeCatalogLimit(request.query.nb);
   if (!term) {
     response.json({ data: [], total: 0, type: scope });
     return;
   }
 
-  const payload = await searchCatalog({ term, scope, count });
-  if (scope === "track") {
-    cacheTrackMediaFromPayload(payload);
-    if (payload.source !== "deezer-public-search") {
-      const trackIds = extractTrackIds(payload);
-      await warmForegroundPrefetch(trackIds, preferredFormat);
-      scheduleBackgroundPrefetch(trackIds, preferredFormat);
-    }
-  }
+  const cacheKey = `${scope}:${count}:${term.toLowerCase()}`;
+  const payload = await cachedSearchPayload(
+    cacheKey,
+    () => searchCatalog({ term, scope, count })
+  );
+  applySearchResponsePrefetch({
+    scope,
+    payload,
+    preferredFormat,
+    cacheTrackMediaFromPayload,
+    extractTrackIds,
+    scheduleBackgroundPrefetch,
+  });
 
   response.json(payload);
 }));
@@ -1041,16 +1088,14 @@ app.get("/api/search", asyncHandler(async (request, response) => {
 app.get("/api/getTracklist", asyncHandler(async (request, response) => {
   const type = String(request.query.type ?? "");
   const id = String(request.query.id ?? "");
-  if (!id || !["artist", "album", "artist-tracks"].includes(type)) {
+  if (!id || !["artist", "album"].includes(type)) {
     response.status(400).json({ result: false, error: "type and id are required" });
     return;
   }
 
   const payload = type === "album"
     ? await cachedDetailPayload(`album:${id}`, () => albumDetailPayload(id))
-    : type === "artist-tracks"
-      ? await artistTracksPayload(id)
-      : await artistDetailPayload(id);
+    : await artistDetailPayload(id);
   cacheTrackMediaFromPayload(payload);
   response.json(payload);
   scheduleBackgroundPrefetch(extractTrackIds(payload), preferredFormat);
@@ -1185,6 +1230,20 @@ app.head("/api/stream/:trackId", asyncHandler(async (request, response) => {
   response.end();
 }));
 
+app.post("/api/import/yandex/likes", asyncHandler(async (request, response) => {
+  const tracks = await yandexLikedTracksForImport({
+    token: request.body?.token,
+    exportText: request.body?.exportText,
+  });
+
+  response.json({
+    result: true,
+    source: "yandex-music",
+    tracks,
+    total: tracks.length,
+  });
+}));
+
 app.get("/api/stream/:trackId", asyncHandler(async (request, response) => {
   if (!isValidTrackId(request.params.trackId)) {
     response.status(400).json({ result: false, errid: "InvalidTrackId", error: "trackId must be numeric" });
@@ -1268,7 +1327,12 @@ app.get("/api/stream/:trackId", asyncHandler(async (request, response) => {
 }));
 
 app.get("/health", (_request, response) => {
-  response.json({ ok: true, source: "Noirwave Backend" });
+  response.json({
+    ok: true,
+    source: "Noirwave Backend",
+    backendRoot: process.cwd(),
+    pid: process.pid,
+  });
 });
 
 app.listen(port, host, () => {

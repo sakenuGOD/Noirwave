@@ -26,6 +26,8 @@ struct Track: Codable, Identifiable, Hashable {
     let palette: TrackPalette
     let catalogID: String?
     let previewURL: String?
+    let artistCatalogID: String?
+    let albumCatalogID: String?
     let kind: TrackKind
     let artworkURL: String?
     let rank: Int?
@@ -46,6 +48,8 @@ struct Track: Codable, Identifiable, Hashable {
         palette: TrackPalette,
         catalogID: String?,
         previewURL: String?,
+        artistCatalogID: String? = nil,
+        albumCatalogID: String? = nil,
         kind: TrackKind = .track,
         artworkURL: String? = nil,
         rank: Int? = nil,
@@ -65,6 +69,8 @@ struct Track: Codable, Identifiable, Hashable {
         self.palette = palette
         self.catalogID = catalogID
         self.previewURL = previewURL
+        self.artistCatalogID = artistCatalogID
+        self.albumCatalogID = albumCatalogID
         self.kind = kind
         self.artworkURL = artworkURL
         self.rank = rank
@@ -352,7 +358,7 @@ enum SmartSearchRanker {
         artists: [Track],
         tracks: [Track],
         albums: [Track],
-        limit: Int = 50
+        limit: Int = Int.max
     ) -> [Track] {
         let term = query.searchNormalized
         guard !term.isEmpty else { return [] }
@@ -435,6 +441,10 @@ enum SmartSearchRanker {
             return true
         }
 
+        if SearchTextMatcher.isCloseName(normalizedQuery: term, normalizedText: name) {
+            return true
+        }
+
         if name.hasPrefix("\(term) ") {
             return (artist.fanCount ?? 0) >= weakArtistPrefixMinimumFans
         }
@@ -486,6 +496,11 @@ enum SmartSearchRanker {
 
         if termTokens.allSatisfy({ valueTokens.contains($0) || value.contains($0) }) {
             return 180_000 + (termTokens.count * 20_000)
+        }
+
+        let fuzzyScore = SearchTextMatcher.matchScore(normalizedQuery: term, normalizedText: value)
+        if fuzzyScore >= 45 {
+            return 120_000 + fuzzyScore * 400
         }
 
         let hits = termTokens.filter { valueTokens.contains($0) || value.contains($0) }.count
@@ -552,7 +567,6 @@ enum LibrarySearchFilter {
         let term = query.searchNormalized
         guard !term.isEmpty else { return tracks }
 
-        let tokens = term.split(separator: " ").map(String.init)
         return tracks.filter { track in
             let searchableText = [
                 track.title,
@@ -562,8 +576,7 @@ enum LibrarySearchFilter {
             .joined(separator: " ")
             .searchNormalized
 
-            return searchableText.containsWholePhrase(term)
-                || tokens.allSatisfy { searchableText.contains($0) }
+            return SearchTextMatcher.matches(normalizedQuery: term, normalizedText: searchableText)
         }
     }
 }
@@ -641,7 +654,7 @@ enum LibrarySortMode: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .recentlyAdded:
-            "Recently Added"
+            "Saved Order"
         case .title:
             "Title"
         case .artist:
@@ -656,7 +669,7 @@ enum LibrarySortMode: String, CaseIterable, Identifiable {
     var systemImage: String {
         switch self {
         case .recentlyAdded:
-            "clock.arrow.circlepath"
+            "line.3.horizontal"
         case .title:
             "textformat"
         case .artist:
@@ -804,18 +817,38 @@ struct TrackPalette: Codable, Hashable {
     var ink: Color { Color(hex: inkHex) }
 
     static let fallback = TrackPalette(
-        baseHex: "#101014",
-        midHex: "#28312D",
+        baseHex: NoirwaveTheme.backgroundHex,
+        midHex: NoirwaveTheme.backgroundElevatedHex,
         accentHex: NoirwaveTheme.primaryAccentHex,
-        inkHex: "#F4F0EA"
+        inkHex: NoirwaveTheme.textHex
     )
 }
 
 enum NoirwaveTheme {
-    static let primaryAccentHex = "#5EE0C2"
+    static let backgroundHex = "#141414"
+    static let backgroundElevatedHex = "#1A1A17"
+    static let surfaceHex = "#20201D"
+    static let textHex = "#F2F0E8"
+    static let primaryAccentHex = "#78DCD0"
 
     static var primaryAccent: Color {
         Color(hex: primaryAccentHex)
+    }
+
+    static var background: Color {
+        Color(hex: backgroundHex)
+    }
+
+    static var backgroundElevated: Color {
+        Color(hex: backgroundElevatedHex)
+    }
+
+    static var surface: Color {
+        Color(hex: surfaceHex)
+    }
+
+    static var text: Color {
+        Color(hex: textHex)
     }
 }
 
@@ -913,6 +946,155 @@ extension String {
         let paddedValue = " \(self) "
         let paddedPhrase = " \(phrase) "
         return paddedValue.contains(paddedPhrase)
+    }
+}
+
+enum SearchTextMatcher {
+    static func matches(query: String, text: String) -> Bool {
+        matchScore(query: query, text: text) > 0
+    }
+
+    static func matches(normalizedQuery: String, normalizedText: String) -> Bool {
+        matchScore(normalizedQuery: normalizedQuery, normalizedText: normalizedText) > 0
+    }
+
+    static func matchScore(query: String, text: String) -> Int {
+        matchScore(normalizedQuery: query.searchNormalized, normalizedText: text.searchNormalized)
+    }
+
+    static func matchScore(normalizedQuery query: String, normalizedText text: String) -> Int {
+        guard !query.isEmpty, !text.isEmpty else { return 0 }
+
+        if text == query {
+            return 100
+        }
+
+        if text.hasPrefix(query) {
+            return 84
+        }
+
+        if text.containsWholePhrase(query) {
+            return 72
+        }
+
+        let queryTokens = tokenList(query)
+        let textTokens = tokenList(text)
+        guard !queryTokens.isEmpty, !textTokens.isEmpty else { return 0 }
+
+        if allTokensMatch(queryTokens, in: textTokens, text: text, allowClose: false) {
+            return 60
+        }
+
+        if allTokensMatch(queryTokens, in: textTokens, text: text, allowClose: true) {
+            return 46
+        }
+
+        let exactHits = queryTokens.filter { token in
+            textTokens.contains(token) || text.contains(token)
+        }.count
+        let closeHits = queryTokens.filter { token in
+            textTokens.contains { isCloseToken(token, $0) }
+        }.count
+
+        return exactHits * 12 + closeHits * 8
+    }
+
+    static func isCloseName(normalizedQuery query: String, normalizedText text: String) -> Bool {
+        let queryTokens = tokenList(query)
+        let textTokens = tokenList(text)
+        guard queryTokens.count == textTokens.count else { return false }
+        return allTokensMatch(queryTokens, in: textTokens, text: text, allowClose: true)
+    }
+
+    private static func allTokensMatch(
+        _ queryTokens: [String],
+        in textTokens: [String],
+        text: String,
+        allowClose: Bool
+    ) -> Bool {
+        queryTokens.allSatisfy { queryToken in
+            textTokens.contains(queryToken)
+                || text.contains(queryToken)
+                || (allowClose && textTokens.contains { isCloseToken(queryToken, $0) })
+        }
+    }
+
+    private static func tokenList(_ value: String) -> [String] {
+        value.split(whereSeparator: \.isWhitespace).map(String.init)
+    }
+
+    private static func isCloseToken(_ queryToken: String, _ textToken: String) -> Bool {
+        guard queryToken.count >= 4, textToken.count >= 4 else { return false }
+        let lengthDelta = abs(queryToken.count - textToken.count)
+        let allowedDistance = max(queryToken.count, textToken.count) >= 8 ? 2 : 1
+        guard lengthDelta <= allowedDistance else { return false }
+        return editDistance(queryToken, textToken, maxDistance: allowedDistance) <= allowedDistance
+    }
+
+    private static func editDistance(_ lhs: String, _ rhs: String, maxDistance: Int) -> Int {
+        let left = Array(lhs)
+        let right = Array(rhs)
+        guard abs(left.count - right.count) <= maxDistance else {
+            return maxDistance + 1
+        }
+
+        var previous = Array(0...right.count)
+        var current = Array(repeating: 0, count: right.count + 1)
+
+        for leftIndex in 1...left.count {
+            current[0] = leftIndex
+            var rowMinimum = current[0]
+
+            for rightIndex in 1...right.count {
+                let substitutionCost = left[leftIndex - 1] == right[rightIndex - 1] ? 0 : 1
+                current[rightIndex] = min(
+                    previous[rightIndex] + 1,
+                    current[rightIndex - 1] + 1,
+                    previous[rightIndex - 1] + substitutionCost
+                )
+                rowMinimum = min(rowMinimum, current[rightIndex])
+            }
+
+            guard rowMinimum <= maxDistance else {
+                return maxDistance + 1
+            }
+
+            swap(&previous, &current)
+        }
+
+        return previous[right.count]
+    }
+}
+
+enum SearchQueryVariants {
+    static func candidates(for term: String) -> [String] {
+        let trimmedTerm = term.trimmed
+        guard !trimmedTerm.isEmpty else { return [] }
+
+        var candidates = [trimmedTerm]
+        appendIfDistinct(keyboardMapped(trimmedTerm), to: &candidates)
+        return candidates
+    }
+
+    private static func appendIfDistinct(_ value: String, to candidates: inout [String]) {
+        let normalizedValue = value.searchNormalized
+        guard !normalizedValue.isEmpty,
+              !candidates.contains(where: { $0.searchNormalized == normalizedValue })
+        else { return }
+        candidates.append(value)
+    }
+
+    private static func keyboardMapped(_ value: String) -> String {
+        let replacements: [Character: Character] = [
+            "й": "q", "ц": "w", "у": "e", "к": "r", "е": "t", "н": "y", "г": "u", "ш": "i", "щ": "o", "з": "p",
+            "ф": "a", "ы": "s", "в": "d", "а": "f", "п": "g", "р": "h", "о": "j", "л": "k", "д": "l",
+            "я": "z", "ч": "x", "с": "c", "м": "v", "и": "b", "т": "n", "ь": "m"
+        ]
+
+        return String(value.map { character in
+            let lowercased = Character(String(character).lowercased())
+            return replacements[lowercased] ?? character
+        })
     }
 }
 

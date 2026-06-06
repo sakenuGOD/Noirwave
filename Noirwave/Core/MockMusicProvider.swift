@@ -102,7 +102,7 @@ final class MockMusicProvider: MusicProviding {
                 return tracks
             case .library:
                 return artistCards
-            case .playlists:
+            case .albums:
                 return albumCards
             }
         }
@@ -137,7 +137,7 @@ final class MockMusicProvider: MusicProviding {
             return artistCards.filter { artist in
                 artist.title.lowercased().contains(term)
             }
-        case .playlists:
+        case .albums:
             return albumCards.filter { album in
                 album.title.lowercased().contains(term)
                     || album.artist.lowercased().contains(term)
@@ -157,6 +157,26 @@ final class MockMusicProvider: MusicProviding {
             return tracks
                 .filter { $0.album.localizedCaseInsensitiveContains(item.title) }
                 .sorted { ($0.trackPosition ?? Int.max) < ($1.trackPosition ?? Int.max) }
+        }
+    }
+
+    func radioTracks(seed: Track?) async throws -> [Track] {
+        guard let seed else {
+            return tracks
+        }
+
+        let seedArtist = seed.artist.searchNormalized
+        let seedAlbum = seed.album.searchNormalized
+        return tracks.sorted { lhs, rhs in
+            let lhsScore = (lhs.artist.searchNormalized == seedArtist ? 2 : 0)
+                + (lhs.album.searchNormalized == seedAlbum ? 1 : 0)
+            let rhsScore = (rhs.artist.searchNormalized == seedArtist ? 2 : 0)
+                + (rhs.album.searchNormalized == seedAlbum ? 1 : 0)
+
+            if lhsScore == rhsScore {
+                return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+            }
+            return lhsScore > rhsScore
         }
     }
 

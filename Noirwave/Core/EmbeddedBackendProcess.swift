@@ -15,19 +15,32 @@ final class EmbeddedBackendProcess {
     }
 
     private var backendRoot: URL? {
-        Bundle.main.resourceURL?.appendingPathComponent("NoirwaveBackend", isDirectory: true)
+        let candidates = [
+            ProcessInfo.processInfo.environment["NOIRWAVE_BACKEND_ROOT"].map { URL(fileURLWithPath: $0, isDirectory: true) },
+            Bundle.main.resourceURL?.appendingPathComponent("NoirwaveBackend", isDirectory: true),
+            sourceCheckoutBackendRoot()
+        ]
+
+        return candidates
+            .compactMap(\.self)
+            .first { FileManager.default.fileExists(atPath: $0.appendingPathComponent("src/server.mjs").path) }
     }
 
     func startIfNeeded() async {
-        if await isBackendResponsive() {
-            return
-        }
-
         guard process == nil,
               let backendRoot,
               FileManager.default.fileExists(atPath: backendRoot.appendingPathComponent("src/server.mjs").path)
         else {
             return
+        }
+
+        if await isBackendResponsive(expectedBackendRoot: backendRoot) {
+            return
+        }
+
+        if await isBackendResponsive(expectedBackendRoot: nil) {
+            terminateBackendOnPort()
+            try? await Task.sleep(for: .milliseconds(250))
         }
 
         guard let nodeExecutable = executablePath(
@@ -65,22 +78,74 @@ final class EmbeddedBackendProcess {
     private func waitUntilResponsive() async {
         let deadline = Date().addingTimeInterval(startupTimeout)
         while Date() < deadline {
-            if await isBackendResponsive() {
+            if await isBackendResponsive(expectedBackendRoot: backendRoot) {
                 return
             }
             try? await Task.sleep(for: .milliseconds(180))
         }
     }
 
-    private func isBackendResponsive() async -> Bool {
+    private func isBackendResponsive(expectedBackendRoot: URL?) async -> Bool {
         do {
-            let url = baseURL.appendingPathComponent("api/connect")
+            let url = baseURL.appendingPathComponent("health")
             var request = URLRequest(url: url)
             request.timeoutInterval = 0.75
-            let (_, response) = try await URLSession.shared.data(for: request)
-            return (response as? HTTPURLResponse)?.statusCode == 200
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { return false }
+            guard let expectedBackendRoot else { return true }
+            guard let health = try? JSONDecoder().decode(BackendHealth.self, from: data),
+                  let backendRoot = health.backendRoot?.nonEmpty
+            else { return false }
+
+            return URL(fileURLWithPath: backendRoot, isDirectory: true).standardizedFileURL.path
+                == expectedBackendRoot.standardizedFileURL.path
         } catch {
             return false
+        }
+    }
+
+    private struct BackendHealth: Decodable {
+        let backendRoot: String?
+    }
+
+    private func sourceCheckoutBackendRoot() -> URL? {
+        let sourceFile = URL(fileURLWithPath: #filePath)
+        let root = sourceFile
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("NoirwaveBackend", isDirectory: true)
+        return root
+    }
+
+    private func terminateBackendOnPort() {
+        let lsof = Process()
+        let output = Pipe()
+        lsof.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        lsof.arguments = ["-ti", "tcp:\(port)"]
+        lsof.standardOutput = output
+        lsof.standardError = FileHandle.nullDevice
+
+        do {
+            try lsof.run()
+            lsof.waitUntilExit()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            guard let text = String(data: data, encoding: .utf8) else { return }
+            let currentPID = String(ProcessInfo.processInfo.processIdentifier)
+            let pids = text
+                .split(whereSeparator: \.isNewline)
+                .map(String.init)
+                .filter { $0 != currentPID }
+
+            for pid in pids {
+                let kill = Process()
+                kill.executableURL = URL(fileURLWithPath: "/bin/kill")
+                kill.arguments = [pid]
+                try? kill.run()
+                kill.waitUntilExit()
+            }
+        } catch {
+            return
         }
     }
 

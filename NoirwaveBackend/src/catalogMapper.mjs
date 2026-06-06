@@ -174,7 +174,7 @@ export const trackPayload = (track, fallbackIndex = 0, albumContext = null) => {
       picture_xl: null,
       nb_album: null,
       nb_fan: null,
-      tracklist: artist?.id ? `https://api.deezer.com/artist/${artist.id}/top?limit=50` : null,
+      tracklist: artist?.id ? `https://api.deezer.com/artist/${artist.id}/top?limit=1000` : null,
     },
     album: album
       ? {
@@ -215,7 +215,7 @@ export const artistPayload = (artist, fallbackIndex = 0) => ({
   picture_xl: artworkURL(artist?.picture),
   nb_album: artist?.albums_count ?? artist?.album_count ?? artist?.albumCount ?? null,
   nb_fan: artist?.fans_count ?? artist?.fansCount ?? null,
-  tracklist: artist?.id ? `https://api.deezer.com/artist/${artist.id}/top?limit=50` : null,
+  tracklist: artist?.id ? `https://api.deezer.com/artist/${artist.id}/top?limit=1000` : null,
 });
 
 export const albumPayload = (album, fallbackIndex = 0, artistContext = null) => {

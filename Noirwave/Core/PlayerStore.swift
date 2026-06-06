@@ -25,15 +25,27 @@ final class PlayerStore: ObservableObject {
     @Published private(set) var savedCollectionOrder: [String] = []
     @Published private(set) var savedCollectionSnapshots: [String: Track] = [:]
     @Published private(set) var localPlaylists: [LocalPlaylist] = []
+    @Published private(set) var importHistory: [MusicImportHistoryRecord] = []
     @Published private(set) var listeningScores: [String: Int] = [:]
+    @Published private(set) var mcpPermissions = MCPLibraryPermissions()
+    @Published private(set) var mcpActivityLog: [MCPActivityEntry] = []
+    @Published private(set) var mcpLastSyncedAt: Date?
+    @Published private(set) var mcpServerStatus = MCPServerStatus.stopped
 
     @Published var searchQuery = ""
     @Published var selectedScope: SearchScope = .smart
     @Published var progress: TimeInterval = 0
     @Published var volume: Double = 0.78
+    @Published var equalizerSettings: EqualizerSettings = .flat
+    @Published var crossfadeDuration: TimeInterval = 4
 
     let provider: MusicProviding
 
+    private static let volumeKey = "noirwave.volume"
+    private static let equalizerEnabledKey = "noirwave.equalizer.enabled"
+    private static let equalizerPresetKey = "noirwave.equalizer.preset"
+    private static let equalizerBandsKey = "noirwave.equalizer.bands"
+    private static let crossfadeDurationKey = "noirwave.crossfade.duration"
     private static let likedTrackIDsKey = "noirwave.likedTrackIDs"
     private static let likedTrackOrderKey = "noirwave.likedTrackOrder"
     private static let likedTrackSnapshotsKey = "noirwave.likedTrackSnapshots"
@@ -41,6 +53,7 @@ final class PlayerStore: ObservableObject {
     private static let savedCollectionOrderKey = "noirwave.savedCollectionOrder"
     private static let savedCollectionSnapshotsKey = "noirwave.savedCollectionSnapshots"
     private static let localPlaylistsKey = "noirwave.localPlaylists"
+    private static let importHistoryKey = "noirwave.importHistory"
     private static let listeningScoresKey = "noirwave.listeningScores"
     private let playbackContextLimit = 16
     private let userDefaults: UserDefaults
@@ -49,8 +62,22 @@ final class PlayerStore: ObservableObject {
     private var progressTask: Task<Void, Never>?
     private var lyricsTask: Task<Void, Never>?
     private var preparationTask: Task<Void, Never>?
+    private var catalogPrefetchTask: Task<Void, Never>?
+    private var mcpBridgeTask: Task<Void, Never>?
+    private var mcpLastSeenLibraryModificationDate: Date?
+    private var isApplyingMCPSnapshot = false
     private var activePlaybackContext: [Track] = []
     private var lastAudibleVolume: Double = 0.78
+    private var isAdvancingWithCrossfade = false
+    private var searchResultsCache: [String: [Track]] = [:]
+    private var lyricsCache: [String: TrackLyrics] = [:]
+    private var catalogItemsCache: [String: CachedCatalogItems] = [:]
+    private var activeCatalogCacheKey: String?
+    private var catalogInFlightKey: String?
+    private let catalogCacheTTL: TimeInterval = 60 * 60
+    private let catalogCacheLimit = 160
+    private let catalogPrefetchLimit = 4
+    private let searchDebounceMilliseconds = 260
 
     init(provider: MusicProviding, userDefaults: UserDefaults = .standard) {
         self.provider = provider
@@ -68,6 +95,32 @@ final class PlayerStore: ObservableObject {
         )
         savedCollectionSnapshots = Self.loadSavedCollectionSnapshots(from: userDefaults, savedIDs: savedCollectionIDs)
         localPlaylists = Self.loadLocalPlaylists(from: userDefaults)
+        importHistory = Self.loadImportHistory(from: userDefaults)
+        mcpPermissions = MCPLibraryBridge.loadPermissions()
+        mcpActivityLog = MCPLibraryBridge.loadActivityLog()
+        mcpServerStatus = MCPLibraryBridge.loadServerStatus()
+        if let storedVolume = userDefaults.object(forKey: Self.volumeKey) as? NSNumber {
+            volume = min(max(storedVolume.doubleValue, 0), 1)
+            lastAudibleVolume = volume > 0 ? volume : lastAudibleVolume
+            provider.setVolume(volume)
+        }
+        if let storedPreset = userDefaults.string(forKey: Self.equalizerPresetKey),
+           let preset = EqualizerPreset(rawValue: storedPreset) {
+            equalizerSettings.preset = preset
+            equalizerSettings.bandGains = preset.bandGains
+        }
+        if let storedBands = userDefaults.array(forKey: Self.equalizerBandsKey) as? [Double],
+           !storedBands.isEmpty {
+            equalizerSettings.bandGains = storedBands
+        }
+        equalizerSettings.isEnabled = userDefaults.object(forKey: Self.equalizerEnabledKey).map { _ in
+            userDefaults.bool(forKey: Self.equalizerEnabledKey)
+        } ?? equalizerSettings.isEnabled
+        if let storedCrossfade = userDefaults.object(forKey: Self.crossfadeDurationKey) as? NSNumber {
+            crossfadeDuration = Self.normalizedCrossfadeDuration(storedCrossfade.doubleValue)
+        }
+        provider.setEqualizer(equalizerSettings)
+        provider.setCrossfadeDuration(crossfadeDuration)
         listeningScores = (userDefaults.dictionary(forKey: Self.listeningScoresKey) ?? [:]).reduce(into: [:]) { result, item in
             if let score = item.value as? Int {
                 result[item.key] = score
@@ -75,6 +128,7 @@ final class PlayerStore: ObservableObject {
                 result[item.key] = score.intValue
             }
         }
+        startMCPBridge()
     }
 
     var needsBackendSession: Bool {
@@ -93,6 +147,7 @@ final class PlayerStore: ObservableObject {
         progressTask?.cancel()
         lyricsTask?.cancel()
         preparationTask?.cancel()
+        mcpBridgeTask?.cancel()
     }
 
     func bootstrap() async {
@@ -126,8 +181,12 @@ final class PlayerStore: ObservableObject {
 
     func leaveCatalogContext() {
         guard catalogContext != nil else { return }
+        searchTask?.cancel()
         catalogContext = nil
+        activeCatalogCacheKey = nil
+        catalogInFlightKey = nil
         resultSubtitle = nil
+        isSearching = false
 
         if searchQuery.trimmed.isEmpty {
             resultTitle = "Catalog Tracks"
@@ -145,6 +204,11 @@ final class PlayerStore: ObservableObject {
     func activate(_ item: Track, in playbackContext: [Track]) {
         guard item.isPlayable else {
             drillIntoCatalog(from: item)
+            return
+        }
+
+        if currentTrack?.id == item.id {
+            togglePlayPause()
             return
         }
 
@@ -233,6 +297,7 @@ final class PlayerStore: ObservableObject {
 
         playbackTask?.cancel()
         progressTask?.cancel()
+        isAdvancingWithCrossfade = false
 
         currentTrack = track
         progress = 0
@@ -277,6 +342,8 @@ final class PlayerStore: ObservableObject {
     }
 
     func pause() {
+        playbackTask?.cancel()
+        isAdvancingWithCrossfade = false
         progressTask?.cancel()
         playbackState = .paused
 
@@ -453,6 +520,26 @@ final class PlayerStore: ObservableObject {
         persistLikedTracks()
     }
 
+    @discardableResult
+    func addLikedTracks(_ tracks: [Track]) -> Int {
+        let playableTracks = uniquePlayableTracks(in: tracks)
+        var imported = 0
+
+        for track in playableTracks where !likedTrackIDs.contains(track.id) {
+            likedTrackIDs.insert(track.id)
+            likedTrackOrder.removeAll { $0 == track.id }
+            likedTrackOrder.insert(track.id, at: likedTrackOrder.startIndex)
+            likedTrackSnapshots[track.id] = track
+            imported += 1
+        }
+
+        if imported > 0 {
+            persistLikedTracks()
+        }
+
+        return imported
+    }
+
     func likedTracks(limit: Int = 12) -> [Track] {
         let knownTracks = knownPlaybackTracks.filter { likedTrackIDs.contains($0.id) }
         var trackByID = likedTrackSnapshots.filter { likedTrackIDs.contains($0.key) }
@@ -542,6 +629,42 @@ final class PlayerStore: ObservableObject {
     }
 
     @discardableResult
+    func addTracksToPlaylist(named title: String, tracks: [Track]) -> (playlist: LocalPlaylist, imported: Int) {
+        let playableTracks = uniquePlayableTracks(in: tracks)
+        guard !playableTracks.isEmpty else {
+            let playlist = localPlaylists.first { $0.title.localizedCaseInsensitiveCompare(title) == .orderedSame }
+                ?? createPlaylist(title: title)
+            return (playlist, 0)
+        }
+
+        if let index = localPlaylists.firstIndex(where: { $0.title.localizedCaseInsensitiveCompare(title) == .orderedSame }) {
+            let originalCount = localPlaylists[index].trackCount
+            _ = localPlaylists[index].append(playableTracks)
+            let imported = localPlaylists[index].trackCount - originalCount
+            if imported > 0 {
+                persistLocalPlaylists()
+            }
+            return (localPlaylists[index], imported)
+        }
+
+        let playlist = createPlaylist(title: title, tracks: playableTracks)
+        return (playlist, playlist.trackCount)
+    }
+
+    func recordImport(source: String, imported: Int, skipped: Int, notFound: Int, destination: String) {
+        let record = MusicImportHistoryRecord(
+            source: source,
+            imported: imported,
+            skipped: skipped,
+            notFound: notFound,
+            destination: destination
+        )
+        importHistory.insert(record, at: importHistory.startIndex)
+        importHistory = Array(importHistory.prefix(10))
+        persistImportHistory()
+    }
+
+    @discardableResult
     func createPlaylist(title: String, track: Track) -> LocalPlaylist {
         createPlaylist(title: title, tracks: [track])
     }
@@ -627,7 +750,8 @@ final class PlayerStore: ObservableObject {
             return
         }
 
-        queue = Array(shuffledPlaybackCandidates(excluding: currentTrack).prefix(playbackContextLimit))
+        let excludedTrack = currentTrack ?? currentPlaybackContext.first
+        queue = Array(shuffledPlaybackCandidates(excluding: excludedTrack).prefix(playbackContextLimit))
         preparePlaybackContext()
     }
 
@@ -635,9 +759,11 @@ final class PlayerStore: ObservableObject {
         repeatMode = repeatMode.next
     }
 
-    func seek(to fraction: Double) {
+    func seek(to time: TimeInterval) {
         guard let duration = currentTrack?.duration else { return }
-        progress = min(max(fraction, 0), 1) * duration
+        playbackTask?.cancel()
+        isAdvancingWithCrossfade = false
+        progress = min(max(time, 0), duration)
 
         let targetTime = progress
         Task {
@@ -645,11 +771,17 @@ final class PlayerStore: ObservableObject {
         }
     }
 
+    func seek(toFraction fraction: Double) {
+        guard let duration = currentTrack?.duration else { return }
+        seek(to: min(max(fraction, 0), 1) * duration)
+    }
+
     func setVolume(_ value: Double) {
         volume = min(max(value, 0), 1)
         if volume > 0 {
             lastAudibleVolume = volume
         }
+        userDefaults.set(volume, forKey: Self.volumeKey)
         provider.setVolume(volume)
     }
 
@@ -661,85 +793,401 @@ final class PlayerStore: ObservableObject {
         }
     }
 
+    func setEqualizerEnabled(_ isEnabled: Bool) {
+        equalizerSettings.isEnabled = isEnabled
+        persistEqualizerSettings()
+        provider.setEqualizer(equalizerSettings)
+    }
+
+    func setEqualizerPreset(_ preset: EqualizerPreset) {
+        equalizerSettings = EqualizerSettings.preset(preset, isEnabled: equalizerSettings.isEnabled)
+        persistEqualizerSettings()
+        provider.setEqualizer(equalizerSettings)
+    }
+
+    func setEqualizerBand(at index: Int, gain: Double) {
+        guard EqualizerSettings.bandFrequencies.indices.contains(index) else { return }
+        var gains = equalizerSettings.normalizedBandGains
+        gains[index] = min(max(gain, -12), 12)
+        equalizerSettings.bandGains = gains
+        equalizerSettings.preset = .flat
+        persistEqualizerSettings()
+        provider.setEqualizer(equalizerSettings)
+    }
+
+    func setCrossfadeDuration(_ duration: TimeInterval) {
+        crossfadeDuration = Self.normalizedCrossfadeDuration(duration)
+        userDefaults.set(crossfadeDuration, forKey: Self.crossfadeDurationKey)
+        provider.setCrossfadeDuration(crossfadeDuration)
+    }
+
+    func updateMCPPermissions(_ update: (inout MCPLibraryPermissions) -> Void) {
+        var permissions = mcpPermissions
+        update(&permissions)
+        guard permissions != mcpPermissions else { return }
+        mcpPermissions = permissions
+        MCPLibraryBridge.savePermissions(permissions)
+        exportMCPLibrarySnapshot()
+    }
+
+    func refreshMCPActivityLog() {
+        mcpActivityLog = MCPLibraryBridge.loadActivityLog()
+    }
+
+    func refreshMCPStatus() {
+        mcpServerStatus = MCPLibraryBridge.loadServerStatus()
+        mcpActivityLog = MCPLibraryBridge.loadActivityLog()
+    }
+
     private func scheduleSearch() {
         searchTask?.cancel()
 
-        searchTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(180))
-            guard let self, !Task.isCancelled else { return }
-            await runSearch()
-        }
-    }
-
-    private func runSearch() async {
         let term = searchQuery.trimmed
         let scope = SearchScope.smart
 
         guard !term.isEmpty else {
-            isSearching = false
-            errorMessage = nil
-            resultTitle = "Catalog Tracks"
+            applyEmptySearchState()
+            return
+        }
+
+        if let cachedResults = searchResultsCache[searchCacheKey(term: term, scope: scope)] {
+            applySearchResults(cachedResults, term: term, scope: scope)
+            return
+        }
+
+        let optimisticResults = localSearchResults(term: term)
+        if optimisticResults.isEmpty {
+            resultTitle = scope.resultsTitle
             resultSubtitle = nil
             catalogContext = nil
-            visibleTracks = featuredTracks
-            preparePlaybackContext()
+            activeCatalogCacheKey = nil
+            catalogInFlightKey = nil
+            errorMessage = nil
+        } else {
+            applySearchResults(optimisticResults, term: term, scope: scope)
+        }
+        isSearching = false
+
+        searchTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(self?.searchDebounceMilliseconds ?? 80))
+            guard let self, !Task.isCancelled else { return }
+            await runSearch(term: term, scope: scope)
+        }
+    }
+
+    private func runSearch(term: String, scope: SearchScope) async {
+        guard !term.isEmpty else {
+            applyEmptySearchState()
             return
         }
 
         isSearching = true
-        defer { isSearching = false }
+        defer {
+            if term == searchQuery.trimmed {
+                isSearching = false
+            }
+        }
 
         do {
-            let results = try await provider.search(term, scope: scope)
+            let results = try await remoteSearchResults(term: term, scope: scope)
             guard !Task.isCancelled,
                   term == searchQuery.trimmed
             else { return }
-            visibleTracks = results
-            resultTitle = scope.resultsTitle
-            resultSubtitle = nil
-            catalogContext = nil
-            errorMessage = nil
-            preparePlaybackContext()
+            searchResultsCache[searchCacheKey(term: term, scope: scope)] = results
+            applySearchResults(results, term: term, scope: scope)
         } catch {
-            guard !Task.isCancelled else { return }
-            visibleTracks = []
+            guard !Task.isCancelled,
+                  term == searchQuery.trimmed
+            else { return }
             resultTitle = scope.resultsTitle
             resultSubtitle = nil
             catalogContext = nil
-            errorMessage = error.localizedDescription
+            errorMessage = visibleTracks.isEmpty ? error.localizedDescription : nil
         }
     }
 
+    private func remoteSearchResults(term: String, scope: SearchScope) async throws -> [Track] {
+        let candidates = SearchQueryVariants.candidates(for: term)
+        var lastError: Error?
+
+        for (index, candidate) in candidates.enumerated() {
+            do {
+                let results = try await provider.search(candidate, scope: scope)
+                if !results.isEmpty || index == candidates.count - 1 {
+                    return results
+                }
+            } catch {
+                lastError = error
+            }
+        }
+
+        if let lastError {
+            throw lastError
+        }
+
+        return []
+    }
+
+    private func applyEmptySearchState() {
+        catalogPrefetchTask?.cancel()
+        isSearching = false
+        errorMessage = nil
+        resultTitle = "Catalog Tracks"
+        resultSubtitle = nil
+        catalogContext = nil
+        activeCatalogCacheKey = nil
+        catalogInFlightKey = nil
+        visibleTracks = featuredTracks
+        preparePlaybackContext()
+    }
+
+    private func applySearchResults(_ results: [Track], term: String, scope: SearchScope) {
+        guard term == searchQuery.trimmed else { return }
+        visibleTracks = results
+        resultTitle = scope.resultsTitle
+        resultSubtitle = nil
+        catalogContext = nil
+        activeCatalogCacheKey = nil
+        catalogInFlightKey = nil
+        errorMessage = nil
+        isSearching = false
+        preparePlaybackContext()
+        prefetchCatalogDetails(from: results)
+    }
+
+    private func searchCacheKey(term: String, scope: SearchScope) -> String {
+        "\(scope.rawValue)::\(term.searchNormalized)"
+    }
+
+    private func localSearchResults(term: String) -> [Track] {
+        let normalizedTerm = term.searchNormalized
+        guard !normalizedTerm.isEmpty else { return [] }
+
+        let tokens = normalizedTerm.split(separator: " ").map(String.init)
+        let candidates = uniqueSearchItems(in:
+            visibleTracks
+            + featuredTracks
+            + Array(likedTrackSnapshots.values)
+            + Array(savedCollectionSnapshots.values)
+            + localPlaylists.flatMap { $0.orderedTracks(preferredTracks: Array(likedTrackSnapshots.values) + featuredTracks) }
+        )
+
+        return candidates
+            .filter { item in
+                SearchTextMatcher.matches(normalizedQuery: normalizedTerm, normalizedText: searchText(for: item))
+            }
+            .sorted { lhs, rhs in
+                let lhsScore = localSearchScore(lhs, term: normalizedTerm, tokens: tokens)
+                let rhsScore = localSearchScore(rhs, term: normalizedTerm, tokens: tokens)
+                if lhsScore == rhsScore {
+                    return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+                }
+                return lhsScore > rhsScore
+            }
+            .prefix(80)
+            .map { $0 }
+    }
+
+    private func uniqueSearchItems(in items: [Track]) -> [Track] {
+        var result: [Track] = []
+        var seenIDs = Set<String>()
+        for item in items where seenIDs.insert(item.id).inserted {
+            result.append(item)
+        }
+        return result
+    }
+
+    private func searchText(for item: Track) -> String {
+        [item.title, item.artist, item.album, item.detailLabel]
+            .joined(separator: " ")
+            .searchNormalized
+    }
+
+    private func localSearchScore(_ item: Track, term: String, tokens: [String]) -> Int {
+        let title = item.title.searchNormalized
+        let artist = item.artist.searchNormalized
+        let album = item.album.searchNormalized
+        let titleMatchScore = SearchTextMatcher.matchScore(normalizedQuery: term, normalizedText: title)
+        let artistMatchScore = SearchTextMatcher.matchScore(normalizedQuery: term, normalizedText: artist)
+        let albumMatchScore = SearchTextMatcher.matchScore(normalizedQuery: term, normalizedText: album)
+        var score = 0
+
+        if title == term { score += 120 }
+        if artist == term { score += 110 }
+        if album == term { score += 80 }
+        if title.hasPrefix(term) { score += 60 }
+        if artist.hasPrefix(term) { score += 55 }
+        if title.contains(term) { score += 35 }
+        if artist.contains(term) { score += 30 }
+        if album.contains(term) { score += 20 }
+        score += tokens.filter { title.contains($0) || artist.contains($0) || album.contains($0) }.count * 8
+        score += titleMatchScore * 2
+        score += artistMatchScore * 2
+        score += albumMatchScore
+
+        switch item.kind {
+        case .artist:
+            score += 10
+        case .track:
+            score += 6
+        case .album:
+            score += 4
+        }
+
+        return score
+    }
+
     private func drillIntoCatalog(from item: Track) {
-        searchTask?.cancel()
+        let cacheKeys = catalogItemsCacheKeys(for: item)
+        let primaryCacheKey = cacheKeys[0]
+        let cached = cachedCatalogItems(for: item)
+        let cachedItems = cached?.entry.items
+        let hasFreshCache = cached.map { isFreshCatalogCache($0.entry) } ?? false
+        let isSameInFlightRequest = catalogInFlightKey.map { cacheKeys.contains($0) } ?? false
+
+        if !isSameInFlightRequest {
+            searchTask?.cancel()
+            catalogInFlightKey = nil
+        }
+
         selectedScope = .catalog
-        let optimisticItems = optimisticCatalogItems(for: item, in: visibleTracks)
+        let optimisticItems = cachedItems ?? optimisticCatalogItems(for: item, in: visibleTracks)
         resultTitle = item.title
         resultSubtitle = item.detailLabel
         catalogContext = item
-        visibleTracks = optimisticItems
-        isSearching = true
+        activeCatalogCacheKey = primaryCacheKey
         errorMessage = nil
+        visibleTracks = optimisticItems
+        isSearching = !hasFreshCache
+        preparePlaybackContext()
 
+        guard !hasFreshCache else { return }
+        guard !isSameInFlightRequest else { return }
+
+        catalogInFlightKey = primaryCacheKey
         searchTask = Task { [weak self] in
             guard let self else { return }
+            defer {
+                if catalogInFlightKey == primaryCacheKey {
+                    catalogInFlightKey = nil
+                }
+                if activeCatalogCacheKey == primaryCacheKey {
+                    isSearching = false
+                }
+            }
 
             do {
                 let items = try await provider.catalogItems(for: item)
-                guard !Task.isCancelled else { return }
-                visibleTracks = items
+                guard !Task.isCancelled,
+                      activeCatalogCacheKey == primaryCacheKey
+                else { return }
+                let resolvedItems = items.isEmpty ? optimisticItems : items
+                cacheCatalogItems(resolvedItems, for: item)
+                if let catalogContext {
+                    cacheCatalogItems(resolvedItems, for: catalogContext)
+                }
+                visibleTracks = resolvedItems
                 resultTitle = item.title
                 resultSubtitle = item.detailLabel
-                errorMessage = items.isEmpty ? "\(provider.sourceName) returned no catalog items." : nil
+                errorMessage = items.isEmpty && optimisticItems.isEmpty ? "\(provider.sourceName) returned no catalog items." : nil
+                preparePlaybackContext()
             } catch {
-                guard !Task.isCancelled else { return }
-                visibleTracks = []
+                guard !Task.isCancelled,
+                      activeCatalogCacheKey == primaryCacheKey
+                else { return }
+                visibleTracks = optimisticItems
                 resultTitle = item.title
                 resultSubtitle = item.detailLabel
-                errorMessage = error.localizedDescription
+                errorMessage = optimisticItems.isEmpty ? error.localizedDescription : nil
             }
+        }
+    }
 
-            isSearching = false
+    private func catalogItemsCacheKeys(for item: Track) -> [String] {
+        var keys: [String] = []
+
+        func append(_ key: String?) {
+            guard let key, !key.isEmpty, !keys.contains(key) else { return }
+            keys.append(key)
+        }
+
+        switch item.kind {
+        case .track:
+            append("track:\(item.catalogID?.nonEmpty ?? item.id)")
+        case .artist:
+            append("artist:\(item.title.searchNormalized)")
+        case .album:
+            append("album:\(item.title.searchNormalized):\(item.artist.searchNormalized)")
+        }
+
+        if let catalogID = item.catalogID?.nonEmpty {
+            append("\(item.kind.rawValue.lowercased()):catalog:\(catalogID)")
+        }
+        append("\(item.kind.rawValue.lowercased()):id:\(item.id)")
+        return keys
+    }
+
+    private func cachedCatalogItems(for item: Track) -> (key: String, entry: CachedCatalogItems)? {
+        for key in catalogItemsCacheKeys(for: item) {
+            if let entry = catalogItemsCache[key] {
+                return (key, entry)
+            }
+        }
+
+        return nil
+    }
+
+    private func isFreshCatalogCache(_ cached: CachedCatalogItems) -> Bool {
+        Date().timeIntervalSince(cached.createdAt) <= catalogCacheTTL
+    }
+
+    private func cacheCatalogItems(_ items: [Track], for item: Track) {
+        let entry = CachedCatalogItems(items: items, createdAt: Date())
+        for key in catalogItemsCacheKeys(for: item) {
+            catalogItemsCache[key] = entry
+        }
+
+        guard catalogItemsCache.count > catalogCacheLimit else { return }
+        let keysToRemove = catalogItemsCache
+            .sorted { $0.value.createdAt < $1.value.createdAt }
+            .prefix(catalogItemsCache.count - catalogCacheLimit)
+            .map(\.key)
+        for key in keysToRemove {
+            catalogItemsCache.removeValue(forKey: key)
+        }
+    }
+
+    private func prefetchCatalogDetails(from items: [Track]) {
+        catalogPrefetchTask?.cancel()
+
+        let targets = uniqueCollectionItems(in: items)
+            .filter { item in
+                guard item.kind == .artist || item.kind == .album else { return false }
+                if cachedCatalogItems(for: item) != nil { return false }
+                if let catalogInFlightKey {
+                    return !catalogItemsCacheKeys(for: item).contains(catalogInFlightKey)
+                }
+                return true
+            }
+            .prefix(catalogPrefetchLimit)
+
+        guard !targets.isEmpty else { return }
+
+        catalogPrefetchTask = Task { [weak self] in
+            guard let self else { return }
+
+            for target in targets {
+                guard !Task.isCancelled else { return }
+                if cachedCatalogItems(for: target) != nil { continue }
+
+                do {
+                    let items = try await provider.catalogItems(for: target)
+                    guard !Task.isCancelled else { return }
+                    cacheCatalogItems(items, for: target)
+                } catch {
+                    continue
+                }
+            }
         }
     }
 
@@ -803,13 +1251,13 @@ final class PlayerStore: ObservableObject {
 
         progressTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(250))
+                try? await Task.sleep(for: .milliseconds(100))
                 guard let self, !Task.isCancelled else { return }
 
                 if let providerProgress = provider.currentPlaybackTime() {
                     updateProgress(to: providerProgress)
                 } else {
-                    advanceProgress(by: 0.25)
+                    advanceProgress(by: 0.1)
                 }
             }
         }
@@ -824,18 +1272,6 @@ final class PlayerStore: ObservableObject {
             resultSubtitle = nil
             catalogContext = nil
         }
-        currentTrack = tracks.first
-        queue = tracks.first.map {
-            playbackQueue(after: $0, in: tracks, limit: playbackContextLimit)
-        } ?? []
-        progress = 0
-        playbackState = .idle
-        if let currentTrack {
-            loadLyrics(for: currentTrack)
-        } else {
-            lyricsTask?.cancel()
-            lyricsState = .idle
-        }
         preparePlaybackContext()
     }
 
@@ -847,6 +1283,11 @@ final class PlayerStore: ObservableObject {
             return
         }
 
+        if let cachedLyrics = lyricsCache[track.id] {
+            applyLyrics(cachedLyrics)
+            return
+        }
+
         lyricsState = .loading
         lyricsTask = Task { [weak self] in
             guard let self else { return }
@@ -854,9 +1295,8 @@ final class PlayerStore: ObservableObject {
             do {
                 let lyrics = try await provider.lyrics(for: track)
                 guard !Task.isCancelled, currentTrack == track else { return }
-                lyricsState = lyrics.isAvailable
-                    ? .loaded(lyrics)
-                    : .unavailable("No lyrics available for this track.")
+                lyricsCache[track.id] = lyrics
+                applyLyrics(lyrics)
             } catch {
                 guard !Task.isCancelled, currentTrack == track else { return }
                 lyricsState = .failed(error.localizedDescription)
@@ -864,10 +1304,19 @@ final class PlayerStore: ObservableObject {
         }
     }
 
+    private func applyLyrics(_ lyrics: TrackLyrics) {
+        lyricsState = lyrics.isAvailable
+            ? .loaded(lyrics)
+            : .unavailable("No lyrics available for this track.")
+    }
+
     private func advanceProgress(by delta: TimeInterval) {
         guard playbackState == .playing, let currentTrack else { return }
 
         progress += delta
+        if maybeStartCrossfade(for: currentTrack) {
+            return
+        }
         if progress >= currentTrack.duration {
             progress = currentTrack.duration
             next()
@@ -878,8 +1327,88 @@ final class PlayerStore: ObservableObject {
         guard playbackState == .playing, let currentTrack else { return }
 
         progress = min(max(playbackTime, 0), currentTrack.duration)
+        if maybeStartCrossfade(for: currentTrack) {
+            return
+        }
         if progress >= currentTrack.duration {
             next()
+        }
+    }
+
+    private func maybeStartCrossfade(for track: Track) -> Bool {
+        guard !isAdvancingWithCrossfade,
+              crossfadeDuration > 0,
+              track.duration > crossfadeDuration + 1,
+              progress >= track.duration - crossfadeDuration,
+              let nextTrack = crossfadeCandidate()
+        else {
+            return false
+        }
+
+        startCrossfade(to: nextTrack)
+        return true
+    }
+
+    private func crossfadeCandidate() -> Track? {
+        guard repeatMode != .one else { return nil }
+
+        if let nextTrack = queue.first {
+            return nextTrack
+        }
+
+        if isShuffled {
+            return shuffledPlaybackCandidates(excluding: currentTrack).first
+        }
+
+        let context = currentPlaybackContext
+        guard let currentTrack,
+              let index = context.firstIndex(of: currentTrack),
+              !context.isEmpty
+        else {
+            return repeatMode == .all ? context.first(where: \.isPlayable) : nil
+        }
+
+        let isLastTrack = context.index(after: index) == context.endIndex
+        guard !isLastTrack || repeatMode == .all else { return nil }
+        let nextIndex = isLastTrack ? context.startIndex : context.index(after: index)
+        return context[nextIndex]
+    }
+
+    private func startCrossfade(to nextTrack: Track) {
+        playbackTask?.cancel()
+        isAdvancingWithCrossfade = true
+
+        if queue.first == nextTrack {
+            queue.removeFirst()
+        } else {
+            queue.removeAll { $0 == nextTrack }
+        }
+
+        currentTrack = nextTrack
+        progress = 0
+        playbackState = .playing
+        errorMessage = nil
+        loadLyrics(for: nextTrack)
+        prepare(Array(([nextTrack] + queue).prefix(playbackContextLimit)))
+
+        playbackTask = Task { [weak self] in
+            guard let self else { return }
+
+            do {
+                try await provider.crossfade(to: nextTrack, duration: crossfadeDuration)
+                guard !Task.isCancelled else { return }
+                recordListening(nextTrack)
+                playbackState = .playing
+                isAdvancingWithCrossfade = false
+                refillQueue(after: nextTrack)
+                preparePlaybackContext()
+            } catch is CancellationError {
+                isAdvancingWithCrossfade = false
+            } catch {
+                guard !Task.isCancelled else { return }
+                isAdvancingWithCrossfade = false
+                handlePlaybackFailure(error)
+            }
         }
     }
 
@@ -947,6 +1476,16 @@ final class PlayerStore: ObservableObject {
             guard let self else { return }
             await provider.prepare(candidates)
         }
+    }
+
+    private func persistEqualizerSettings() {
+        userDefaults.set(equalizerSettings.isEnabled, forKey: Self.equalizerEnabledKey)
+        userDefaults.set(equalizerSettings.preset.rawValue, forKey: Self.equalizerPresetKey)
+        userDefaults.set(equalizerSettings.normalizedBandGains, forKey: Self.equalizerBandsKey)
+    }
+
+    private static func normalizedCrossfadeDuration(_ duration: TimeInterval) -> TimeInterval {
+        min(max(duration, 0), 8)
     }
 
     private func playbackPreparationCandidates(limit: Int) -> [Track] {
@@ -1122,6 +1661,73 @@ final class PlayerStore: ObservableObject {
         return score
     }
 
+    private func startMCPBridge() {
+        MCPLibraryBridge.ensureFiles(permissions: mcpPermissions)
+        exportMCPLibrarySnapshot()
+
+        mcpBridgeTask?.cancel()
+        mcpBridgeTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                self?.importExternalMCPSnapshotIfNeeded()
+                self?.mcpPermissions = MCPLibraryBridge.loadPermissions()
+                self?.mcpActivityLog = MCPLibraryBridge.loadActivityLog()
+                self?.mcpServerStatus = MCPLibraryBridge.loadServerStatus()
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+    }
+
+    private var mcpKnownTracks: [Track] {
+        uniquePlayableTracks(
+            in: knownPlaybackTracks
+                + Array(likedTrackSnapshots.values)
+                + Array(savedCollectionSnapshots.values)
+                + localPlaylists.flatMap { $0.orderedTracks(preferredTracks: knownPlaybackTracks) }
+        )
+    }
+
+    private func exportMCPLibrarySnapshot() {
+        guard !isApplyingMCPSnapshot else { return }
+        let snapshot = MCPLibraryBridge.snapshot(
+            tracks: mcpKnownTracks,
+            likedIDs: likedTrackIDs,
+            savedIDs: savedCollectionIDs,
+            playlists: localPlaylists,
+            permissions: mcpPermissions
+        )
+        MCPLibraryBridge.saveSnapshot(snapshot)
+        mcpLastSyncedAt = Date()
+        mcpLastSeenLibraryModificationDate = Self.fileModificationDate(MCPLibraryBridge.libraryURL)
+    }
+
+    private func importExternalMCPSnapshotIfNeeded() {
+        guard let modificationDate = Self.fileModificationDate(MCPLibraryBridge.libraryURL),
+              modificationDate != mcpLastSeenLibraryModificationDate,
+              let snapshot = MCPLibraryBridge.loadSnapshot()
+        else { return }
+
+        mcpLastSeenLibraryModificationDate = modificationDate
+
+        let importedPlaylists = Self.normalizedLocalPlaylists(MCPLibraryBridge.playlists(from: snapshot))
+        if importedPlaylists != localPlaylists {
+            isApplyingMCPSnapshot = true
+            localPlaylists = importedPlaylists
+            Self.persistLocalPlaylists(localPlaylists, to: userDefaults)
+            isApplyingMCPSnapshot = false
+        }
+
+        if snapshot.permissions != mcpPermissions {
+            mcpPermissions = snapshot.permissions
+            MCPLibraryBridge.savePermissions(snapshot.permissions)
+        }
+
+        mcpLastSyncedAt = Date()
+    }
+
+    private static func fileModificationDate(_ url: URL) -> Date? {
+        try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date
+    }
+
     private func recordListening(_ track: Track) {
         listeningScores[track.id, default: 0] += 1
         persistListeningScores()
@@ -1133,6 +1739,7 @@ final class PlayerStore: ObservableObject {
         userDefaults.set(likedTrackOrder, forKey: Self.likedTrackOrderKey)
         likedTrackSnapshots = likedTrackSnapshots.filter { likedTrackIDs.contains($0.key) }
         Self.persistLikedTrackSnapshots(likedTrackSnapshots, to: userDefaults)
+        exportMCPLibrarySnapshot()
     }
 
     private func persistSavedCollections() {
@@ -1141,6 +1748,7 @@ final class PlayerStore: ObservableObject {
         userDefaults.set(savedCollectionOrder, forKey: Self.savedCollectionOrderKey)
         savedCollectionSnapshots = savedCollectionSnapshots.filter { savedCollectionIDs.contains($0.key) }
         Self.persistSavedCollectionSnapshots(savedCollectionSnapshots, to: userDefaults)
+        exportMCPLibrarySnapshot()
     }
 
     private func updatePlaylist(playlistID: String, _ update: (inout LocalPlaylist) -> Void) {
@@ -1157,6 +1765,12 @@ final class PlayerStore: ObservableObject {
     private func persistLocalPlaylists() {
         localPlaylists = Self.normalizedLocalPlaylists(localPlaylists)
         Self.persistLocalPlaylists(localPlaylists, to: userDefaults)
+        exportMCPLibrarySnapshot()
+    }
+
+    private func persistImportHistory() {
+        guard let data = try? JSONEncoder().encode(importHistory) else { return }
+        userDefaults.set(data, forKey: Self.importHistoryKey)
     }
 
     private static func normalizedLikedTrackOrder(_ order: [String], likedIDs: Set<String>) -> [String] {
@@ -1249,6 +1863,14 @@ final class PlayerStore: ObservableObject {
         userDefaults.set(data, forKey: Self.localPlaylistsKey)
     }
 
+    private static func loadImportHistory(from userDefaults: UserDefaults) -> [MusicImportHistoryRecord] {
+        guard let data = userDefaults.data(forKey: Self.importHistoryKey),
+              let records = try? JSONDecoder().decode([MusicImportHistoryRecord].self, from: data)
+        else { return [] }
+
+        return Array(records.prefix(10))
+    }
+
     private func persistListeningScores() {
         userDefaults.set(listeningScores, forKey: Self.listeningScoresKey)
     }
@@ -1271,4 +1893,9 @@ final class PlayerStore: ObservableObject {
             || message.localizedCaseInsensitiveContains("session expired")
             || message.localizedCaseInsensitiveContains("session token")
     }
+}
+
+private struct CachedCatalogItems {
+    let items: [Track]
+    let createdAt: Date
 }

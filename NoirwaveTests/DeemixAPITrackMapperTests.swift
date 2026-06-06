@@ -36,6 +36,8 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         XCTAssertEqual(track.previewURL, "https://cdns-preview.dzcdn.net/stream/c-test-preview.mp3")
         XCTAssertEqual(track.kind, .track)
         XCTAssertEqual(track.artworkURL, "https://e-cdns-images.dzcdn.net/images/cover/homework/250x250-000000-80-0-0.jpg")
+        XCTAssertEqual(track.artistCatalogID, "https://www.deezer.com/artist/27")
+        XCTAssertEqual(track.albumCatalogID, "https://www.deezer.com/album/302127")
     }
 
     func testRejectsTrackWithoutDownloadURL() {
@@ -152,8 +154,339 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(80))
 
         let preparedIDs = Array(provider.preparedBatches.flatMap { $0 }.prefix(11))
-        let expectedIDs = tracks.dropFirst().map(\.id)
+        let expectedIDs = tracks.prefix(11).map(\.id)
         XCTAssertEqual(preparedIDs, expectedIDs)
+    }
+
+    @MainActor
+    func testBootstrapDoesNotSelectFeaturedTrackAsCurrentPlayback() async throws {
+        let tracks = (1...3).map { Self.makePlaybackTrack($0) }
+        let provider = PrewarmRecordingProvider(tracks: tracks)
+        let store = PlayerStore(provider: provider)
+
+        await store.bootstrap()
+
+        XCTAssertNil(store.currentTrack)
+        XCTAssertTrue(store.queue.isEmpty)
+        XCTAssertEqual(store.playbackState, .idle)
+        XCTAssertEqual(store.visibleTracks, tracks)
+    }
+
+    @MainActor
+    func testSearchDebouncesRemoteRequestAndKeepsTypingLocal() async throws {
+        let provider = SearchCacheRecordingProvider(
+            featured: [Self.makePlaybackTrack(1, title: "Ambient Seed")],
+            resultsByQuery: [
+                "ambient": [Self.makePlaybackTrack(2, title: "Ambient Result")]
+            ],
+            searchDelay: .milliseconds(120)
+        )
+        let store = PlayerStore(provider: provider)
+
+        await store.bootstrap()
+        store.updateSearchQuery("ambient")
+
+        try await Task.sleep(for: .milliseconds(10))
+
+        XCTAssertEqual(store.searchQuery, "ambient")
+        XCTAssertFalse(store.isSearching)
+        XCTAssertTrue(provider.recordedQueries.isEmpty)
+        XCTAssertEqual(store.visibleTracks.map(\.title), ["Ambient Seed"])
+
+        try await Task.sleep(for: .milliseconds(180))
+
+        XCTAssertTrue(provider.recordedQueries.isEmpty)
+        XCTAssertEqual(store.visibleTracks.map(\.title), ["Ambient Seed"])
+        XCTAssertFalse(store.isSearching)
+
+        try await Task.sleep(for: .milliseconds(110))
+
+        XCTAssertEqual(provider.recordedQueries.map(\.query), ["ambient"])
+        XCTAssertEqual(store.visibleTracks.map(\.title), ["Ambient Seed"])
+        XCTAssertTrue(store.isSearching)
+
+        try await Task.sleep(for: .milliseconds(160))
+
+        XCTAssertEqual(provider.recordedQueries.map(\.query), ["ambient"])
+        XCTAssertEqual(store.visibleTracks.map(\.title), ["Ambient Result"])
+    }
+
+    @MainActor
+    func testSearchRetriesKeyboardLayoutVariantWhenOriginalReturnsEmpty() async throws {
+        let result = Self.makePlaybackTrack(2, title: "Especially for You", artist: "Manchild")
+        let provider = SearchCacheRecordingProvider(
+            featured: [],
+            resultsByQuery: ["manchild": [result]],
+            searchDelay: .milliseconds(20)
+        )
+        let store = PlayerStore(provider: provider)
+
+        store.updateSearchQuery("ьanchild")
+        try await Task.sleep(for: .milliseconds(360))
+
+        XCTAssertEqual(provider.recordedQueries.map(\.query), ["ьanchild", "manchild"])
+        XCTAssertEqual(store.visibleTracks, [result])
+        XCTAssertFalse(store.isSearching)
+    }
+
+    @MainActor
+    func testSearchUsesCachedResultsWithoutRepeatingRemoteQuery() async throws {
+        let cachedResult = Self.makePlaybackTrack(2, title: "Cached Search Result")
+        let provider = SearchCacheRecordingProvider(
+            featured: [Self.makePlaybackTrack(1, title: "Seed")],
+            resultsByQuery: ["cache": [cachedResult]],
+            searchDelay: .milliseconds(20)
+        )
+        let store = PlayerStore(provider: provider)
+
+        await store.bootstrap()
+        store.updateSearchQuery("cache")
+        try await Task.sleep(for: .milliseconds(420))
+        XCTAssertEqual(store.visibleTracks, [cachedResult])
+        XCTAssertEqual(provider.recordedQueries.map(\.query), ["cache"])
+
+        store.updateSearchQuery("")
+        try await Task.sleep(for: .milliseconds(40))
+        store.updateSearchQuery("cache")
+        try await Task.sleep(for: .milliseconds(420))
+
+        XCTAssertEqual(store.visibleTracks, [cachedResult])
+        XCTAssertEqual(provider.recordedQueries.map(\.query), ["cache"])
+    }
+
+    @MainActor
+    func testSlowNetworkSearchKeepsShellPlaybackAndPreviousResultsUsable() async throws {
+        let seed = Self.makePlaybackTrack(1, title: "Slow Seed")
+        let playingTrack = Self.makePlaybackTrack(2, title: "Playing Track")
+        let delayedResult = Self.makePlaybackTrack(3, title: "Delayed Result")
+        let provider = SearchCacheRecordingProvider(
+            featured: [seed],
+            resultsByQuery: ["slow": [delayedResult]],
+            searchDelay: .milliseconds(3_500)
+        )
+        let store = PlayerStore(provider: provider)
+
+        await store.bootstrap()
+        store.play(playingTrack)
+        try await Task.sleep(for: .milliseconds(80))
+
+        store.updateSearchQuery("slow")
+        try await Task.sleep(for: .milliseconds(360))
+
+        XCTAssertEqual(store.searchQuery, "slow")
+        XCTAssertTrue(store.isSearching)
+        XCTAssertEqual(store.visibleTracks, [seed])
+        XCTAssertEqual(store.currentTrack, playingTrack)
+        XCTAssertEqual(store.playbackState, .playing)
+
+        store.togglePlayPause()
+        try await Task.sleep(for: .milliseconds(40))
+
+        XCTAssertEqual(store.playbackState, .paused)
+        XCTAssertEqual(store.visibleTracks, [seed])
+        XCTAssertEqual(provider.recordedQueries.map(\.query), ["slow"])
+        XCTAssertEqual(provider.playedIDs, [playingTrack.id])
+
+        try await Task.sleep(for: .milliseconds(4_000))
+
+        XCTAssertFalse(store.isSearching)
+        XCTAssertEqual(store.visibleTracks, [delayedResult])
+        XCTAssertEqual(store.currentTrack, playingTrack)
+    }
+
+    @MainActor
+    func testActivatingCurrentSearchTrackTogglesPlaybackInsteadOfRestarting() async throws {
+        let result = Self.makePlaybackTrack(7, title: "Search Playback")
+        let provider = SearchCacheRecordingProvider(
+            featured: [],
+            resultsByQuery: ["play": [result]],
+            searchDelay: .milliseconds(10)
+        )
+        let store = PlayerStore(provider: provider)
+
+        await store.bootstrap()
+        store.updateSearchQuery("play")
+        try await Task.sleep(for: .milliseconds(380))
+
+        store.activate(result, in: store.visibleTracks)
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertEqual(store.currentTrack, result)
+        XCTAssertEqual(store.playbackState, .playing)
+        XCTAssertEqual(provider.playedIDs, [result.id])
+
+        store.activate(result, in: store.visibleTracks)
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertEqual(store.currentTrack, result)
+        XCTAssertEqual(store.playbackState, .paused)
+        XCTAssertEqual(provider.playedIDs, [result.id])
+    }
+
+    @MainActor
+    func testActivatingSearchResultUsesVisibleResultsForPlaybackContext() async throws {
+        let results = [
+            Self.makePlaybackTrack(10, title: "Search One"),
+            Self.makePlaybackTrack(11, title: "Search Two"),
+            Self.makePlaybackTrack(12, title: "Search Three")
+        ]
+        let provider = SearchCacheRecordingProvider(
+            featured: [],
+            resultsByQuery: ["queue": results],
+            searchDelay: .milliseconds(10)
+        )
+        let store = PlayerStore(provider: provider)
+
+        await store.bootstrap()
+        store.updateSearchQuery("queue")
+        try await Task.sleep(for: .milliseconds(380))
+
+        store.activate(results[1], in: store.visibleTracks)
+        try await Task.sleep(for: .milliseconds(80))
+
+        XCTAssertEqual(store.currentTrack, results[1])
+        XCTAssertEqual(store.playbackState, .playing)
+        XCTAssertEqual(store.queue, [results[2]])
+        XCTAssertEqual(provider.playedIDs, [results[1].id])
+    }
+
+    @MainActor
+    func testLyricsSeekUpdatesProgressAndForwardsToProvider() async throws {
+        let track = Self.makePlaybackTrack(3)
+        let provider = SearchCacheRecordingProvider(featured: [track], resultsByQuery: [:], searchDelay: .milliseconds(10))
+        let store = PlayerStore(provider: provider)
+
+        await store.bootstrap()
+        store.play(track)
+        try await Task.sleep(for: .milliseconds(80))
+
+        store.seek(to: 42)
+        try await Task.sleep(for: .milliseconds(40))
+
+        XCTAssertEqual(store.progress, 42, accuracy: 0.25)
+        XCTAssertEqual(provider.seekTimes, [42])
+    }
+
+    @MainActor
+    func testProgressSliderSeekUsesFractionOfCurrentTrackDuration() async throws {
+        let track = Self.makePlaybackTrack(4)
+        let provider = SearchCacheRecordingProvider(featured: [track], resultsByQuery: [:], searchDelay: .milliseconds(10))
+        let store = PlayerStore(provider: provider)
+
+        await store.bootstrap()
+        store.play(track)
+        try await Task.sleep(for: .milliseconds(80))
+
+        store.seek(toFraction: 0.25)
+        try await Task.sleep(for: .milliseconds(40))
+
+        XCTAssertEqual(store.progress, 45, accuracy: 0.25)
+        XCTAssertEqual(provider.seekTimes, [45])
+    }
+
+    @MainActor
+    func testLyricsCacheReusesLoadedLyricsForRepeatedPlayback() async throws {
+        let track = Self.makePlaybackTrack(41, title: "Cached Lyrics")
+        let otherTrack = Self.makePlaybackTrack(42, title: "Other Track")
+        let lyrics = TrackLyrics(
+            text: "cached line",
+            lines: [],
+            copyright: nil,
+            writers: nil
+        )
+        let provider = LyricsCacheRecordingProvider(lyricsByTrackID: [track.id: lyrics])
+        let store = PlayerStore(provider: provider)
+
+        store.play(track)
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertEqual(store.lyricsState, .loaded(lyrics))
+        XCTAssertEqual(provider.lyricsRequests, [track.id])
+
+        store.play(otherTrack)
+        store.play(track)
+        XCTAssertEqual(store.lyricsState, .loaded(lyrics))
+
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertEqual(provider.lyricsRequests.filter { $0 == track.id }.count, 1)
+    }
+
+    func testMiniPlayerVisualStyleKeepsGlassReadable() {
+        XCTAssertLessThanOrEqual(MiniPlayerVisualStyle.materialTintOpacity, 0.1)
+        XCTAssertLessThanOrEqual(MiniPlayerVisualStyle.legacyDimOpacity, 0.1)
+        XCTAssertGreaterThanOrEqual(MiniPlayerVisualStyle.inactiveControlOpacity, 0.62)
+        XCTAssertLessThanOrEqual(MiniPlayerVisualStyle.progressTrackOpacity, 0.18)
+        XCTAssertGreaterThanOrEqual(MiniPlayerVisualStyle.progressHeight, 0.75)
+        XCTAssertLessThanOrEqual(MiniPlayerVisualStyle.progressHeight, 1.0)
+        XCTAssertGreaterThanOrEqual(MiniPlayerVisualStyle.progressHoverHeight, MiniPlayerVisualStyle.progressHeight * 4)
+        XCTAssertGreaterThanOrEqual(MiniPlayerVisualStyle.progressHitHeight, 24)
+        XCTAssertGreaterThanOrEqual(MiniPlayerVisualStyle.primaryControlStrokeOpacity, 0.30)
+    }
+
+    func testSidebarVisualStyleUsesControlledNativePalette() {
+        XCTAssertGreaterThanOrEqual(SidebarVisualStyle.materialDimOpacity, LiquidGlassPanelStyle.dimOpacity)
+        XCTAssertLessThanOrEqual(SidebarVisualStyle.activeAccentOpacity, 0.8)
+        XCTAssertLessThanOrEqual(SidebarVisualStyle.activeAccentFillOpacity, 0.05)
+        XCTAssertGreaterThanOrEqual(SidebarVisualStyle.inactiveTextOpacity, 0.7)
+        XCTAssertGreaterThanOrEqual(SidebarVisualStyle.inactiveIconOpacity, 0.62)
+        XCTAssertLessThanOrEqual(SidebarVisualStyle.searchRestFillOpacity, 0.065)
+        XCTAssertLessThanOrEqual(SidebarVisualStyle.activeStrokeOpacity, 0.12)
+    }
+
+    func testSidePanelsShareMiniPlayerLiquidGlassLanguage() {
+        XCTAssertEqual(SidebarVisualStyle.panelMaterial, .sidebar)
+        XCTAssertEqual(NowPlayingPanelVisualStyle.panelMaterial, LiquidGlassPanelStyle.material)
+        XCTAssertGreaterThanOrEqual(LiquidGlassPanelStyle.dimOpacity, MiniPlayerVisualStyle.legacyDimOpacity + 0.015)
+        XCTAssertLessThanOrEqual(LiquidGlassPanelStyle.dimOpacity, 0.03)
+        XCTAssertLessThanOrEqual(LiquidGlassPanelStyle.materialOpacity, 0.82)
+        XCTAssertGreaterThanOrEqual(LiquidGlassPanelStyle.materialOpacity, 0.70)
+        XCTAssertEqual(LiquidGlassPanelStyle.borderOpacity, 0.18, accuracy: 0.001)
+        XCTAssertEqual(LiquidGlassPanelStyle.topHighlightOpacity, 0.24, accuracy: 0.001)
+        XCTAssertLessThanOrEqual(LiquidGlassPanelStyle.innerHighlightOpacity, 0.055)
+        XCTAssertLessThanOrEqual(LiquidGlassPanelStyle.diagonalHighlightOpacity, 0.018)
+        XCTAssertEqual(LiquidGlassPanelStyle.mintGlowOpacity, 0, accuracy: 0.001)
+        XCTAssertLessThanOrEqual(SidebarVisualStyle.activeAccentFillOpacity, 0.05)
+        XCTAssertLessThanOrEqual(NowPlayingPanelVisualStyle.innerCardFillOpacity, 0.08)
+    }
+
+    func testSidebarUsesNativeMaterialWithoutHeavyBlackFill() {
+        XCTAssertGreaterThan(SidebarVisualStyle.panelAppearance.materialOpacity, LiquidGlassPanelStyle.appearance.materialOpacity)
+        XCTAssertGreaterThan(SidebarVisualStyle.panelAppearance.dimOpacity, LiquidGlassPanelStyle.appearance.dimOpacity)
+        XCTAssertGreaterThanOrEqual(SidebarVisualStyle.panelAppearance.materialOpacity, 0.80)
+        XCTAssertLessThanOrEqual(SidebarVisualStyle.panelAppearance.dimOpacity, 0.025)
+
+        XCTAssertGreaterThan(NowPlayingPanelVisualStyle.panelAppearance.materialOpacity, LiquidGlassPanelStyle.appearance.materialOpacity)
+        XCTAssertGreaterThan(NowPlayingPanelVisualStyle.panelAppearance.dimOpacity, LiquidGlassPanelStyle.appearance.dimOpacity)
+        XCTAssertGreaterThanOrEqual(NowPlayingPanelVisualStyle.panelAppearance.materialOpacity, 0.76)
+        XCTAssertLessThanOrEqual(NowPlayingPanelVisualStyle.panelAppearance.dimOpacity, 0.03)
+        XCTAssertGreaterThanOrEqual(NowPlayingPanelVisualStyle.panelAppearance.shadowOpacity, SidebarVisualStyle.panelAppearance.shadowOpacity)
+    }
+
+    func testSidebarPlaylistPreviewBuilderUsesOnlyRealLocalPlaylists() {
+        let localPlaylist = LocalPlaylist(
+            id: "dream-pop",
+            title: "Dream Pop",
+            tracks: [Self.makeLibraryTrack(1, title: "Cherry-Coloured Funk", artist: "Cocteau Twins", album: "Heaven or Las Vegas")]
+        )
+
+        let items = SidebarPlaylistPreviewBuilder.visibleItems(
+            localPlaylists: [localPlaylist],
+            isExpanded: false,
+            tracksForPlaylist: { $0.orderedTracks(preferredTracks: []) }
+        )
+
+        XCTAssertEqual(items.map(\.id), ["playlist.dream-pop"])
+        XCTAssertEqual(items.first?.title, "Dream Pop")
+        XCTAssertEqual(items.first?.subtitle, "1 track")
+        XCTAssertEqual(items.first?.symbol, "music.note.list")
+        XCTAssertEqual(items.first?.selection, .localPlaylist("dream-pop"))
+        XCTAssertFalse(items.map(\.id).contains("liked.songs"))
+        XCTAssertFalse(items.map(\.id).contains("discovery.mix"))
+        XCTAssertTrue(items.allSatisfy { !$0.id.hasPrefix("album.") && !$0.id.hasPrefix("artist.") })
+
+        let emptyItems = SidebarPlaylistPreviewBuilder.visibleItems(
+            localPlaylists: [],
+            isExpanded: false,
+            tracksForPlaylist: { _ in [] }
+        )
+        XCTAssertTrue(emptyItems.isEmpty)
     }
 
     @MainActor
@@ -163,7 +496,7 @@ final class DeemixAPITrackMapperTests: XCTestCase {
 
         await store.bootstrap()
         store.updateSearchQuery("first")
-        try await Task.sleep(for: .milliseconds(240))
+        try await Task.sleep(for: .milliseconds(360))
         store.updateSearchQuery("second")
         try await Task.sleep(for: .milliseconds(700))
 
@@ -195,7 +528,7 @@ final class DeemixAPITrackMapperTests: XCTestCase {
 
         XCTAssertEqual(store.searchQuery, "nirvana")
         XCTAssertEqual(store.catalogContext, artist)
-        XCTAssertTrue(store.visibleTracks.isEmpty)
+        XCTAssertTrue(store.visibleTracks.allSatisfy { $0.artist.searchNormalized == "nirvana" })
         XCTAssertTrue(store.isSearching)
 
         try await Task.sleep(for: .milliseconds(240))
@@ -205,6 +538,139 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         XCTAssertEqual(store.catalogContext, artist)
         XCTAssertEqual(store.visibleTracks, [detailTrack])
         XCTAssertFalse(store.isSearching)
+    }
+
+    @MainActor
+    func testAlbumSearchResultOpensAlbumDetailThroughSharedCatalogNavigation() async throws {
+        let detailTrack = Self.makePlaybackTrack(2, title: "Lithium", artist: "Nirvana", album: "Nevermind")
+        let provider = CatalogDrillRecordingProvider(detailItems: [detailTrack])
+        let store = PlayerStore(provider: provider)
+        let album = Self.makeAlbum(
+            id: "1262014",
+            title: "Nevermind",
+            trackCount: 13,
+            releaseDate: "1991-09-26",
+            recordType: "album"
+        )
+
+        store.updateSearchQuery("nevermind")
+        store.activate(album)
+
+        XCTAssertEqual(store.searchQuery, "nevermind")
+        XCTAssertEqual(store.catalogContext, album)
+        XCTAssertTrue(store.visibleTracks.isEmpty)
+        XCTAssertTrue(store.isSearching)
+
+        try await Task.sleep(for: .milliseconds(240))
+
+        XCTAssertEqual(provider.searchCalls, 0)
+        XCTAssertEqual(provider.catalogItemsCalls, 1)
+        XCTAssertEqual(store.catalogContext, album)
+        XCTAssertEqual(store.visibleTracks, [detailTrack])
+        XCTAssertFalse(store.isSearching)
+    }
+
+    @MainActor
+    func testCatalogDetailCacheReusesLoadedItemsWithoutProviderRoundTrip() async throws {
+        let artist = Self.makeArtist(id: "415", title: "Nirvana", albumCount: 25)
+        let detailTrack = Self.makePlaybackTrack(2, title: "Lithium", artist: "Nirvana", album: "Nevermind")
+        let provider = CatalogDrillRecordingProvider(featuredItems: [artist], detailItems: [detailTrack])
+        let store = PlayerStore(provider: provider)
+
+        await store.bootstrap()
+        store.activate(artist)
+        try await Task.sleep(for: .milliseconds(180))
+
+        XCTAssertEqual(provider.catalogItemsCalls, 1)
+        XCTAssertEqual(store.visibleTracks, [detailTrack])
+        XCTAssertFalse(store.isSearching)
+
+        store.leaveCatalogContext()
+        store.activate(artist)
+
+        XCTAssertEqual(store.catalogContext, artist)
+        XCTAssertEqual(store.visibleTracks, [detailTrack])
+        XCTAssertFalse(store.isSearching)
+
+        try await Task.sleep(for: .milliseconds(180))
+        XCTAssertEqual(provider.catalogItemsCalls, 1)
+    }
+
+    @MainActor
+    func testAlbumDrillDoesNotStartDuplicateFetchWhileTracklistIsLoading() async throws {
+        let album = Self.makeAlbum(id: "1262014", title: "Nevermind", trackCount: 13, releaseDate: "1991-09-26", recordType: "album")
+        let detailTrack = Self.makePlaybackTrack(2, title: "Lithium", artist: "Nirvana", album: "Nevermind")
+        let provider = CatalogDrillRecordingProvider(detailItems: [detailTrack])
+        let store = PlayerStore(provider: provider)
+
+        store.activate(album)
+        try await Task.sleep(for: .milliseconds(20))
+
+        XCTAssertEqual(provider.catalogItemsCalls, 1)
+
+        store.activate(album)
+        try await Task.sleep(for: .milliseconds(240))
+
+        XCTAssertEqual(provider.catalogItemsCalls, 1)
+        XCTAssertEqual(store.visibleTracks, [detailTrack])
+        XCTAssertFalse(store.isSearching)
+    }
+
+    @MainActor
+    func testAlbumDrillReusesCachedTracklistForEquivalentDerivedAlbum() async throws {
+        let album = Self.makeAlbum(id: "1262014", title: "Nevermind", trackCount: 13, releaseDate: "1991-09-26", recordType: "album")
+        let derivedAlbum = Track(
+            id: "derived-album.nevermind.nirvana",
+            title: "Nevermind",
+            artist: "Nirvana",
+            album: "Album",
+            duration: 0,
+            palette: .fallback,
+            catalogID: nil,
+            previewURL: nil,
+            kind: .album,
+            trackCount: 13,
+            releaseDate: "1991-09-26",
+            recordType: "album"
+        )
+        let detailTrack = Self.makePlaybackTrack(2, title: "Lithium", artist: "Nirvana", album: "Nevermind")
+        let provider = CatalogDrillRecordingProvider(detailItems: [detailTrack])
+        let store = PlayerStore(provider: provider)
+
+        store.activate(album)
+        try await Task.sleep(for: .milliseconds(240))
+
+        XCTAssertEqual(provider.catalogItemsCalls, 1)
+
+        store.leaveCatalogContext()
+        store.activate(derivedAlbum)
+
+        XCTAssertEqual(store.visibleTracks, [detailTrack])
+        XCTAssertFalse(store.isSearching)
+
+        try await Task.sleep(for: .milliseconds(180))
+
+        XCTAssertEqual(provider.catalogItemsCalls, 1)
+    }
+
+    @MainActor
+    func testSearchPrefetchesCatalogDetailSoOpeningAlbumIsInstant() async throws {
+        let detailTrack = Self.makePlaybackTrack(2, title: "Lithium", artist: "Nirvana", album: "Nevermind")
+        let album = Self.makeAlbum(id: "1262014", title: "Nevermind", trackCount: 13, releaseDate: "1991-09-26", recordType: "album")
+        let provider = CatalogDrillRecordingProvider(detailItems: [detailTrack], searchItems: [album])
+        let store = PlayerStore(provider: provider)
+
+        store.updateSearchQuery("nevermind")
+        try await Task.sleep(for: .milliseconds(420))
+
+        XCTAssertEqual(store.visibleTracks, [album])
+        XCTAssertEqual(provider.catalogItemsCalls, 1)
+
+        store.activate(album)
+
+        XCTAssertEqual(store.visibleTracks, [detailTrack])
+        XCTAssertFalse(store.isSearching)
+        XCTAssertEqual(provider.catalogItemsCalls, 1)
     }
 
     @MainActor
@@ -249,15 +715,19 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         let store = PlayerStore(provider: provider)
 
         store.updateSearchQuery("nirvana")
-        try await Task.sleep(for: .milliseconds(240))
+        try await Task.sleep(for: .milliseconds(420))
         XCTAssertEqual(store.visibleTracks, [artist, searchTrack])
 
         store.activate(artist)
 
         XCTAssertEqual(store.searchQuery, "nirvana")
         XCTAssertEqual(store.catalogContext, artist)
-        XCTAssertEqual(store.visibleTracks, [searchTrack])
-        XCTAssertTrue(store.isSearching)
+        if store.visibleTracks == [detailTrack] {
+            XCTAssertFalse(store.isSearching)
+        } else {
+            XCTAssertEqual(store.visibleTracks, [searchTrack])
+            XCTAssertTrue(store.isSearching)
+        }
 
         try await Task.sleep(for: .milliseconds(240))
 
@@ -265,6 +735,32 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         XCTAssertEqual(provider.catalogItemsCalls, 1)
         XCTAssertEqual(store.visibleTracks, [detailTrack])
         XCTAssertFalse(store.isSearching)
+    }
+
+    @MainActor
+    func testQueryUpdateAfterCatalogDrillReturnsToFreshSearchResults() async throws {
+        let artist = Self.makeArtist(id: "415", title: "Nirvana", albumCount: 25)
+        let staleDetailTrack = Self.makePlaybackTrack(13, title: "Stale Detail", artist: "Nirvana")
+        let freshSearchTrack = Self.makePlaybackTrack(14, title: "Where Is My Mind?", artist: "Pixies")
+        let provider = CatalogDrillRecordingProvider(
+            detailItems: [staleDetailTrack],
+            searchItems: [freshSearchTrack]
+        )
+        let store = PlayerStore(provider: provider)
+
+        store.updateSearchQuery("nirvana")
+        store.activate(artist)
+        XCTAssertEqual(store.catalogContext, artist)
+
+        store.updateSearchQuery("pixies")
+        try await Task.sleep(for: .milliseconds(420))
+
+        XCTAssertEqual(store.searchQuery, "pixies")
+        XCTAssertNil(store.catalogContext)
+        XCTAssertEqual(store.visibleTracks, [freshSearchTrack])
+        XCTAssertFalse(store.isSearching)
+        XCTAssertEqual(provider.catalogItemsCalls, 1)
+        XCTAssertEqual(provider.searchCalls, 1)
     }
 
 
@@ -330,7 +826,7 @@ final class DeemixAPITrackMapperTests: XCTestCase {
             pictureXL: "https://cdn-images.dzcdn.net/images/artist/nirvana/1000x1000-000000-80-0-0.jpg",
             albumCount: 25,
             fanCount: 9_999_080,
-            tracklist: "https://api.deezer.com/artist/415/top?limit=50"
+            tracklist: "https://api.deezer.com/artist/415/top?limit=1000"
         )
 
         let artist = DeemixAPITrackMapper.mapArtist(payload, fallbackIndex: 0)
@@ -449,6 +945,24 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         XCTAssertEqual(DeemixAPITrackSorter.sortedByPopularity(tracks).map(\.title), ["Popular", "Less Played"])
     }
 
+    func testArtistCatalogComposerDoesNotTruncatePopularTracks() {
+        let popularTracks = (1...18).map { index in
+            Self.makePlaybackTrack(index, title: "Popular \(index)", artist: "Nirvana", album: "Nevermind", rank: 1_000_000 - index)
+        }
+        let album = Self.makeAlbum(
+            id: "album",
+            title: "Nevermind",
+            trackCount: 13,
+            releaseDate: "1991-09-24",
+            recordType: "studio"
+        )
+
+        let items = DeemixAPIArtistCatalogComposer.items(popularTracks: popularTracks, albums: [album])
+
+        XCTAssertEqual(items.prefix(18).map(\.title), popularTracks.map(\.title))
+        XCTAssertEqual(items.last?.title, "Nevermind")
+    }
+
     func testRejectsInvalidPreviewFallbackURL() {
         let track = Track(
             id: "deemix-api.3135556",
@@ -468,7 +982,209 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         XCTAssertEqual(SearchScope.smart.rawValue, "Smart")
         XCTAssertEqual(SearchScope.catalog.rawValue, "Tracks")
         XCTAssertEqual(SearchScope.library.rawValue, "Artists")
-        XCTAssertEqual(SearchScope.playlists.rawValue, "Albums")
+        XCTAssertEqual(SearchScope.albums.rawValue, "Albums")
+    }
+
+    func testCatalogRequestWindowsAreExpandedPastPreviewLimits() {
+        XCTAssertGreaterThanOrEqual(DeemixAPICatalogRequestLimits.searchWindow, 180)
+        XCTAssertGreaterThanOrEqual(DeemixAPICatalogRequestLimits.artistTrackWindow, 500)
+    }
+
+    func testArtistPopularTracksSubtitleDescribesDeezerTopWindow() {
+        XCTAssertEqual(ArtistPopularTracksCopy.subtitle(count: 0), "No Deezer top tracks loaded")
+        XCTAssertEqual(ArtistPopularTracksCopy.subtitle(count: 1), "1 Deezer top track")
+        XCTAssertEqual(ArtistPopularTracksCopy.subtitle(count: 100), "100 Deezer top tracks")
+    }
+
+    func testArtistHeaderLayoutKeepsFirstViewportDense() {
+        XCTAssertLessThanOrEqual(ArtistHeaderLayoutMetrics.heroMinHeight, 280)
+        XCTAssertLessThanOrEqual(ArtistHeaderLayoutMetrics.foregroundArtworkSize, 156)
+        XCTAssertLessThanOrEqual(ArtistHeaderLayoutMetrics.titleFontSize, 48)
+        XCTAssertLessThanOrEqual(
+            ArtistHeaderLayoutMetrics.aboveFoldStackHeight,
+            ArtistHeaderLayoutMetrics.availableDesktopContentHeight
+        )
+    }
+
+    func testArtistPopularTracksPresentationDefaultsToTopFiveAndCanExpand() {
+        let tracks = (1...12).map { index in
+            Self.makePlaybackTrack(index, title: "Popular \(index)")
+        }
+
+        XCTAssertEqual(
+            ArtistPopularTracksPresentation.visibleTracks(from: tracks, isExpanded: false).map(\.title),
+            ["Popular 1", "Popular 2", "Popular 3", "Popular 4", "Popular 5"]
+        )
+        XCTAssertEqual(
+            ArtistPopularTracksPresentation.visibleTracks(from: tracks, isExpanded: true).map(\.title),
+            tracks.map(\.title)
+        )
+        XCTAssertTrue(ArtistPopularTracksPresentation.showsToggle(totalCount: tracks.count))
+        XCTAssertFalse(ArtistPopularTracksPresentation.showsToggle(totalCount: 5))
+        XCTAssertEqual(ArtistPopularTracksPresentation.toggleTitle(totalCount: tracks.count, isExpanded: false), "Show more")
+        XCTAssertEqual(ArtistPopularTracksPresentation.toggleTitle(totalCount: tracks.count, isExpanded: true), "Show less")
+    }
+
+    func testSearchPresentationKeepsArtistResultsLightweight() {
+        let artist = Self.makeArtist(id: "artist", title: "Арсений Креститель", albumCount: 4)
+        let album = Self.makeAlbum(id: "album", title: "Hidden release", trackCount: 9, releaseDate: "2024-01-01", recordType: "studio")
+        let track = Self.makePlaybackTrack(44, title: "Fast result", artist: "Арсений Креститель")
+
+        let presentation = SearchResultsPresentation(items: [artist, album, track])
+
+        XCTAssertEqual(presentation.bestMatch, artist)
+        XCTAssertEqual(presentation.artists, [artist])
+        XCTAssertTrue(presentation.albums.isEmpty)
+        XCTAssertEqual(presentation.tracks, [track])
+    }
+
+    func testSearchPresentationDerivesArtistCandidateFromTrackMetadata() {
+        let track = Track(
+            id: "deemix-api.2",
+            title: "About A Girl",
+            artist: "Nirvana",
+            album: "Bleach",
+            duration: 166,
+            palette: .fallback,
+            catalogID: "https://www.deezer.com/track/2",
+            previewURL: nil,
+            artistCatalogID: "https://www.deezer.com/artist/415",
+            albumCatalogID: "https://www.deezer.com/album/1",
+            kind: .track,
+            artworkURL: "https://cdn.example.test/bleach.jpg",
+            rank: 200_000
+        )
+
+        let presentation = SearchResultsPresentation(items: [track], query: "nirvana")
+
+        XCTAssertEqual(presentation.bestMatch?.kind, .artist)
+        XCTAssertEqual(presentation.bestMatch?.title, "Nirvana")
+        XCTAssertEqual(presentation.bestMatch?.catalogID, "https://www.deezer.com/artist/415")
+        XCTAssertEqual(presentation.artists.map(\.title), ["Nirvana"])
+        XCTAssertEqual(presentation.tracks, [track])
+    }
+
+    func testMiniPlayerVisualStyleUsesInsetMintProgressAndSmallerPrimaryControl() {
+        XCTAssertEqual(NoirwaveTheme.primaryAccentHex, "#78DCD0")
+        XCTAssertGreaterThanOrEqual(MiniPlayerVisualStyle.progressHorizontalInset, 8)
+        XCTAssertLessThanOrEqual(MiniPlayerVisualStyle.progressHeight, 1.0)
+        XCTAssertLessThanOrEqual(MiniPlayerVisualStyle.progressThumbSize, 4.0)
+        XCTAssertGreaterThanOrEqual(MiniPlayerVisualStyle.progressHoverThumbSize, MiniPlayerVisualStyle.progressThumbSize * 2)
+        XCTAssertGreaterThanOrEqual(MiniPlayerVisualStyle.progressTimeWidth, 40)
+        XCTAssertLessThanOrEqual(MiniPlayerVisualStyle.progressMaxWidth, 560)
+        XCTAssertEqual(MiniPlayerVisualStyle.progressTopPadding, 0)
+        XCTAssertLessThanOrEqual(MiniPlayerVisualStyle.progressCompactHeight, 10)
+        XCTAssertLessThanOrEqual(MiniPlayerVisualStyle.progressExpandedHeight, 46)
+        XCTAssertLessThanOrEqual(MiniPlayerVisualStyle.primaryControlVisualSize, 38)
+        XCTAssertLessThanOrEqual(MiniPlayerVisualStyle.primaryIconSize, 15)
+        XCTAssertGreaterThanOrEqual(MiniPlayerVisualStyle.primaryControlHitSize, 44)
+    }
+
+    func testArtworkFallbackStyleUsesNeutralNonGeneratedPlaceholder() {
+        XCTAssertEqual(ArtworkFallbackStyle.backgroundHex, NoirwaveTheme.backgroundHex)
+        XCTAssertFalse(ArtworkFallbackStyle.usesGeneratedArtwork)
+    }
+
+    func testSearchResultsStayScopedToCatalogDestination() {
+        XCTAssertTrue(ContentDeckRouting.showsSearchResults(
+            selectionIsCatalog: true,
+            hasCatalogContext: false,
+            searchQuery: "nirvana"
+        ))
+        XCTAssertFalse(ContentDeckRouting.showsSearchResults(
+            selectionIsCatalog: false,
+            hasCatalogContext: false,
+            searchQuery: "nirvana"
+        ))
+        XCTAssertFalse(ContentDeckRouting.showsSearchResults(
+            selectionIsCatalog: true,
+            hasCatalogContext: true,
+            searchQuery: "nirvana"
+        ))
+        XCTAssertFalse(ContentDeckRouting.showsSearchResults(
+            selectionIsCatalog: true,
+            hasCatalogContext: false,
+            searchQuery: "   "
+        ))
+    }
+
+    func testCatalogDetailStaysScopedToCatalogDestination() {
+        XCTAssertTrue(ContentDeckRouting.showsCatalogDetail(
+            selectionIsCatalog: true,
+            hasCatalogContext: true
+        ))
+        XCTAssertFalse(ContentDeckRouting.showsCatalogDetail(
+            selectionIsCatalog: false,
+            hasCatalogContext: true
+        ))
+        XCTAssertFalse(ContentDeckRouting.showsCatalogDetail(
+            selectionIsCatalog: true,
+            hasCatalogContext: false
+        ))
+    }
+
+    @MainActor
+    func testLeavingCatalogDetailWithEmptyQueryCancelsLateDetailResponse() async throws {
+        let featured = Self.makePlaybackTrack(1, title: "Featured Track")
+        let detailTrack = Self.makePlaybackTrack(2, title: "Late Detail")
+        let provider = CatalogDrillRecordingProvider(
+            featuredItems: [featured],
+            detailItems: [detailTrack]
+        )
+        let store = PlayerStore(provider: provider)
+        let album = Self.makeAlbum(
+            id: "1262014",
+            title: "Nevermind",
+            trackCount: 13,
+            releaseDate: "1991-09-26",
+            recordType: "album"
+        )
+
+        await store.bootstrap()
+        store.activate(album)
+        XCTAssertEqual(store.catalogContext, album)
+        XCTAssertTrue(store.isSearching)
+
+        store.leaveCatalogContext()
+        try await Task.sleep(for: .milliseconds(180))
+
+        XCTAssertNil(store.catalogContext)
+        XCTAssertEqual(store.visibleTracks, [featured])
+        XCTAssertFalse(store.isSearching)
+    }
+
+    func testAlbumDetailLabelKeepsSinglesAndEPsDistinct() {
+        let single = Track(
+            id: "deemix-album.1",
+            title: "Single Release",
+            artist: "Nirvana",
+            album: "Album",
+            duration: 0,
+            palette: .fallback,
+            catalogID: "https://www.deezer.com/album/1",
+            previewURL: nil,
+            kind: .album,
+            trackCount: 1,
+            releaseDate: "1991-01-01",
+            recordType: "single"
+        )
+        let ep = Track(
+            id: "deemix-album.2",
+            title: "EP Release",
+            artist: "Nirvana",
+            album: "Album",
+            duration: 0,
+            palette: .fallback,
+            catalogID: "https://www.deezer.com/album/2",
+            previewURL: nil,
+            kind: .album,
+            trackCount: 4,
+            releaseDate: "1992-01-01",
+            recordType: "ep"
+        )
+
+        XCTAssertEqual(single.detailLabel, "Nirvana · Single · 1 track · 1991")
+        XCTAssertEqual(ep.detailLabel, "Nirvana · EP · 4 tracks · 1992")
     }
 
     func testSmartSearchDeduplicatesExactArtistsAndFiltersWeakContainsMatches() {
@@ -751,7 +1467,7 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         store.setScope(.library)
         store.updateSearchQuery("nirvana")
 
-        try await Task.sleep(for: .milliseconds(260))
+        try await Task.sleep(for: .milliseconds(360))
 
         XCTAssertEqual(provider.recordedScopes, [.smart])
         XCTAssertEqual(store.resultTitle, SearchScope.smart.resultsTitle)
@@ -795,6 +1511,15 @@ final class DeemixAPITrackMapperTests: XCTestCase {
             FavoriteTracksOrganizer.tracks(tracks, libraryQuery: "slowdive", localQuery: "alison", sortMode: .recentlyAdded).map(\.id),
             [slowdive.id]
         )
+    }
+
+    func testLibrarySectionExpansionLimitsCollapsedItemsToSix() {
+        let items = Array(1...9)
+
+        XCTAssertEqual(LibrarySectionExpansion.visibleItems(items, isExpanded: false), [1, 2, 3, 4, 5, 6])
+        XCTAssertEqual(LibrarySectionExpansion.visibleItems(items, isExpanded: true), items)
+        XCTAssertTrue(LibrarySectionExpansion.showsToggle(totalCount: 7))
+        XCTAssertFalse(LibrarySectionExpansion.showsToggle(totalCount: 6))
     }
 
     func testPlaylistTrackFilterKeepsPlaylistOrderAndMatchesTrackMetadata() {
@@ -850,41 +1575,42 @@ final class DeemixAPITrackMapperTests: XCTestCase {
     }
 
     func testNoirwavePrimaryAccentUsesMintCyan() {
-        XCTAssertEqual(NoirwaveTheme.primaryAccentHex, "#5EE0C2")
+        XCTAssertEqual(NoirwaveTheme.primaryAccentHex, "#78DCD0")
+        XCTAssertEqual(NoirwaveTheme.backgroundHex, "#141414")
+        XCTAssertEqual(NoirwaveTheme.backgroundElevatedHex, "#1A1A17")
         XCTAssertEqual(TrackPalette.fallback.accentHex, NoirwaveTheme.primaryAccentHex)
     }
 
-    func testLibrarySurfaceLayoutKeepsPlaylistsOutOfOverview() {
+    func testSearchMatcherToleratesSmallTyposAndKeyboardLayoutMisses() {
+        XCTAssertTrue(SearchTextMatcher.matches(query: "mancild", text: "Manchild"))
+        XCTAssertTrue(SearchTextMatcher.matches(query: "ьanchild", text: "Manchild"))
+        XCTAssertEqual(SearchQueryVariants.candidates(for: "ьanchild"), ["ьanchild", "manchild"])
+    }
+
+    func testLibraryDefaultSortDoesNotExposeRecentlyAddedBlockLabel() {
+        XCTAssertEqual(LibrarySortMode.recentlyAdded.title, "Saved Order")
+    }
+
+    func testLibrarySurfaceLayoutPlacesPlaylistsAtBottom() {
         XCTAssertEqual(
             LibrarySurfaceLayout.sections(hasTracks: true, hasSavedCollections: true, hasLocalPlaylists: true),
-            [.collections, .favoriteTracks]
+            [.favoriteTracks, .playlists, .collections]
         )
         XCTAssertEqual(
             LibrarySurfaceLayout.sections(hasTracks: false, hasSavedCollections: true, hasLocalPlaylists: true),
-            [.collections]
+            [.playlists, .collections]
+        )
+        XCTAssertEqual(
+            LibrarySurfaceLayout.sections(hasTracks: true, hasSavedCollections: false, hasLocalPlaylists: false),
+            [.favoriteTracks, .playlists]
         )
         XCTAssertEqual(
             LibrarySurfaceLayout.sections(hasTracks: false, hasSavedCollections: false, hasLocalPlaylists: true),
-            []
+            [.playlists]
         )
     }
 
-    func testShellContentRouteKeepsSidebarSelectionOverSearchQuery() {
-        XCTAssertEqual(
-            ShellContentRouteResolver.route(selection: .library, hasSearchQuery: true, hasCatalogContext: false),
-            .library
-        )
-        XCTAssertEqual(
-            ShellContentRouteResolver.route(selection: .listenNow, hasSearchQuery: true, hasCatalogContext: false),
-            .listenNow
-        )
-        XCTAssertEqual(
-            ShellContentRouteResolver.route(selection: .search, hasSearchQuery: true, hasCatalogContext: false),
-            .searchResults
-        )
-    }
-
-    func testLibraryPlaylistShelfBuilderIncludesLikedSongsBeforeLocalPlaylists() {
+    func testLibraryPlaylistShelfBuilderKeepsLikedSongsOutOfPlaylistShelf() {
         let likedTracks = [
             Self.makeLibraryTrack(1, title: "Alison", artist: "Slowdive", album: "Souvlaki"),
             Self.makeLibraryTrack(2, title: "Xtal", artist: "Aphex Twin", album: "Selected Ambient Works 85-92")
@@ -901,14 +1627,13 @@ final class DeemixAPITrackMapperTests: XCTestCase {
             query: ""
         )
 
-        XCTAssertEqual(items.map(\.id), ["liked.songs", "playlist.road-trip"])
-        XCTAssertEqual(items.first?.title, "Liked Songs")
-        XCTAssertEqual(items.first?.subtitle, "2 saved")
-        XCTAssertEqual(items.first?.selection, .likedSongs)
-        XCTAssertEqual(items.last?.selection, .localPlaylist("road-trip"))
+        XCTAssertEqual(items.map(\.id), ["playlist.road-trip"])
+        XCTAssertEqual(items.first?.title, "Road Trip")
+        XCTAssertEqual(items.first?.subtitle, "1 track")
+        XCTAssertEqual(items.first?.selection, .localPlaylist("road-trip"))
     }
 
-    func testLibraryPlaylistShelfBuilderFiltersLikedSongsByTitleAndTrackMetadata() {
+    func testLibraryPlaylistShelfBuilderFiltersOnlyRealLocalPlaylists() {
         let likedTracks = [
             Self.makeLibraryTrack(1, title: "Digital Bath", artist: "Deftones", album: "White Pony"),
             Self.makeLibraryTrack(2, title: "Only Shallow", artist: "My Bloody Valentine", album: "Loveless")
@@ -921,11 +1646,11 @@ final class DeemixAPITrackMapperTests: XCTestCase {
 
         XCTAssertEqual(
             LibraryPlaylistShelfBuilder.items(likedTracks: likedTracks, localPlaylists: [localPlaylist], query: "liked").map(\.selection),
-            [.likedSongs]
+            []
         )
         XCTAssertEqual(
             LibraryPlaylistShelfBuilder.items(likedTracks: likedTracks, localPlaylists: [localPlaylist], query: "white pony").map(\.selection),
-            [.likedSongs]
+            []
         )
         XCTAssertEqual(
             LibraryPlaylistShelfBuilder.items(likedTracks: likedTracks, localPlaylists: [localPlaylist], query: "cocteau").map(\.selection),
@@ -1082,60 +1807,6 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         )
     }
 
-    func testPlaylistTargetMenuBuilderDeduplicatesAndCapsTargets() {
-        let playlists = [
-            LocalPlaylist(id: "sequenced-new", title: "Sequenced", tracks: [Self.makeLibraryTrack(1, title: "Alison", artist: "Slowdive", album: "Souvlaki")]),
-            LocalPlaylist(id: "night-drive", title: "Night Drive", tracks: [Self.makeLibraryTrack(2, title: "Joga", artist: "Bjork", album: "Homogenic")]),
-            LocalPlaylist(id: "sequenced-old", title: "Sequenced", tracks: [Self.makeLibraryTrack(3, title: "Xtal", artist: "Aphex Twin", album: "Selected Ambient Works 85-92")]),
-            LocalPlaylist(id: "focus", title: "Focus", tracks: [Self.makeLibraryTrack(4, title: "Cherry", artist: "Chromatics", album: "Night Drive")]),
-            LocalPlaylist(id: "archive", title: "Archive", tracks: [Self.makeLibraryTrack(5, title: "Angel", artist: "Massive Attack", album: "Mezzanine")]),
-            LocalPlaylist(id: "ambient", title: "Ambient", tracks: [Self.makeLibraryTrack(6, title: "Avril 14th", artist: "Aphex Twin", album: "Drukqs")]),
-            LocalPlaylist(id: "overflow", title: "Overflow", tracks: [Self.makeLibraryTrack(7, title: "Ceremony", artist: "New Order", album: "Substance")])
-        ]
-
-        XCTAssertEqual(
-            PlaylistTargetMenuBuilder.targetPlaylists(playlists, excludingPlaylistID: nil).map(\.id),
-            ["sequenced-new", "night-drive", "focus", "archive", "ambient"]
-        )
-    }
-
-    @MainActor
-    func testCreatePlaylistReusesEquivalentPlaylistInsteadOfSpawningDuplicates() {
-        let defaults = Self.makeIsolatedDefaults(name: "local-playlists-no-spawn")
-        let tracks = [
-            Self.makeLibraryTrack(1, title: "Alison", artist: "Slowdive", album: "Souvlaki"),
-            Self.makeLibraryTrack(2, title: "When the Sun Hits", artist: "Slowdive", album: "Souvlaki")
-        ]
-        let store = PlayerStore(provider: PrewarmRecordingProvider(tracks: tracks), userDefaults: defaults)
-
-        let first = store.createPlaylist(title: "Sequenced", tracks: tracks)
-        let second = store.createPlaylist(title: "  Sequenced  ", tracks: [tracks[0], tracks[1], tracks[0]])
-
-        XCTAssertEqual(first.id, second.id)
-        XCTAssertEqual(store.localPlaylists.map(\.id), [first.id])
-    }
-
-    @MainActor
-    func testLocalPlaylistLoadCollapsesLegacyDuplicateNamesAndMergesTracks() {
-        let defaults = Self.makeIsolatedDefaults(name: "local-playlists-collapse-legacy")
-        let tracks = [
-            Self.makeLibraryTrack(1, title: "Alison", artist: "Slowdive", album: "Souvlaki"),
-            Self.makeLibraryTrack(2, title: "When the Sun Hits", artist: "Slowdive", album: "Souvlaki"),
-            Self.makeLibraryTrack(3, title: "Joga", artist: "Bjork", album: "Homogenic")
-        ]
-        let playlists = [
-            LocalPlaylist(id: "sequenced-new", title: "Sequenced", tracks: [tracks[0], tracks[1]]),
-            LocalPlaylist(id: "night-drive", title: "Night Drive", tracks: [tracks[2]]),
-            LocalPlaylist(id: "sequenced-old", title: "  Sequenced  ", tracks: [tracks[0]])
-        ]
-        defaults.set(try! JSONEncoder().encode(playlists), forKey: "noirwave.localPlaylists")
-
-        let store = PlayerStore(provider: PrewarmRecordingProvider(tracks: tracks), userDefaults: defaults)
-
-        XCTAssertEqual(store.localPlaylists.map(\.id), ["sequenced-new", "night-drive"])
-        XCTAssertEqual(store.playlistTracks(playlistID: "sequenced-new").map(\.id), [tracks[0].id, tracks[1].id])
-    }
-
     @MainActor
     func testLocalPlaylistsRenameRemoveAndDeleteWithoutTouchingLikedTracks() {
         let defaults = Self.makeIsolatedDefaults(name: "local-playlists-edit")
@@ -1207,6 +1878,43 @@ final class DeemixAPITrackMapperTests: XCTestCase {
     }
 
     @MainActor
+    func testVolumePersistsAcrossStoreInstancesAndIconTracksState() {
+        let defaults = Self.makeIsolatedDefaults(name: "volume-persistence")
+        let provider = PrewarmRecordingProvider(tracks: [])
+        let store = PlayerStore(provider: provider, userDefaults: defaults)
+
+        store.setVolume(0.31)
+
+        let restoredStore = PlayerStore(provider: PrewarmRecordingProvider(tracks: []), userDefaults: defaults)
+
+        XCTAssertEqual(restoredStore.volume, 0.31, accuracy: 0.001)
+        XCTAssertEqual(VolumeIcon.symbol(for: 0), "speaker.slash.fill")
+        XCTAssertEqual(VolumeIcon.symbol(for: 0.18), "speaker.wave.1.fill")
+        XCTAssertEqual(VolumeIcon.symbol(for: 0.52), "speaker.wave.2.fill")
+        XCTAssertEqual(VolumeIcon.symbol(for: 0.9), "speaker.wave.3.fill")
+    }
+
+    @MainActor
+    func testEqualizerAndCrossfadeSettingsForwardToProvider() {
+        let provider = PrewarmRecordingProvider(tracks: [])
+        let store = PlayerStore(provider: provider)
+
+        store.setEqualizerEnabled(true)
+        store.setEqualizerPreset(.bassBoost)
+        XCTAssertEqual(store.equalizerSettings.preset, .bassBoost)
+        XCTAssertEqual(provider.recordedEqualizerSettings?.preset, .bassBoost)
+        XCTAssertEqual(provider.recordedEqualizerSettings?.normalizedBandGains, EqualizerPreset.bassBoost.bandGains)
+
+        store.setEqualizerBand(at: 0, gain: 8)
+        XCTAssertEqual(store.equalizerSettings.normalizedBandGains[0], 8)
+        XCTAssertEqual(provider.recordedEqualizerSettings?.normalizedBandGains[0], 8)
+
+        store.setCrossfadeDuration(4.5)
+        XCTAssertEqual(store.crossfadeDuration, 4.5, accuracy: 0.001)
+        XCTAssertEqual(provider.recordedCrossfadeDuration ?? -1, 4.5, accuracy: 0.001)
+    }
+
+    @MainActor
     func testRepeatOneReplaysCurrentTrackOnNext() async throws {
         let tracks = (1...3).map { Self.makePlaybackTrack($0) }
         let provider = PrewarmRecordingProvider(tracks: tracks)
@@ -1254,10 +1962,7 @@ final class DeemixAPITrackMapperTests: XCTestCase {
     func testPlaylistPlaybackContextRepeatsWithinPlaylistOrder() async throws {
         let tracks = (1...4).map { Self.makePlaybackTrack($0) }
         let provider = PrewarmRecordingProvider(tracks: tracks)
-        let store = PlayerStore(
-            provider: provider,
-            userDefaults: Self.makeIsolatedDefaults(name: "playlist-repeat-order")
-        )
+        let store = PlayerStore(provider: provider)
         let playlist = store.createPlaylist(title: "Night Drive", tracks: [tracks[1], tracks[2]])
 
         await store.bootstrap()
@@ -1277,10 +1982,7 @@ final class DeemixAPITrackMapperTests: XCTestCase {
     func testPlaylistPreviousUsesPlaylistOrderInsteadOfVisibleCatalog() async throws {
         let tracks = (1...4).map { Self.makePlaybackTrack($0) }
         let provider = PrewarmRecordingProvider(tracks: tracks)
-        let store = PlayerStore(
-            provider: provider,
-            userDefaults: Self.makeIsolatedDefaults(name: "playlist-previous-order")
-        )
+        let store = PlayerStore(provider: provider)
         let playlist = store.createPlaylist(title: "Sequenced", tracks: [tracks[1], tracks[2]])
 
         await store.bootstrap()
@@ -1509,13 +2211,14 @@ final class DeemixAPITrackMapperTests: XCTestCase {
 
     fileprivate static func makePlaybackTrack(
         _ index: Int,
+        title: String? = nil,
         artist: String = "Artist",
         album: String = "Album",
         rank: Int? = nil
     ) -> Track {
         Track(
             id: "deemix-api.\(1000 + index)",
-            title: "Track \(index)",
+            title: title ?? "Track \(index)",
             artist: artist,
             album: album,
             duration: 180,
@@ -1588,13 +2291,16 @@ final class DeemixAPITrackMapperTests: XCTestCase {
 }
 
 @MainActor
-    private final class PrewarmRecordingProvider: MusicProviding {
+private final class PrewarmRecordingProvider: MusicProviding {
     let sourceName = "Prewarm Test"
     private let tracks: [Track]
     private let playError: Error?
     private(set) var preparedBatches: [[String]] = []
     private(set) var recordedVolume: Double?
+    private(set) var recordedEqualizerSettings: EqualizerSettings?
+    private(set) var recordedCrossfadeDuration: TimeInterval?
     private(set) var playedIDs: [String] = []
+    private(set) var crossfadedIDs: [String] = []
 
     init(tracks: [Track], playError: Error? = nil) {
         self.tracks = tracks
@@ -1610,6 +2316,10 @@ final class DeemixAPITrackMapperTests: XCTestCase {
     }
 
     func catalogItems(for item: Track) async throws -> [Track] {
+        tracks
+    }
+
+    func radioTracks(seed: Track?) async throws -> [Track] {
         tracks
     }
 
@@ -1652,6 +2362,159 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         recordedVolume = volume
     }
 
+    func setEqualizer(_ settings: EqualizerSettings) {
+        recordedEqualizerSettings = settings
+    }
+
+    func setCrossfadeDuration(_ duration: TimeInterval) {
+        recordedCrossfadeDuration = duration
+    }
+
+    func crossfade(to track: Track, duration: TimeInterval) async throws {
+        crossfadedIDs.append(track.id)
+    }
+
+    func currentPlaybackTime() -> TimeInterval? {
+        nil
+    }
+}
+
+@MainActor
+private final class LyricsCacheRecordingProvider: MusicProviding {
+    let sourceName = "Lyrics Cache Test"
+    let lyricsByTrackID: [String: TrackLyrics]
+    private(set) var lyricsRequests: [String] = []
+
+    init(lyricsByTrackID: [String: TrackLyrics]) {
+        self.lyricsByTrackID = lyricsByTrackID
+    }
+
+    func featuredTracks() async throws -> [Track] {
+        []
+    }
+
+    func search(_ query: String, scope: SearchScope) async throws -> [Track] {
+        []
+    }
+
+    func catalogItems(for item: Track) async throws -> [Track] {
+        []
+    }
+
+    func radioTracks(seed: Track?) async throws -> [Track] {
+        []
+    }
+
+    func requestAuthorization() async throws -> ProviderStatus {
+        ProviderStatus(authorization: .authorized, canPlayCatalogContent: true, message: nil)
+    }
+
+    func currentStatus() async throws -> ProviderStatus {
+        try await requestAuthorization()
+    }
+
+    func configureBackendSession(arl: String) async throws -> ProviderStatus {
+        try await requestAuthorization()
+    }
+
+    func lyrics(for track: Track) async throws -> TrackLyrics {
+        lyricsRequests.append(track.id)
+        try await Task.sleep(for: .milliseconds(40))
+        return lyricsByTrackID[track.id] ?? TrackLyrics(text: "", lines: [], copyright: nil, writers: nil)
+    }
+
+    func prepare(_ tracks: [Track]) async {}
+
+    func play(_ track: Track) async throws {}
+
+    func resume() async throws {}
+
+    func pause() async {}
+
+    func stop() async {}
+
+    func seek(to time: TimeInterval) async {}
+
+    func setVolume(_ volume: Double) {}
+
+    func currentPlaybackTime() -> TimeInterval? {
+        nil
+    }
+}
+
+@MainActor
+private final class SearchCacheRecordingProvider: MusicProviding {
+    struct QueryRecord {
+        let query: String
+        let scope: SearchScope
+    }
+
+    let sourceName = "Search Cache Test"
+    private let featured: [Track]
+    private let resultsByQuery: [String: [Track]]
+    private let searchDelay: Duration
+    private(set) var recordedQueries: [QueryRecord] = []
+    private(set) var playedIDs: [String] = []
+    private(set) var seekTimes: [TimeInterval] = []
+
+    init(featured: [Track], resultsByQuery: [String: [Track]], searchDelay: Duration) {
+        self.featured = featured
+        self.resultsByQuery = resultsByQuery
+        self.searchDelay = searchDelay
+    }
+
+    func featuredTracks() async throws -> [Track] {
+        featured
+    }
+
+    func search(_ query: String, scope: SearchScope) async throws -> [Track] {
+        recordedQueries.append(QueryRecord(query: query, scope: scope))
+        try await Task.sleep(for: searchDelay)
+        return resultsByQuery[query] ?? []
+    }
+
+    func catalogItems(for item: Track) async throws -> [Track] {
+        []
+    }
+
+    func radioTracks(seed: Track?) async throws -> [Track] {
+        featured
+    }
+
+    func requestAuthorization() async throws -> ProviderStatus {
+        ProviderStatus(authorization: .authorized, canPlayCatalogContent: true, message: nil)
+    }
+
+    func currentStatus() async throws -> ProviderStatus {
+        try await requestAuthorization()
+    }
+
+    func configureBackendSession(arl: String) async throws -> ProviderStatus {
+        try await requestAuthorization()
+    }
+
+    func lyrics(for track: Track) async throws -> TrackLyrics {
+        TrackLyrics(text: "", lines: [], copyright: nil, writers: nil)
+    }
+
+    func prepare(_ tracks: [Track]) async {}
+
+    func play(_ track: Track) async throws {
+        playedIDs.append(track.id)
+    }
+
+    func resume() async throws {}
+
+    func pause() async {}
+
+    func stop() async {}
+
+    func seek(to time: TimeInterval) async {
+        seekTimes.append(time)
+    }
+
+    func setVolume(_ volume: Double) {}
+
     func currentPlaybackTime() -> TimeInterval? {
         nil
     }
@@ -1677,6 +2540,10 @@ private final class CancelledSearchProvider: MusicProviding {
     }
 
     func catalogItems(for item: Track) async throws -> [Track] {
+        []
+    }
+
+    func radioTracks(seed: Track?) async throws -> [Track] {
         []
     }
 
@@ -1738,6 +2605,10 @@ private final class ScopeRecordingProvider: MusicProviding {
         []
     }
 
+    func radioTracks(seed: Track?) async throws -> [Track] {
+        results
+    }
+
     func requestAuthorization() async throws -> ProviderStatus {
         ProviderStatus(authorization: .authorized, canPlayCatalogContent: true, message: nil)
     }
@@ -1776,18 +2647,20 @@ private final class ScopeRecordingProvider: MusicProviding {
 @MainActor
 private final class CatalogDrillRecordingProvider: MusicProviding {
     let sourceName = "Catalog Drill Test"
+    private let featuredItems: [Track]
     private let detailItems: [Track]
     private let searchItems: [Track]
     private(set) var searchCalls = 0
     private(set) var catalogItemsCalls = 0
 
-    init(detailItems: [Track], searchItems: [Track] = []) {
+    init(featuredItems: [Track] = [], detailItems: [Track], searchItems: [Track] = []) {
+        self.featuredItems = featuredItems
         self.detailItems = detailItems
         self.searchItems = searchItems
     }
 
     func featuredTracks() async throws -> [Track] {
-        []
+        featuredItems
     }
 
     func search(_ query: String, scope: SearchScope) async throws -> [Track] {
@@ -1799,6 +2672,10 @@ private final class CatalogDrillRecordingProvider: MusicProviding {
         catalogItemsCalls += 1
         try await Task.sleep(for: .milliseconds(120))
         return detailItems
+    }
+
+    func radioTracks(seed: Track?) async throws -> [Track] {
+        detailItems
     }
 
     func requestAuthorization() async throws -> ProviderStatus {

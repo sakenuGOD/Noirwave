@@ -91,9 +91,41 @@ Backend format defaults to MP3 320:
 NOIRWAVE_DEEZER_FORMAT=MP3_320 npm start
 ```
 
-## Test Seeds
+## AI / MCP
 
-The first screen loads two catalog seed searches:
+Noirwave exposes the app library through a local stdio MCP server. Start it as a
+separate command from the backend directory:
 
-- `Daft Punk Around the World`
-- `Nirvana Come As You Are`
+```sh
+cd /Users/fsociety/Noirwave/NoirwaveBackend
+npm run mcp
+```
+
+The app writes the MCP bridge files under:
+
+```sh
+~/Library/Application Support/Noirwave/MCP
+```
+
+Set `NOIRWAVE_MCP_ROOT` only if you intentionally want a different bridge
+directory. MCP clients should use the command shown in Settings -> AI / MCP.
+
+Resources:
+
+- `library://tracks`
+- `library://artists`
+- `library://albums`
+- `library://playlists`
+- `library://playlist/{id}`
+- `library://track/{id}`
+
+Tools include track search, playlist create/rename/delete, add/remove/reorder,
+smart playlist preview/apply, similar-track lookup, stats, tags, and metadata
+updates. Destructive and mass operations return a preview first and require the
+returned confirmation phrase before applying.
+
+## Initial Catalog State
+
+The first screen does not issue hardcoded catalog seed searches. If no real
+library or featured data is available yet, Noirwave shows a clean empty state and
+waits for an explicit search or playback action.

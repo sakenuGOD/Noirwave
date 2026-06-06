@@ -5,12 +5,14 @@
   "type": "module",
   "scripts": {
     "start": "node src/server.mjs",
+    "mcp": "node src/mcpServer.mjs",
     "test": "node --test tests/*.test.mjs",
     "setup:deemix": "node scripts/setup-deemix.mjs"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "express": "^4.19.2",
-    "got": "^14.4.7"
-  },
-  "devDependencies": {}
+    "got": "^14.4.7",
+    "zod": "^3.25.76"
+  }
 }

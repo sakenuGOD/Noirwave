@@ -4,7 +4,7 @@ enum SearchScope: String, CaseIterable, Identifiable {
     case smart = "Smart"
     case catalog = "Tracks"
     case library = "Artists"
-    case playlists = "Albums"
+    case albums = "Albums"
 
     var id: String { rawValue }
 
@@ -16,7 +16,7 @@ enum SearchScope: String, CaseIterable, Identifiable {
             "square.grid.2x2"
         case .library:
             "music.mic"
-        case .playlists:
+        case .albums:
             "rectangle.stack"
         }
     }
@@ -29,7 +29,7 @@ enum SearchScope: String, CaseIterable, Identifiable {
             "Track Results"
         case .library:
             "Artist Results"
-        case .playlists:
+        case .albums:
             "Album Results"
         }
     }
@@ -68,6 +68,50 @@ enum RepeatMode: String, CaseIterable, Identifiable {
         case .one:
             .off
         }
+    }
+}
+
+enum EqualizerPreset: String, CaseIterable, Identifiable {
+    case flat = "Default"
+    case bassBoost = "Bass boost"
+    case vocal = "Vocal"
+    case soft = "Soft"
+    case electronic = "Electronic"
+
+    var id: String { rawValue }
+
+    var bandGains: [Double] {
+        switch self {
+        case .flat:
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        case .bassBoost:
+            [6, 5, 3, 1, 0, -1, -2, -2, -1, 0]
+        case .vocal:
+            [-2, -1, 1, 3, 4, 3, 1, 0, -1, -1]
+        case .soft:
+            [-1, 0, 1, 2, 2, 1, 0, -1, -2, -2]
+        case .electronic:
+            [4, 3, 1, 0, -1, 2, 4, 5, 4, 3]
+        }
+    }
+}
+
+struct EqualizerSettings: Equatable {
+    static let bandFrequencies: [Double] = [60, 170, 310, 600, 1_000, 3_000, 6_000, 12_000, 14_000, 16_000]
+    static let flat = EqualizerSettings(isEnabled: false, preset: .flat, bandGains: EqualizerPreset.flat.bandGains)
+
+    var isEnabled: Bool
+    var preset: EqualizerPreset
+    var bandGains: [Double]
+
+    var normalizedBandGains: [Double] {
+        let clamped = bandGains.prefix(Self.bandFrequencies.count).map { min(max($0, -12), 12) }
+        guard clamped.count < Self.bandFrequencies.count else { return clamped }
+        return clamped + Array(repeating: 0, count: Self.bandFrequencies.count - clamped.count)
+    }
+
+    static func preset(_ preset: EqualizerPreset, isEnabled: Bool = true) -> EqualizerSettings {
+        EqualizerSettings(isEnabled: isEnabled, preset: preset, bandGains: preset.bandGains)
     }
 }
 
@@ -163,6 +207,7 @@ protocol MusicProviding: AnyObject {
     func featuredTracks() async throws -> [Track]
     func search(_ query: String, scope: SearchScope) async throws -> [Track]
     func catalogItems(for item: Track) async throws -> [Track]
+    func radioTracks(seed: Track?) async throws -> [Track]
     func requestAuthorization() async throws -> ProviderStatus
     func currentStatus() async throws -> ProviderStatus
     func configureBackendSession(arl: String) async throws -> ProviderStatus
@@ -174,7 +219,20 @@ protocol MusicProviding: AnyObject {
     func stop() async
     func seek(to time: TimeInterval) async
     func setVolume(_ volume: Double)
+    func setEqualizer(_ settings: EqualizerSettings)
+    func setCrossfadeDuration(_ duration: TimeInterval)
+    func crossfade(to track: Track, duration: TimeInterval) async throws
     func currentPlaybackTime() -> TimeInterval?
+}
+
+extension MusicProviding {
+    func setEqualizer(_ settings: EqualizerSettings) {}
+
+    func setCrossfadeDuration(_ duration: TimeInterval) {}
+
+    func crossfade(to track: Track, duration: TimeInterval) async throws {
+        try await play(track)
+    }
 }
 
 enum MusicProviderError: LocalizedError {
