@@ -1122,6 +1122,7 @@ private struct PlaylistTitleSheet: View {
 private struct LocalPlaylistDetailView: View {
     @EnvironmentObject private var store: PlayerStore
     @State private var playlistQuery = ""
+    @State private var playlistSortMode: PlaylistSortMode = .playlistOrder
     @State private var isConfirmingDelete = false
     let playlist: LocalPlaylist
     let tracks: [Track]
@@ -1137,8 +1138,8 @@ private struct LocalPlaylistDetailView: View {
         "\(playlist.trackCount) track\(playlist.trackCount == 1 ? "" : "s")"
     }
 
-    private var filteredTracks: [Track] {
-        PlaylistTrackFilter.filteredTracks(tracks, query: playlistQuery)
+    private var visibleTracks: [Track] {
+        PlaylistTrackOrganizer.tracks(tracks, query: playlistQuery, sortMode: playlistSortMode)
     }
 
     private var isFiltering: Bool {
@@ -1146,11 +1147,11 @@ private struct LocalPlaylistDetailView: View {
     }
 
     private var actionTracks: [Track] {
-        isFiltering ? filteredTracks : tracks
+        visibleTracks
     }
 
     private var visibleTrackCountLabel: String {
-        isFiltering ? "\(filteredTracks.count) of \(tracks.count)" : trackCountLabel
+        isFiltering ? "\(visibleTracks.count) of \(tracks.count)" : trackCountLabel
     }
 
     var body: some View {
@@ -1211,6 +1212,8 @@ private struct LocalPlaylistDetailView: View {
                     )
                     .frame(maxWidth: 360)
 
+                    PlaylistSortMenu(selection: $playlistSortMode)
+
                     if isFiltering {
                         InfoPill(symbol: "line.3.horizontal.decrease.circle", text: visibleTrackCountLabel)
                     }
@@ -1218,13 +1221,13 @@ private struct LocalPlaylistDetailView: View {
                     Spacer(minLength: 0)
                 }
 
-                if filteredTracks.isEmpty {
+                if visibleTracks.isEmpty {
                     EmptyPlaylistSearchPanel(accent: accent)
                 } else {
                     TrackListSection(
                         title: "Треки",
                         subtitle: visibleTrackCountLabel,
-                        tracks: filteredTracks,
+                        tracks: visibleTracks,
                         numbered: true,
                         playlistID: playlist.id
                     )
@@ -1521,6 +1524,53 @@ private struct LibrarySortMenu: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .help("Sort library")
+    }
+}
+
+private struct PlaylistSortMenu: View {
+    @EnvironmentObject private var store: PlayerStore
+    @Binding var selection: PlaylistSortMode
+
+    private var accent: Color {
+        store.currentTrack?.palette.accent ?? .white
+    }
+
+    var body: some View {
+        Menu {
+            ForEach(PlaylistSortMode.allCases) { mode in
+                Button {
+                    selection = mode
+                } label: {
+                    Label(mode.title, systemImage: selection == mode ? "checkmark" : mode.systemImage)
+                }
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: selection.systemImage)
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(accent)
+
+                Text(selection.title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.82)
+
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.44))
+            }
+            .foregroundStyle(.white.opacity(0.84))
+            .padding(.horizontal, 12)
+            .frame(height: 40)
+            .background(.white.opacity(0.09), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(accent.opacity(0.22), lineWidth: 1)
+            )
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .help("Sort playlist")
     }
 }
 
