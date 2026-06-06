@@ -568,6 +568,12 @@ enum LibrarySearchFilter {
     }
 }
 
+enum PlaylistTrackFilter {
+    static func filteredTracks(_ tracks: [Track], query: String) -> [Track] {
+        LibrarySearchFilter.filteredTracks(tracks, query: query)
+    }
+}
+
 enum LibrarySortMode: String, CaseIterable, Identifiable {
     case recentlyAdded
     case title

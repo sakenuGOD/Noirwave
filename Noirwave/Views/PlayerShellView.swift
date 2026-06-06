@@ -1121,6 +1121,7 @@ private struct PlaylistTitleSheet: View {
 
 private struct LocalPlaylistDetailView: View {
     @EnvironmentObject private var store: PlayerStore
+    @State private var playlistQuery = ""
     @State private var isConfirmingDelete = false
     let playlist: LocalPlaylist
     let tracks: [Track]
@@ -1134,6 +1135,22 @@ private struct LocalPlaylistDetailView: View {
 
     private var trackCountLabel: String {
         "\(playlist.trackCount) track\(playlist.trackCount == 1 ? "" : "s")"
+    }
+
+    private var filteredTracks: [Track] {
+        PlaylistTrackFilter.filteredTracks(tracks, query: playlistQuery)
+    }
+
+    private var isFiltering: Bool {
+        !playlistQuery.trimmed.isEmpty
+    }
+
+    private var actionTracks: [Track] {
+        isFiltering ? filteredTracks : tracks
+    }
+
+    private var visibleTrackCountLabel: String {
+        isFiltering ? "\(filteredTracks.count) of \(tracks.count)" : trackCountLabel
     }
 
     var body: some View {
@@ -1168,7 +1185,7 @@ private struct LocalPlaylistDetailView: View {
                     }
 
                     LocalPlaylistActionBar(
-                        tracks: tracks,
+                        tracks: actionTracks,
                         accent: accent,
                         onRename: onRename,
                         onDelete: {
@@ -1185,19 +1202,69 @@ private struct LocalPlaylistDetailView: View {
             if tracks.isEmpty {
                 EmptyPlaylistTracksPanel(accent: accent)
             } else {
-                TrackListSection(
-                    title: "Треки",
-                    subtitle: trackCountLabel,
-                    tracks: tracks,
-                    numbered: true,
-                    playlistID: playlist.id
-                )
+                HStack(alignment: .center, spacing: 12) {
+                    LocalLibrarySearchField(
+                        query: $playlistQuery,
+                        placeholder: "Find in playlist",
+                        clearHelp: "Clear playlist search"
+                    )
+                    .frame(maxWidth: 360)
+
+                    if isFiltering {
+                        InfoPill(symbol: "line.3.horizontal.decrease.circle", text: visibleTrackCountLabel)
+                    }
+
+                    Spacer(minLength: 0)
+                }
+
+                if filteredTracks.isEmpty {
+                    EmptyPlaylistSearchPanel(accent: accent)
+                } else {
+                    TrackListSection(
+                        title: "Треки",
+                        subtitle: visibleTrackCountLabel,
+                        tracks: filteredTracks,
+                        numbered: true,
+                        playlistID: playlist.id
+                    )
+                }
             }
         }
         .confirmationDialog("Delete playlist?", isPresented: $isConfirmingDelete) {
             Button("Delete Playlist", role: .destructive, action: onDelete)
             Button("Cancel", role: .cancel) {}
         }
+    }
+}
+
+private struct EmptyPlaylistSearchPanel: View {
+    let accent: Color
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 18, weight: .bold))
+                .foregroundStyle(.black)
+                .frame(width: 42, height: 42)
+                .background(accent, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("No matching tracks")
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(.white)
+                Text("0 found")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.46))
+            }
+
+            Spacer()
+        }
+        .padding(16)
+        .background(Color(hex: "#101010"), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(.white.opacity(0.08), lineWidth: 1)
+        )
     }
 }
 
@@ -1438,6 +1505,18 @@ private struct LibrarySortMenu: View {
 private struct LocalLibrarySearchField: View {
     @EnvironmentObject private var store: PlayerStore
     @Binding var query: String
+    let placeholder: String
+    let clearHelp: String
+
+    init(
+        query: Binding<String>,
+        placeholder: String = "Search library",
+        clearHelp: String = "Clear library search"
+    ) {
+        _query = query
+        self.placeholder = placeholder
+        self.clearHelp = clearHelp
+    }
 
     var body: some View {
         HStack(spacing: 9) {
@@ -1445,7 +1524,7 @@ private struct LocalLibrarySearchField: View {
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.5))
 
-            TextField("Search library", text: $query)
+            TextField(placeholder, text: $query)
                 .textFieldStyle(.plain)
                 .font(.system(size: 14, weight: .medium))
 
@@ -1458,7 +1537,7 @@ private struct LocalLibrarySearchField: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.white.opacity(0.52))
-                .help("Clear library search")
+                .help(clearHelp)
             }
         }
         .padding(.horizontal, 13)
