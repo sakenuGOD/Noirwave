@@ -678,6 +678,14 @@ enum LibraryTrackOrganizer {
     }
 }
 
+enum FavoriteTracksOrganizer {
+    static func tracks(_ tracks: [Track], libraryQuery: String, localQuery: String, sortMode: LibrarySortMode) -> [Track] {
+        let libraryFilteredTracks = LibrarySearchFilter.filteredTracks(tracks, query: libraryQuery)
+        let locallyFilteredTracks = LibrarySearchFilter.filteredTracks(libraryFilteredTracks, query: localQuery)
+        return TrackSortOrder.sortedTracks(locallyFilteredTracks, sortMode: sortMode)
+    }
+}
+
 enum PlaylistTrackOrganizer {
     static func tracks(_ tracks: [Track], query: String, sortMode: PlaylistSortMode) -> [Track] {
         let filteredTracks = PlaylistTrackFilter.filteredTracks(tracks, query: query)

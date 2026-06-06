@@ -921,6 +921,7 @@ private struct LibraryView: View {
     @EnvironmentObject private var store: PlayerStore
     @Binding var selectedPlaylistID: String?
     @State private var libraryQuery = ""
+    @State private var favoriteTracksQuery = ""
     @State private var librarySortMode: LibrarySortMode = .recentlyAdded
     @State private var playlistEditor: PlaylistEditor?
 
@@ -943,6 +944,15 @@ private struct LibraryView: View {
 
     private var filteredTracks: [Track] {
         LibraryTrackOrganizer.tracks(likedTracks, query: libraryQuery, sortMode: librarySortMode)
+    }
+
+    private var favoriteTracks: [Track] {
+        FavoriteTracksOrganizer.tracks(
+            likedTracks,
+            libraryQuery: libraryQuery,
+            localQuery: favoriteTracksQuery,
+            sortMode: librarySortMode
+        )
     }
 
     private var filteredLocalPlaylists: [LocalPlaylist] {
@@ -1052,12 +1062,13 @@ private struct LibraryView: View {
                 artists: artists
             )
         case .favoriteTracks:
-            CollectionActionCluster(
-                tracks: filteredTracks,
+            FavoriteTracksLibrarySection(
+                query: $favoriteTracksQuery,
+                tracks: favoriteTracks,
+                totalTracks: filteredTracks.count,
                 accent: store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent,
                 primaryLabel: "Play Favorites"
             )
-            TrackListSection(title: "Любимые треки", subtitle: "\(filteredTracks.count)", tracks: filteredTracks, numbered: true)
         case .playlists:
             LibraryPlaylistsShelf(localPlaylists: filteredLocalPlaylists) { playlistID in
                 selectedPlaylistID = playlistID
@@ -1620,9 +1631,18 @@ private struct PlaylistSortMenu: View {
 
 private struct LocalLibrarySearchField: View {
     @EnvironmentObject private var store: PlayerStore
+    @FocusState private var isFocused: Bool
     @Binding var query: String
     let placeholder: String
     let clearHelp: String
+
+    private var accent: Color {
+        store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent
+    }
+
+    private var borderColor: Color {
+        isFocused || !query.trimmed.isEmpty ? accent.opacity(0.34) : .white.opacity(0.1)
+    }
 
     init(
         query: Binding<String>,
@@ -1643,6 +1663,7 @@ private struct LocalLibrarySearchField: View {
             TextField(placeholder, text: $query)
                 .textFieldStyle(.plain)
                 .font(.system(size: 14, weight: .medium))
+                .focused($isFocused)
 
             if !query.trimmed.isEmpty {
                 Button {
@@ -1658,10 +1679,88 @@ private struct LocalLibrarySearchField: View {
         }
         .padding(.horizontal, 13)
         .frame(height: 40)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke((store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent).opacity(0.18), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(borderColor, lineWidth: 1)
+        )
+    }
+}
+
+private struct FavoriteTracksLibrarySection: View {
+    @Binding var query: String
+    let tracks: [Track]
+    let totalTracks: Int
+    let accent: Color
+    let primaryLabel: String
+
+    private var isFiltering: Bool {
+        !query.trimmed.isEmpty
+    }
+
+    private var countLabel: String {
+        isFiltering ? "\(tracks.count) of \(totalTracks)" : "\(totalTracks)"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .center, spacing: 12) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("Любимые треки")
+                        .font(.system(size: 20, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white)
+                    Text(countLabel)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.48))
+                }
+
+                Spacer(minLength: 12)
+                LocalLibrarySearchField(
+                    query: $query,
+                    placeholder: "Find in favorites",
+                    clearHelp: "Clear favorites search"
+                )
+                .frame(minWidth: 220, maxWidth: 320)
+            }
+
+            CollectionActionCluster(tracks: tracks, accent: accent, primaryLabel: primaryLabel)
+
+            if tracks.isEmpty {
+                EmptyFavoriteTracksSearchPanel(accent: accent)
+            } else {
+                TrackRowsStack(tracks: tracks, numbered: true)
+            }
+        }
+    }
+}
+
+private struct EmptyFavoriteTracksSearchPanel: View {
+    let accent: Color
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 18, weight: .bold))
+                .foregroundStyle(.black)
+                .frame(width: 42, height: 42)
+                .background(accent, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("No matching favorites")
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(.white)
+                Text("0 found")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.46))
+            }
+
+            Spacer()
+        }
+        .padding(16)
+        .background(Color(hex: "#101010"), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(.white.opacity(0.08), lineWidth: 1)
         )
     }
 }
@@ -2399,17 +2498,32 @@ private struct TrackListSection: View {
         } else {
             VStack(alignment: .leading, spacing: 12) {
                 SectionTitle(title: title, subtitle: subtitle)
+                TrackRowsStack(tracks: tracks, numbered: numbered, playlistID: playlistID)
+            }
+        }
+    }
+}
 
-                VStack(spacing: 7) {
-                    ForEach(Array(tracks.enumerated()), id: \.element.id) { index, track in
-                        TrackRowView(
-                            track: track,
-                            index: numbered ? index + 1 : nil,
-                            playlistID: playlistID,
-                            playbackContext: tracks
-                        )
-                    }
-                }
+private struct TrackRowsStack: View {
+    let tracks: [Track]
+    let numbered: Bool
+    let playlistID: String?
+
+    init(tracks: [Track], numbered: Bool, playlistID: String? = nil) {
+        self.tracks = tracks
+        self.numbered = numbered
+        self.playlistID = playlistID
+    }
+
+    var body: some View {
+        VStack(spacing: 7) {
+            ForEach(Array(tracks.enumerated()), id: \.element.id) { index, track in
+                TrackRowView(
+                    track: track,
+                    index: numbered ? index + 1 : nil,
+                    playlistID: playlistID,
+                    playbackContext: tracks
+                )
             }
         }
     }
