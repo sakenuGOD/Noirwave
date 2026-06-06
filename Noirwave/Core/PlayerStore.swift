@@ -139,13 +139,17 @@ final class PlayerStore: ObservableObject {
     }
 
     func activate(_ item: Track) {
+        activate(item, in: visibleTracks)
+    }
+
+    func activate(_ item: Track, in playbackContext: [Track]) {
         guard item.isPlayable else {
             drillIntoCatalog(from: item)
             return
         }
 
-        let context = uniquePlayableTracks(in: visibleTracks)
-        activePlaybackContext = context.isEmpty ? [item] : context
+        let context = uniquePlayableTracks(in: playbackContext)
+        activePlaybackContext = context.contains(item) ? context : [item] + context.filter { $0 != item }
         let playbackContext = playbackQueue(after: item, in: activePlaybackContext, limit: playbackContextLimit)
         queue = playbackContext
         prepare(Array(([item] + playbackContext).prefix(playbackContextLimit)))

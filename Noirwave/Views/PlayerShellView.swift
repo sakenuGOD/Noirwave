@@ -2402,7 +2402,12 @@ private struct TrackListSection: View {
 
                 VStack(spacing: 7) {
                     ForEach(Array(tracks.enumerated()), id: \.element.id) { index, track in
-                        TrackRowView(track: track, index: numbered ? index + 1 : nil, playlistID: playlistID)
+                        TrackRowView(
+                            track: track,
+                            index: numbered ? index + 1 : nil,
+                            playlistID: playlistID,
+                            playbackContext: tracks
+                        )
                     }
                 }
             }
@@ -2415,11 +2420,13 @@ private struct TrackRowView: View {
     let track: Track
     let index: Int?
     let playlistID: String?
+    let playbackContext: [Track]
 
-    init(track: Track, index: Int?, playlistID: String? = nil) {
+    init(track: Track, index: Int?, playlistID: String? = nil, playbackContext: [Track] = []) {
         self.track = track
         self.index = index
         self.playlistID = playlistID
+        self.playbackContext = playbackContext
     }
 
     private var isCurrent: Bool {
@@ -2442,7 +2449,7 @@ private struct TrackRowView: View {
             }
 
             Button {
-                store.activate(track)
+                store.activate(track, in: playbackContext)
             } label: {
                 ZStack {
                     ArtworkTile(track: track, size: 48, cornerRadius: track.kind == .artist ? 24 : 8)
@@ -2510,7 +2517,7 @@ private struct TrackRowView: View {
         )
         .contextMenu {
             Button {
-                store.activate(track)
+                store.activate(track, in: playbackContext)
             } label: {
                 Label(track.isPlayable ? "Play" : "Open", systemImage: track.isPlayable ? "play.fill" : "chevron.right")
             }
