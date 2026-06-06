@@ -49,6 +49,7 @@ final class PlayerStore: ObservableObject {
     private var progressTask: Task<Void, Never>?
     private var lyricsTask: Task<Void, Never>?
     private var preparationTask: Task<Void, Never>?
+    private var activePlaybackContext: [Track] = []
     private var lastAudibleVolume: Double = 0.78
 
     init(provider: MusicProviding, userDefaults: UserDefaults = .standard) {
@@ -143,7 +144,9 @@ final class PlayerStore: ObservableObject {
             return
         }
 
-        let playbackContext = playbackQueue(after: item, in: visibleTracks, limit: playbackContextLimit)
+        let context = uniquePlayableTracks(in: visibleTracks)
+        activePlaybackContext = context.isEmpty ? [item] : context
+        let playbackContext = playbackQueue(after: item, in: activePlaybackContext, limit: playbackContextLimit)
         queue = playbackContext
         prepare(Array(([item] + playbackContext).prefix(playbackContextLimit)))
         play(item)
@@ -153,6 +156,7 @@ final class PlayerStore: ObservableObject {
         let playableTracks = uniquePlayableTracks(in: tracks)
         guard let firstTrack = playableTracks.first else { return }
 
+        activePlaybackContext = playableTracks
         queue = Array(playableTracks.dropFirst())
         prepare(Array(playableTracks.prefix(playbackContextLimit)))
         play(firstTrack)
@@ -162,6 +166,7 @@ final class PlayerStore: ObservableObject {
         let playableTracks = uniquePlayableTracks(in: tracks).shuffled()
         guard let firstTrack = playableTracks.first else { return }
 
+        activePlaybackContext = playableTracks
         isShuffled = true
         queue = Array(playableTracks.dropFirst())
         prepare(Array(playableTracks.prefix(playbackContextLimit)))
@@ -561,6 +566,7 @@ final class PlayerStore: ObservableObject {
         let wave = smartWaveTracks(limit: playbackContextLimit)
         guard let firstTrack = wave.first else { return }
 
+        activePlaybackContext = wave
         queue = Array(wave.dropFirst())
         prepare(Array(wave.prefix(playbackContextLimit)))
         play(firstTrack)
@@ -790,6 +796,7 @@ final class PlayerStore: ObservableObject {
     private func applyFeaturedTracks(_ tracks: [Track]) {
         featuredTracks = tracks
         visibleTracks = searchQuery.trimmed.isEmpty ? tracks : visibleTracks
+        activePlaybackContext = []
         if searchQuery.trimmed.isEmpty {
             resultTitle = "Catalog Tracks"
             resultSubtitle = nil
@@ -863,6 +870,23 @@ final class PlayerStore: ObservableObject {
             queuedIDs.insert(currentTrack.id)
         }
 
+        if !activePlaybackContext.isEmpty,
+           activePlaybackContext.contains(track) {
+            let candidates = playbackQueue(after: track, in: activePlaybackContext, limit: playbackContextLimit)
+            for candidate in candidates where queue.count < playbackContextLimit {
+                guard candidate != currentTrack,
+                      !queue.contains(candidate),
+                      !queuedIDs.contains(candidate.id)
+                else { continue }
+
+                queue.append(candidate)
+                queuedIDs.insert(candidate.id)
+            }
+
+            preparePlaybackContext()
+            return
+        }
+
         let smartCandidates = smartWaveTracks(
             limit: playbackContextLimit,
             excludingIDs: queuedIDs
@@ -920,6 +944,7 @@ final class PlayerStore: ObservableObject {
         }
 
         append(queue)
+        append(activePlaybackContext)
         append(visibleTracks)
         append(featuredTracks)
 
@@ -927,6 +952,10 @@ final class PlayerStore: ObservableObject {
     }
 
     private var currentPlaybackContext: [Track] {
+        if !activePlaybackContext.isEmpty {
+            return activePlaybackContext
+        }
+
         let playableVisibleTracks = visibleTracks.filter(\.isPlayable)
         return playableVisibleTracks.isEmpty ? featuredTracks.filter(\.isPlayable) : playableVisibleTracks
     }
