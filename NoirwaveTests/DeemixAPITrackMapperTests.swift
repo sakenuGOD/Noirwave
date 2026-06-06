@@ -198,7 +198,7 @@ final class DeemixAPITrackMapperTests: XCTestCase {
             pictureXL: "https://cdn-images.dzcdn.net/images/artist/nirvana/1000x1000-000000-80-0-0.jpg",
             albumCount: 25,
             fanCount: 9_999_080,
-            tracklist: "https://api.deezer.com/artist/415/top?limit=50"
+            tracklist: "https://api.deezer.com/artist/415/top?limit=1000"
         )
 
         let artist = DeemixAPITrackMapper.mapArtist(payload, fallbackIndex: 0)
@@ -291,9 +291,147 @@ final class DeemixAPITrackMapperTests: XCTestCase {
     }
 
     func testSearchScopeLabelsAreClearMediaTypes() {
+        XCTAssertEqual(SearchScope.smart.rawValue, "Smart")
         XCTAssertEqual(SearchScope.catalog.rawValue, "Tracks")
         XCTAssertEqual(SearchScope.library.rawValue, "Artists")
-        XCTAssertEqual(SearchScope.playlists.rawValue, "Albums")
+        XCTAssertEqual(SearchScope.albums.rawValue, "Albums")
+    }
+
+    func testCatalogRequestWindowsAreExpandedPastPreviewLimits() {
+        XCTAssertGreaterThanOrEqual(DeemixAPICatalogRequestLimits.searchWindow, 180)
+        XCTAssertGreaterThanOrEqual(DeemixAPICatalogRequestLimits.artistTrackWindow, 500)
+    }
+
+    func testAlbumDetailLabelKeepsSinglesAndEPsDistinct() {
+        let single = Track(
+            id: "deemix-album.1",
+            title: "Single Release",
+            artist: "Nirvana",
+            album: "Album",
+            duration: 0,
+            palette: .fallback,
+            catalogID: "https://www.deezer.com/album/1",
+            previewURL: nil,
+            kind: .album,
+            trackCount: 1,
+            releaseDate: "1991-01-01",
+            recordType: "single"
+        )
+        let ep = Track(
+            id: "deemix-album.2",
+            title: "EP Release",
+            artist: "Nirvana",
+            album: "Album",
+            duration: 0,
+            palette: .fallback,
+            catalogID: "https://www.deezer.com/album/2",
+            previewURL: nil,
+            kind: .album,
+            trackCount: 4,
+            releaseDate: "1992-01-01",
+            recordType: "ep"
+        )
+
+        XCTAssertEqual(single.detailLabel, "Nirvana · Single · 1 track · 1991")
+        XCTAssertEqual(ep.detailLabel, "Nirvana · EP · 4 tracks · 1992")
+    }
+
+    func testSmartSearchDeduplicatesExactArtistsAndFiltersWeakContainsMatches() {
+        let canonical = Track(
+            id: "deemix-artist.415",
+            title: "Nirvana",
+            artist: "Nirvana",
+            album: "Artist",
+            duration: 0,
+            palette: .fallback,
+            catalogID: "https://www.deezer.com/artist/415",
+            previewURL: nil,
+            kind: .artist,
+            fanCount: 10_000_000,
+            albumCount: 26
+        )
+        let duplicate = Track(
+            id: "deemix-artist.999",
+            title: "Nirvana",
+            artist: "Nirvana",
+            album: "Artist",
+            duration: 0,
+            palette: .fallback,
+            catalogID: "https://www.deezer.com/artist/999",
+            previewURL: nil,
+            kind: .artist,
+            fanCount: 10,
+            albumCount: 2
+        )
+        let weakContainsMatch = Track(
+            id: "deemix-artist.777",
+            title: "Approaching Nirvana",
+            artist: "Approaching Nirvana",
+            album: "Artist",
+            duration: 0,
+            palette: .fallback,
+            catalogID: "https://www.deezer.com/artist/777",
+            previewURL: nil,
+            kind: .artist,
+            fanCount: 9_900,
+            albumCount: 100
+        )
+
+        let ranked = SmartSearchRanker.ranked(
+            query: "nirvana",
+            artists: [duplicate, weakContainsMatch, canonical],
+            tracks: [],
+            albums: []
+        )
+
+        XCTAssertEqual(ranked.map(\.id), ["deemix-artist.415"])
+    }
+
+    func testSmartSearchBoostsDominantArtistTracksOverTitleOnlyMatches() {
+        let artist = Track(
+            id: "deemix-artist.415",
+            title: "Nirvana",
+            artist: "Nirvana",
+            album: "Artist",
+            duration: 0,
+            palette: .fallback,
+            catalogID: "https://www.deezer.com/artist/415",
+            previewURL: nil,
+            kind: .artist,
+            fanCount: 10_000_000,
+            albumCount: 26
+        )
+        let titleOnlyTrack = Track(
+            id: "deemix-api.1",
+            title: "Nirvana",
+            artist: "Kerchak",
+            album: "Nirvana",
+            duration: 167,
+            palette: .fallback,
+            catalogID: "https://www.deezer.com/track/1",
+            previewURL: nil,
+            rank: 950_000
+        )
+        let dominantArtistTrack = Track(
+            id: "deemix-api.2",
+            title: "About A Girl",
+            artist: "Nirvana",
+            album: "Nirvana",
+            duration: 166,
+            palette: .fallback,
+            catalogID: "https://www.deezer.com/track/2",
+            previewURL: nil,
+            rank: 200_000
+        )
+
+        let ranked = SmartSearchRanker.ranked(
+            query: "nirvana",
+            artists: [artist],
+            tracks: [titleOnlyTrack, dominantArtistTrack],
+            albums: []
+        )
+
+        XCTAssertEqual(ranked.map(\.id), ["deemix-artist.415", "deemix-api.2", "deemix-api.1"])
     }
 
     func testNormalizesBackendSessionTokenBeforeLogin() {

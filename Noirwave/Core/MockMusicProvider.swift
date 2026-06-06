@@ -1,7 +1,7 @@
 import Foundation
 
 final class MockMusicProvider: MusicProviding {
-    let sourceName = "Mock Studio"
+    let sourceName = "Noirwave Free"
 
     private let tracks: [Track] = [
         Track(
@@ -10,9 +10,10 @@ final class MockMusicProvider: MusicProviding {
             artist: "NOVA UNIT",
             album: "Afterimage",
             duration: 217,
-            palette: TrackPalette(baseHex: "#0D0E12", midHex: "#38433F", accentHex: "#E55E70", inkHex: "#F4F0EA"),
+            palette: TrackPalette(baseHex: "#0D0E12", midHex: "#38433F", accentHex: "#5EE0C2", inkHex: "#EAFDF8"),
             catalogID: nil,
-            previewURL: nil
+            previewURL: nil,
+            artworkURL: "https://picsum.photos/seed/noirwave-chrome-halo/640/640"
         ),
         Track(
             id: "mock.low-orbit",
@@ -20,9 +21,10 @@ final class MockMusicProvider: MusicProviding {
             artist: "Mara Vale",
             album: "Telemetry",
             duration: 254,
-            palette: TrackPalette(baseHex: "#090C10", midHex: "#143D48", accentHex: "#37D1B2", inkHex: "#EAF8F4"),
+            palette: TrackPalette(baseHex: "#090C10", midHex: "#143D48", accentHex: "#5EE0C2", inkHex: "#EAFDF8"),
             catalogID: nil,
-            previewURL: nil
+            previewURL: nil,
+            artworkURL: "https://picsum.photos/seed/noirwave-low-orbit/640/640"
         ),
         Track(
             id: "mock.soft-voltage",
@@ -30,9 +32,10 @@ final class MockMusicProvider: MusicProviding {
             artist: "Glass Relay",
             album: "Midnight Utility",
             duration: 186,
-            palette: TrackPalette(baseHex: "#111016", midHex: "#3C3149", accentHex: "#F0A34A", inkHex: "#FFF3DF"),
+            palette: TrackPalette(baseHex: "#111016", midHex: "#3C3149", accentHex: "#5EE0C2", inkHex: "#EAFDF8"),
             catalogID: nil,
-            previewURL: nil
+            previewURL: nil,
+            artworkURL: "https://picsum.photos/seed/noirwave-soft-voltage/640/640"
         ),
         Track(
             id: "mock.ceramic-static",
@@ -40,9 +43,10 @@ final class MockMusicProvider: MusicProviding {
             artist: "Iris Circuit",
             album: "No Service",
             duration: 228,
-            palette: TrackPalette(baseHex: "#0F1110", midHex: "#34402E", accentHex: "#D9E86D", inkHex: "#F6F8DF"),
+            palette: TrackPalette(baseHex: "#0F1110", midHex: "#34402E", accentHex: "#5EE0C2", inkHex: "#EAFDF8"),
             catalogID: nil,
-            previewURL: nil
+            previewURL: nil,
+            artworkURL: "https://picsum.photos/seed/noirwave-ceramic-static/640/640"
         ),
         Track(
             id: "mock.terminal-silk",
@@ -50,9 +54,10 @@ final class MockMusicProvider: MusicProviding {
             artist: "Vanta Choir",
             album: "Room Tone",
             duration: 242,
-            palette: TrackPalette(baseHex: "#090909", midHex: "#433232", accentHex: "#FF5B35", inkHex: "#F7E8DF"),
+            palette: TrackPalette(baseHex: "#090909", midHex: "#433232", accentHex: "#5EE0C2", inkHex: "#EAFDF8"),
             catalogID: nil,
-            previewURL: nil
+            previewURL: nil,
+            artworkURL: "https://picsum.photos/seed/noirwave-terminal-silk/640/640"
         ),
         Track(
             id: "mock.black-current",
@@ -60,9 +65,10 @@ final class MockMusicProvider: MusicProviding {
             artist: "North Prism",
             album: "Signal Shapes",
             duration: 205,
-            palette: TrackPalette(baseHex: "#0C0E14", midHex: "#24314B", accentHex: "#5EA8FF", inkHex: "#EEF5FF"),
+            palette: TrackPalette(baseHex: "#0C0E14", midHex: "#24314B", accentHex: "#5EE0C2", inkHex: "#EAFDF8"),
             catalogID: nil,
-            previewURL: nil
+            previewURL: nil,
+            artworkURL: "https://picsum.photos/seed/noirwave-black-current/640/640"
         ),
         Track(
             id: "mock.silver-rain",
@@ -70,9 +76,10 @@ final class MockMusicProvider: MusicProviding {
             artist: "Luma District",
             album: "Refraction",
             duration: 233,
-            palette: TrackPalette(baseHex: "#101112", midHex: "#4A4E50", accentHex: "#DDE6EA", inkHex: "#F7F8F8"),
+            palette: TrackPalette(baseHex: "#101112", midHex: "#4A4E50", accentHex: "#5EE0C2", inkHex: "#EAFDF8"),
             catalogID: nil,
-            previewURL: nil
+            previewURL: nil,
+            artworkURL: "https://picsum.photos/seed/noirwave-silver-rain/640/640"
         ),
         Track(
             id: "mock.subsurface",
@@ -80,9 +87,10 @@ final class MockMusicProvider: MusicProviding {
             artist: "Aster Field",
             album: "Drift Index",
             duration: 198,
-            palette: TrackPalette(baseHex: "#0A1110", midHex: "#1D4B3E", accentHex: "#FFCB66", inkHex: "#FFF5DD"),
+            palette: TrackPalette(baseHex: "#0A1110", midHex: "#1D4B3E", accentHex: "#5EE0C2", inkHex: "#EAFDF8"),
             catalogID: nil,
-            previewURL: nil
+            previewURL: nil,
+            artworkURL: "https://picsum.photos/seed/noirwave-subsurface/640/640"
         )
     ]
 
@@ -98,11 +106,36 @@ final class MockMusicProvider: MusicProviding {
             return tracks
         }
 
-        return tracks.filter { track in
+        let matchingTracks = tracks.filter { track in
             track.title.lowercased().contains(term)
                 || track.artist.lowercased().contains(term)
                 || track.album.lowercased().contains(term)
         }
+
+        guard scope == .smart else {
+            return matchingTracks
+        }
+
+        let artists = Dictionary(grouping: matchingTracks, by: \.artist)
+            .enumerated()
+            .map { offset, group in
+                Track(
+                    id: "mock-artist.\(group.key)",
+                    title: group.key,
+                    artist: group.key,
+                    album: "Artist",
+                    duration: 0,
+                    palette: group.value.first?.palette ?? .fallback,
+                    catalogID: nil,
+                    previewURL: nil,
+                    kind: .artist,
+                    artworkURL: group.value.first?.artworkURL,
+                    fanCount: 100_000 - offset,
+                    albumCount: Set(group.value.map(\.album)).count
+                )
+            }
+
+        return SmartSearchRanker.ranked(query: query, artists: artists, tracks: matchingTracks, albums: [])
     }
 
     func catalogItems(for item: Track) async throws -> [Track] {
@@ -120,11 +153,29 @@ final class MockMusicProvider: MusicProviding {
         }
     }
 
+    func radioTracks(seed: Track?) async throws -> [Track] {
+        try await Task.sleep(for: .milliseconds(80))
+
+        guard let seed else {
+            return tracks.shuffled()
+        }
+
+        let sameArtistOrAlbum = tracks.filter {
+            $0 != seed && ($0.artist == seed.artist || $0.album == seed.album)
+        }
+        let relatedPalette = tracks.filter {
+            $0 != seed && $0.palette.accentHex == seed.palette.accentHex
+        }
+        let fallback = tracks.filter { $0 != seed }
+
+        return stableRadioOrder(sameArtistOrAlbum + relatedPalette + fallback, seed: seed.id)
+    }
+
     func requestAuthorization() async throws -> ProviderStatus {
         ProviderStatus(
             authorization: .authorized,
             canPlayCatalogContent: true,
-            message: "Mock playback"
+            message: "Free local playback"
         )
     }
 
@@ -169,5 +220,16 @@ final class MockMusicProvider: MusicProviding {
 
     func currentPlaybackTime() -> TimeInterval? {
         nil
+    }
+
+    private func stableRadioOrder(_ items: [Track], seed: String) -> [Track] {
+        var seenIDs = Set<String>()
+        return items
+            .filter { seenIDs.insert($0.id).inserted }
+            .sorted { lhsTrack, rhsTrack in
+                let lhs = "\(seed).\(lhsTrack.id)".unicodeScalars.reduce(0) { $0 + Int($1.value) }
+                let rhs = "\(seed).\(rhsTrack.id)".unicodeScalars.reduce(0) { $0 + Int($1.value) }
+                return lhs < rhs
+            }
     }
 }

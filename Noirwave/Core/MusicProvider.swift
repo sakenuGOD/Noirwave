@@ -1,30 +1,35 @@
 import Foundation
 
 enum SearchScope: String, CaseIterable, Identifiable {
+    case smart = "Smart"
     case catalog = "Tracks"
     case library = "Artists"
-    case playlists = "Albums"
+    case albums = "Albums"
 
     var id: String { rawValue }
 
     var systemImage: String {
         switch self {
+        case .smart:
+            "magnifyingglass"
         case .catalog:
             "square.grid.2x2"
         case .library:
             "music.mic"
-        case .playlists:
+        case .albums:
             "rectangle.stack"
         }
     }
 
     var resultsTitle: String {
         switch self {
+        case .smart:
+            "Best Matches"
         case .catalog:
             "Track Results"
         case .library:
             "Artist Results"
-        case .playlists:
+        case .albums:
             "Album Results"
         }
     }
@@ -130,6 +135,7 @@ protocol MusicProviding: AnyObject {
     func featuredTracks() async throws -> [Track]
     func search(_ query: String, scope: SearchScope) async throws -> [Track]
     func catalogItems(for item: Track) async throws -> [Track]
+    func radioTracks(seed: Track?) async throws -> [Track]
     func requestAuthorization() async throws -> ProviderStatus
     func currentStatus() async throws -> ProviderStatus
     func configureBackendSession(arl: String) async throws -> ProviderStatus

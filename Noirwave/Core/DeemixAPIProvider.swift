@@ -23,6 +23,15 @@ struct DeemixAPIAlbumSearchResponse: Decodable {
     let error: String?
 }
 
+struct DeemixAPISmartSearchResponse: Decodable {
+    let tracks: [DeemixAPITrackPayload]?
+    let artists: [DeemixAPIArtistPayload]?
+    let albums: [DeemixAPIAlbumPayload]?
+    let total: Int?
+    let type: String?
+    let error: String?
+}
+
 struct DeemixAPIConnectResponse: Decodable {
     let autologin: Bool?
     let currentUser: DeemixAPILoginUser?
@@ -699,12 +708,12 @@ enum DeemixAPITrackMapper {
 
     private static func palette(for seed: String) -> TrackPalette {
         let palettes = [
-            TrackPalette(baseHex: "#0D0E12", midHex: "#38433F", accentHex: "#E55E70", inkHex: "#F4F0EA"),
-            TrackPalette(baseHex: "#090C10", midHex: "#143D48", accentHex: "#37D1B2", inkHex: "#EAF8F4"),
-            TrackPalette(baseHex: "#111016", midHex: "#3C3149", accentHex: "#F0A34A", inkHex: "#FFF3DF"),
-            TrackPalette(baseHex: "#0F1110", midHex: "#34402E", accentHex: "#D9E86D", inkHex: "#F6F8DF"),
-            TrackPalette(baseHex: "#090909", midHex: "#433232", accentHex: "#FF5B35", inkHex: "#F7E8DF"),
-            TrackPalette(baseHex: "#0C0E14", midHex: "#24314B", accentHex: "#5EA8FF", inkHex: "#EEF5FF")
+            TrackPalette(baseHex: "#0D0E12", midHex: "#38433F", accentHex: "#5EE0C2", inkHex: "#EAFDF8"),
+            TrackPalette(baseHex: "#090C10", midHex: "#143D48", accentHex: "#5EE0C2", inkHex: "#EAFDF8"),
+            TrackPalette(baseHex: "#111016", midHex: "#3C3149", accentHex: "#5EE0C2", inkHex: "#EAFDF8"),
+            TrackPalette(baseHex: "#0F1110", midHex: "#34402E", accentHex: "#5EE0C2", inkHex: "#EAFDF8"),
+            TrackPalette(baseHex: "#090909", midHex: "#433232", accentHex: "#5EE0C2", inkHex: "#EAFDF8"),
+            TrackPalette(baseHex: "#0C0E14", midHex: "#24314B", accentHex: "#5EE0C2", inkHex: "#EAFDF8")
         ]
 
         let value = seed.unicodeScalars.reduce(0) { partialResult, scalar in
@@ -894,6 +903,14 @@ enum DeemixAPIStreamURLResolver {
     }
 }
 
+enum DeemixAPICatalogRequestLimits {
+    static let searchWindow = 180
+    static let smartTrackWindow = 180
+    static let smartArtistWindow = 80
+    static let smartAlbumWindow = 120
+    static let artistTrackWindow = 500
+}
+
 enum DeemixAPISessionSecret {
     private static let minimumLength = 32
 
@@ -1074,6 +1091,23 @@ struct DeemixAPIClient {
         return response.data ?? []
     }
 
+    func searchSmart(term: String, count: Int = 30) async throws -> DeemixAPISmartSearchResponse {
+        let response: DeemixAPISmartSearchResponse = try await get(
+            "search",
+            queryItems: [
+                URLQueryItem(name: "term", value: term),
+                URLQueryItem(name: "type", value: "smart"),
+                URLQueryItem(name: "nb", value: String(count))
+            ]
+        )
+
+        if let error = response.error?.nonEmpty {
+            throw MusicProviderError.providerNotReady(error)
+        }
+
+        return response
+    }
+
     func artistDetail(id: String) async throws -> DeemixAPIArtistDetailPayload {
         try await get(
             "getTracklist",
@@ -1179,9 +1213,11 @@ final class DeemixAPIProvider: MusicProviding {
     private let client: DeemixAPIClient
     private let downloadTimeout: TimeInterval
     private let sessionVault: DeemixAPISessionVault
+    private let usesSessionVault: Bool
     private var player: AVPlayer?
     private var lastPlaybackFileURL: URL?
     private var didAttemptDownloadLogin = false
+    private var searchCache: [String: [Track]] = [:]
 
     private let seedQueries = [
         "Daft Punk Around the World",
@@ -1191,11 +1227,13 @@ final class DeemixAPIProvider: MusicProviding {
     init(
         client: DeemixAPIClient = DeemixAPIClient(baseURL: DeemixAPIProvider.defaultBaseURL()),
         downloadTimeout: TimeInterval = 180,
-        sessionVault: DeemixAPISessionVault = .app
+        sessionVault: DeemixAPISessionVault = .app,
+        usesSessionVault: Bool = false
     ) {
         self.client = client
         self.downloadTimeout = downloadTimeout
         self.sessionVault = sessionVault
+        self.usesSessionVault = usesSessionVault
     }
 
     func featuredTracks() async throws -> [Track] {
@@ -1222,26 +1260,53 @@ final class DeemixAPIProvider: MusicProviding {
             return []
         }
 
+        let cacheKey = searchCacheKey(term: term, scope: scope)
+        if let cached = searchCache[cacheKey] {
+            return cached
+        }
+
+        let results: [Track]
         switch scope {
+        case .smart:
+            let payload = try await searchSmartPayload(term: term)
+            let artists = (payload.artists ?? []).enumerated().map { index, payload in
+                DeemixAPITrackMapper.mapArtist(payload, fallbackIndex: index)
+            }
+            let tracks = (payload.tracks ?? []).enumerated().compactMap { index, payload in
+                try? DeemixAPITrackMapper.map(payload, fallbackIndex: index)
+            }
+            let albums = (payload.albums ?? []).enumerated().map { index, payload in
+                DeemixAPITrackMapper.mapAlbum(payload, fallbackIndex: index)
+            }
+            results = SmartSearchRanker.ranked(
+                query: term,
+                artists: artists,
+                tracks: tracks,
+                albums: albums,
+                limit: DeemixAPICatalogRequestLimits.searchWindow
+            )
         case .catalog:
-            let payloads = try await client.searchTracks(term: term, count: 30)
+            let payloads = try await client.searchTracks(term: term, count: DeemixAPICatalogRequestLimits.searchWindow)
             let tracks = payloads.enumerated().compactMap { index, payload in
                 try? DeemixAPITrackMapper.map(payload, fallbackIndex: index)
             }
-            return DeemixAPITrackSorter.sortedByPopularity(tracks)
+            results = DeemixAPITrackSorter.sortedByPopularity(tracks)
         case .library:
-            let payloads = try await client.searchArtists(term: term, count: 30)
+            let payloads = try await client.searchArtists(term: term, count: DeemixAPICatalogRequestLimits.searchWindow)
             let artists = payloads.enumerated().map { index, payload in
                 DeemixAPITrackMapper.mapArtist(payload, fallbackIndex: index)
             }
-            return DeemixAPIMediaSorter.sortedArtistsByAudience(artists)
-        case .playlists:
-            let payloads = try await client.searchAlbums(term: term, count: 30)
+            results = DeemixAPIMediaSorter.sortedArtistsByAudience(artists)
+        case .albums:
+            let payloads = try await client.searchAlbums(term: term, count: DeemixAPICatalogRequestLimits.searchWindow)
             let albums = payloads.enumerated().map { index, payload in
                 DeemixAPITrackMapper.mapAlbum(payload, fallbackIndex: index)
             }
-            return DeemixAPIMediaSorter.sortedAlbumsForArtist(albums)
+            results = DeemixAPIMediaSorter.sortedAlbumsForArtist(albums)
         }
+
+        storeSearchResults(results, for: cacheKey)
+        return results
     }
 
     func catalogItems(for item: Track) async throws -> [Track] {
@@ -1269,7 +1334,7 @@ final class DeemixAPIProvider: MusicProviding {
                 DeemixAPITrackMapper.mapAlbum(payload, fallbackIndex: index, artistContext: artistPayload)
             }
 
-            let topTracks = Array(DeemixAPITrackSorter.sortedByPopularity(popularTracks).prefix(12))
+            let topTracks = DeemixAPITrackSorter.sortedByPopularity(popularTracks)
             return topTracks + DeemixAPIMediaSorter.sortedAlbumsForArtist(albums)
         case .album:
             guard let albumID = deemixID(from: item, prefix: "deemix-album.") else {
@@ -1285,6 +1350,40 @@ final class DeemixAPIProvider: MusicProviding {
         }
     }
 
+    func radioTracks(seed: Track?) async throws -> [Track] {
+        guard let seed else {
+            return try await search("new music", scope: .catalog)
+        }
+
+        let seedArtist = seed.artist.trimmed
+        let seedAlbum = seed.album.trimmed
+        let primaryTerm = [seedArtist.nonEmpty, seedAlbum.nonEmpty]
+            .compactMap(\.self)
+            .joined(separator: " ")
+            .nonEmpty ?? seed.title
+
+        async let artistPayloads = client.searchTracks(term: seedArtist.nonEmpty ?? primaryTerm, count: 35)
+        async let albumPayloads = seedAlbum.isEmpty
+            ? client.searchTracks(term: primaryTerm, count: 20)
+            : client.searchTracks(term: seedAlbum, count: 20)
+
+        let (artistMatches, albumMatches) = try await (artistPayloads, albumPayloads)
+        let mapped = (artistMatches + albumMatches).enumerated().compactMap { index, payload in
+            try? DeemixAPITrackMapper.map(payload, fallbackIndex: index)
+        }
+
+        let sorted = mapped.sorted { lhs, rhs in
+            let lhsScore = radioScore(lhs, seed: seed)
+            let rhsScore = radioScore(rhs, seed: seed)
+            if lhsScore == rhsScore {
+                return (lhs.rank ?? 0) > (rhs.rank ?? 0)
+            }
+            return lhsScore > rhsScore
+        }
+
+        return Array(deduplicatedTracks(sorted).prefix(40))
+    }
+
     func requestAuthorization() async throws -> ProviderStatus {
         try await currentStatus()
     }
@@ -1294,7 +1393,7 @@ final class DeemixAPIProvider: MusicProviding {
             let response = try await client.connect()
             return providerStatus(from: response)
         } catch {
-            if let restoredStatus = await restoreSavedSessionStatus() {
+            if usesSessionVault, let restoredStatus = await restoreSavedSessionStatus() {
                 return restoredStatus
             }
 
@@ -1320,7 +1419,9 @@ final class DeemixAPIProvider: MusicProviding {
         }
 
         try await activateBackendSession(normalizedARL)
-        try sessionVault.saveARL(normalizedARL)
+        if usesSessionVault {
+            try sessionVault.saveARL(normalizedARL)
+        }
         return try await currentStatus()
     }
 
@@ -1383,7 +1484,7 @@ final class DeemixAPIProvider: MusicProviding {
     private func providerStatus(from response: DeemixAPIConnectResponse) -> ProviderStatus {
         let available = response.deezerAvailable ?? "unknown"
         let savedARL = ProcessInfo.processInfo.environment[Self.arlEnvironmentKey]
-            ?? (try? sessionVault.savedARL())
+            ?? (usesSessionVault ? (try? sessionVault.savedARL()) : nil)
             ?? response.singleUser?.arl
         let loginMessage = DeemixAPISessionState.playbackMessage(
             autologin: response.autologin,
@@ -1587,7 +1688,7 @@ final class DeemixAPIProvider: MusicProviding {
         let term = artist.name?.nonEmpty ?? ""
         guard !term.isEmpty else { return [] }
 
-        let payloads = try await client.searchTracks(term: term, count: 50)
+        let payloads = try await client.searchTracks(term: term, count: DeemixAPICatalogRequestLimits.artistTrackWindow)
         return payloads.enumerated().compactMap { index, payload in
             let sameArtistID = payload.artist?.id == artist.id
             let sameArtistName = payload.artist?.name?.localizedCaseInsensitiveCompare(term) == .orderedSame
@@ -1602,6 +1703,59 @@ final class DeemixAPIProvider: MusicProviding {
             guard let id = payload.id else { return true }
             return seenIDs.insert(id).inserted
         }
+    }
+
+    private func searchSmartPayload(term: String) async throws -> DeemixAPISmartSearchResponse {
+        do {
+            return try await client.searchSmart(term: term, count: DeemixAPICatalogRequestLimits.smartTrackWindow)
+        } catch {
+            async let artistPayloads = client.searchArtists(term: term, count: DeemixAPICatalogRequestLimits.smartArtistWindow)
+            async let trackPayloads = client.searchTracks(term: term, count: DeemixAPICatalogRequestLimits.smartTrackWindow)
+            async let albumPayloads = client.searchAlbums(term: term, count: DeemixAPICatalogRequestLimits.smartAlbumWindow)
+            let (artists, tracks, albums) = try await (artistPayloads, trackPayloads, albumPayloads)
+            return DeemixAPISmartSearchResponse(
+                tracks: tracks,
+                artists: artists,
+                albums: albums,
+                total: tracks.count + artists.count + albums.count,
+                type: "smart",
+                error: nil
+            )
+        }
+    }
+
+    private func deduplicatedTracks(_ tracks: [Track]) -> [Track] {
+        var seenKeys = Set<String>()
+        return tracks.filter { track in
+            let key = track.catalogID?.nonEmpty
+                ?? "\(track.title.searchNormalized).\(track.artist.searchNormalized)"
+            return seenKeys.insert(key).inserted
+        }
+    }
+
+    private func radioScore(_ track: Track, seed: Track) -> Int {
+        var score = track.rank ?? 0
+        if track.artist.localizedCaseInsensitiveCompare(seed.artist) == .orderedSame {
+            score += 900_000
+        }
+        if track.album.localizedCaseInsensitiveCompare(seed.album) == .orderedSame {
+            score += 280_000
+        }
+        if track.id == seed.id {
+            score -= 3_000_000
+        }
+        return score
+    }
+
+    private func searchCacheKey(term: String, scope: SearchScope) -> String {
+        "\(scope.rawValue).\(term.searchNormalized)"
+    }
+
+    private func storeSearchResults(_ results: [Track], for key: String) {
+        if searchCache.count > 80 {
+            searchCache.removeAll(keepingCapacity: true)
+        }
+        searchCache[key] = results
     }
 
     private func cleanupLastPlaybackFile(except currentURL: URL? = nil) {

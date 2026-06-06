@@ -1,9 +1,50 @@
 import Foundation
 
+enum PlayerSection: String, CaseIterable, Identifiable {
+    case studio = "Studio"
+    case wave = "Wave"
+    case library = "Library"
+    case favourites = "Favourites"
+
+    var id: String { rawValue }
+
+    var systemImage: String {
+        switch self {
+        case .studio:
+            "music.quarternote.3"
+        case .wave:
+            "dot.radiowaves.left.and.right"
+        case .library:
+            "rectangle.stack"
+        case .favourites:
+            "heart"
+        }
+    }
+}
+
+enum UtilityPanelMode: String, Identifiable {
+    case lyrics = "Lyrics"
+    case queue = "Queue"
+
+    var id: String { rawValue }
+
+    var systemImage: String {
+        switch self {
+        case .lyrics:
+            "text.quote"
+        case .queue:
+            "text.line.last.and.arrowtriangle.forward"
+        }
+    }
+}
+
 @MainActor
 final class PlayerStore: ObservableObject {
+    @Published var selectedSection: PlayerSection = .studio
+    @Published var utilityPanelMode: UtilityPanelMode?
     @Published private(set) var featuredTracks: [Track] = []
     @Published private(set) var visibleTracks: [Track] = []
+    @Published private(set) var waveTracks: [Track] = []
     @Published private(set) var queue: [Track] = []
     @Published private(set) var currentTrack: Track?
     @Published private(set) var playbackState: PlaybackState = .idle
@@ -11,13 +52,15 @@ final class PlayerStore: ObservableObject {
     @Published private(set) var providerStatus = ProviderStatus.disconnected
     @Published private(set) var isSearching = false
     @Published private(set) var isLoadingFeaturedTracks = false
+    @Published private(set) var isLoadingWave = false
     @Published private(set) var isConfiguringBackendSession = false
     @Published private(set) var errorMessage: String?
     @Published private(set) var resultTitle = "Catalog Tracks"
     @Published private(set) var resultSubtitle: String?
+    @Published private(set) var favouriteTrackIDs: Set<String> = []
 
     @Published var searchQuery = ""
-    @Published var selectedScope: SearchScope = .catalog
+    @Published var selectedSearchScope: SearchScope = .smart
     @Published var progress: TimeInterval = 0
     @Published var volume: Double = 0.78
 
@@ -27,9 +70,16 @@ final class PlayerStore: ObservableObject {
     private var playbackTask: Task<Void, Never>?
     private var progressTask: Task<Void, Never>?
     private var lyricsTask: Task<Void, Never>?
+    private var waveTask: Task<Void, Never>?
+    private var playbackContext: [Track] = []
+    private var recentlyPlayedIDs: [String] = []
+    private let favouritesStorageKey = "Noirwave.favouriteTrackIDs"
 
     init(provider: MusicProviding) {
         self.provider = provider
+        if let savedIDs = UserDefaults.standard.array(forKey: favouritesStorageKey) as? [String] {
+            favouriteTrackIDs = Set(savedIDs)
+        }
     }
 
     var needsBackendSession: Bool {
@@ -47,6 +97,7 @@ final class PlayerStore: ObservableObject {
         playbackTask?.cancel()
         progressTask?.cancel()
         lyricsTask?.cancel()
+        waveTask?.cancel()
     }
 
     func bootstrap() async {
@@ -69,12 +120,40 @@ final class PlayerStore: ObservableObject {
 
     func updateSearchQuery(_ query: String) {
         searchQuery = query
+        if query.trimmed.isEmpty {
+            visibleTracks = featuredTracks
+            resultTitle = "Catalog Tracks"
+            resultSubtitle = nil
+        }
         scheduleSearch()
     }
 
-    func setScope(_ scope: SearchScope) {
-        selectedScope = scope
-        scheduleSearch()
+    func selectSection(_ section: PlayerSection) {
+        selectedSection = section
+
+        if !searchQuery.trimmed.isEmpty {
+            searchQuery = ""
+            searchTask?.cancel()
+            isSearching = false
+        }
+
+        if section == .wave, waveTracks.isEmpty {
+            refreshWave()
+        }
+    }
+
+    func toggleUtilityPanel(_ mode: UtilityPanelMode) {
+        utilityPanelMode = utilityPanelMode == mode ? nil : mode
+    }
+
+    func closeUtilityPanel() {
+        utilityPanelMode = nil
+    }
+
+    func selectSearchScope(_ scope: SearchScope) {
+        selectedSearchScope = scope
+        guard !searchQuery.trimmed.isEmpty else { return }
+        scheduleSearch(delay: .milliseconds(60))
     }
 
     func activate(_ item: Track) {
@@ -140,10 +219,13 @@ final class PlayerStore: ObservableObject {
             return
         }
 
+        seedPlaybackContext(for: track)
+
         playbackTask?.cancel()
         progressTask?.cancel()
 
         currentTrack = track
+        rememberPlayed(track)
         progress = 0
         playbackState = .loading
         errorMessage = nil
@@ -215,27 +297,28 @@ final class PlayerStore: ObservableObject {
             return
         }
 
-        guard let currentTrack,
-              let index = featuredTracks.firstIndex(of: currentTrack),
-              !featuredTracks.isEmpty
-        else { return }
+        guard let currentTrack else { return }
 
-        let nextIndex = featuredTracks.index(after: index) % featuredTracks.count
-        play(featuredTracks[nextIndex])
+        if let nextTrack = nextContextTrack(after: currentTrack) {
+            play(nextTrack)
+            refillQueue(after: nextTrack)
+        } else {
+            refreshWave()
+        }
     }
 
     func previous() {
         guard progress < 4,
               let currentTrack,
-              let index = featuredTracks.firstIndex(of: currentTrack),
-              !featuredTracks.isEmpty
+              let index = playbackContext.firstIndex(of: currentTrack),
+              !playbackContext.isEmpty
         else {
             progress = 0
             return
         }
 
-        let previousIndex = index == featuredTracks.startIndex ? featuredTracks.count - 1 : index - 1
-        play(featuredTracks[previousIndex])
+        let previousIndex = index == playbackContext.startIndex ? playbackContext.count - 1 : index - 1
+        play(playbackContext[previousIndex])
     }
 
     func enqueue(_ track: Track) {
@@ -250,6 +333,10 @@ final class PlayerStore: ObservableObject {
         queue.removeAll { $0 == track }
     }
 
+    func clearQueue() {
+        queue.removeAll()
+    }
+
     func seek(to fraction: Double) {
         guard let duration = currentTrack?.duration else { return }
         progress = min(max(fraction, 0), 1) * duration
@@ -260,11 +347,76 @@ final class PlayerStore: ObservableObject {
         }
     }
 
-    private func scheduleSearch() {
+    func seek(toTime time: TimeInterval) {
+        guard let currentTrack else { return }
+        progress = min(max(time, 0), currentTrack.duration)
+
+        let targetTime = progress
+        Task {
+            await provider.seek(to: targetTime)
+        }
+    }
+
+    func toggleFavourite(_ track: Track) {
+        guard track.isPlayable else { return }
+
+        if favouriteTrackIDs.contains(track.id) {
+            favouriteTrackIDs.remove(track.id)
+        } else {
+            favouriteTrackIDs.insert(track.id)
+        }
+
+        UserDefaults.standard.set(Array(favouriteTrackIDs).sorted(), forKey: favouritesStorageKey)
+    }
+
+    func isFavourite(_ track: Track) -> Bool {
+        favouriteTrackIDs.contains(track.id)
+    }
+
+    var favouriteTracks: [Track] {
+        let candidates = ([currentTrack].compactMap(\.self) + featuredTracks + visibleTracks + waveTracks + queue)
+            .filter(\.isPlayable)
+        var seenIDs = Set<String>()
+        let uniqueTracks = candidates.filter { seenIDs.insert($0.id).inserted }
+        return uniqueTracks.filter { favouriteTrackIDs.contains($0.id) }
+    }
+
+    func refreshWave() {
+        waveTask?.cancel()
+        isLoadingWave = true
+        errorMessage = nil
+
+        let seed = currentTrack ?? featuredTracks.first
+        let excludedIDs = Set(([currentTrack].compactMap(\.self) + queue + Array(waveTracks.prefix(8))).map(\.id))
+
+        waveTask = Task { [weak self] in
+            guard let self else { return }
+
+            do {
+                let tracks = try await provider.radioTracks(seed: seed)
+                    .filter(\.isPlayable)
+                    .filter { !excludedIDs.contains($0.id) }
+                guard !Task.isCancelled else { return }
+
+                waveTracks = tracks.isEmpty
+                    ? featuredTracks.filter { !excludedIDs.contains($0.id) }
+                    : tracks
+                refillQueueFromWave()
+            } catch {
+                guard !Task.isCancelled else { return }
+                waveTracks = featuredTracks.filter { !excludedIDs.contains($0.id) }
+                errorMessage = error.localizedDescription
+            }
+
+            isLoadingWave = false
+        }
+    }
+
+    private func scheduleSearch(delay: Duration = .milliseconds(180)) {
         searchTask?.cancel()
 
         searchTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(180))
+            try? await Task.sleep(for: delay)
             guard let self, !Task.isCancelled else { return }
             await runSearch()
         }
@@ -285,15 +437,23 @@ final class PlayerStore: ObservableObject {
         isSearching = true
         defer { isSearching = false }
 
+        let scope = selectedSearchScope
+
         do {
-            let results = try await provider.search(term, scope: selectedScope)
+            let results = try await provider.search(term, scope: scope)
+            guard searchQuery.trimmed == term,
+                  selectedSearchScope == scope
+            else { return }
             visibleTracks = results
-            resultTitle = selectedScope.resultsTitle
+            resultTitle = scope.resultsTitle
             resultSubtitle = nil
             errorMessage = nil
         } catch {
+            guard searchQuery.trimmed == term,
+                  selectedSearchScope == scope
+            else { return }
             visibleTracks = []
-            resultTitle = selectedScope.resultsTitle
+            resultTitle = scope.resultsTitle
             resultSubtitle = nil
             errorMessage = error.localizedDescription
         }
@@ -301,7 +461,6 @@ final class PlayerStore: ObservableObject {
 
     private func drillIntoCatalog(from item: Track) {
         searchTask?.cancel()
-        selectedScope = .catalog
         searchQuery = item.title
         resultTitle = item.title
         resultSubtitle = item.detailLabel
@@ -383,6 +542,7 @@ final class PlayerStore: ObservableObject {
             resultSubtitle = nil
         }
         currentTrack = tracks.first
+        playbackContext = tracks.filter(\.isPlayable)
         queue = Array(tracks.dropFirst().filter(\.isPlayable).prefix(5))
         progress = 0
         playbackState = .idle
@@ -391,6 +551,17 @@ final class PlayerStore: ObservableObject {
         } else {
             lyricsTask?.cancel()
             lyricsState = .idle
+        }
+    }
+
+    private func refillQueueFromWave() {
+        guard queue.count < 5 else { return }
+
+        for track in waveTracks where track != currentTrack && !queue.contains(track) {
+            queue.append(track)
+            if queue.count >= 5 {
+                return
+            }
         }
     }
 
@@ -439,13 +610,65 @@ final class PlayerStore: ObservableObject {
     }
 
     private func refillQueue(after track: Track) {
-        guard queue.count < 4,
-              let index = featuredTracks.firstIndex(of: track),
-              !featuredTracks.isEmpty
-        else { return }
+        guard queue.count < 5 else { return }
 
-        let candidate = featuredTracks[(index + 3) % featuredTracks.count]
-        enqueue(candidate)
+        let excludedIDs = Set(([track, currentTrack].compactMap(\.self) + queue).map(\.id) + recentlyPlayedIDs)
+        let candidates = playbackContext + waveTracks + featuredTracks
+
+        for candidate in candidates where candidate.isPlayable && !excludedIDs.contains(candidate.id) {
+            enqueue(candidate)
+            if queue.count >= 5 {
+                return
+            }
+        }
+
+        if queue.count < 3 {
+            refreshWave()
+        }
+    }
+
+    private func seedPlaybackContext(for track: Track) {
+        let source: [Track]
+        switch selectedSection {
+        case .wave:
+            source = waveTracks
+        case .favourites:
+            source = favouriteTracks
+        case .studio, .library:
+            source = visibleTracks.isEmpty ? featuredTracks : visibleTracks
+        }
+
+        var seenIDs = Set<String>()
+        let playable = source
+            .filter(\.isPlayable)
+            .filter { seenIDs.insert($0.id).inserted }
+
+        if playable.contains(track) {
+            playbackContext = playable
+        } else if !playable.isEmpty {
+            playbackContext = [track] + playable
+        } else {
+            playbackContext = [track]
+        }
+    }
+
+    private func nextContextTrack(after track: Track) -> Track? {
+        guard let index = playbackContext.firstIndex(of: track), !playbackContext.isEmpty else {
+            return playbackContext.first { $0 != track }
+        }
+
+        let excludedIDs = Set(recentlyPlayedIDs.suffix(6))
+        let wrapped = Array(playbackContext.dropFirst(index + 1)) + Array(playbackContext.prefix(index))
+        return wrapped.first { $0 != track && !excludedIDs.contains($0.id) }
+            ?? wrapped.first { $0 != track }
+    }
+
+    private func rememberPlayed(_ track: Track) {
+        recentlyPlayedIDs.removeAll { $0 == track.id }
+        recentlyPlayedIDs.append(track.id)
+        if recentlyPlayedIDs.count > 16 {
+            recentlyPlayedIDs.removeFirst(recentlyPlayedIDs.count - 16)
+        }
     }
 
     private func messageNeedsBackendSession(_ message: String?) -> Bool {

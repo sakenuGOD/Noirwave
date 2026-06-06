@@ -4,6 +4,7 @@ import { loadDeemixModules } from "./deemixModules.mjs";
 import { readARL, setRuntimeARL } from "./session.mjs";
 import { parseRangeHeader, streamDeezerMedia } from "./streaming.mjs";
 import { normalizeLyricsPayload } from "./lyricsMapper.mjs";
+import { normalizeCatalogLimit } from "./requestLimits.mjs";
 
 const app = express();
 const port = Number(process.env.NOIRWAVE_BACKEND_PORT ?? 6605);
@@ -19,10 +20,44 @@ const bitrateByFormat = new Map([
 let sdkState = null;
 const mediaURLCache = new Map();
 const trackMediaCache = new Map();
+const catalogResponseCache = new Map();
+const catalogInFlight = new Map();
+const catalogCacheTTL = 20_000;
 
 app.use(express.json());
 
 const isValidTrackId = (value) => /^\d+$/.test(String(value ?? ""));
+
+const cachedCatalogCall = async (args, options = {}) => {
+  const sessionKey = readARL()?.slice(-12) ?? "no-session";
+  const cacheKey = `${sessionKey}:${JSON.stringify(args)}`;
+  const cached = catalogResponseCache.get(cacheKey);
+  if (cached?.expiresAt > Date.now()) return cached.payload;
+  if (catalogInFlight.has(cacheKey)) return await catalogInFlight.get(cacheKey);
+
+  const promise = callCatalog(args, options)
+    .then((payload) => {
+      catalogResponseCache.set(cacheKey, {
+        payload,
+        expiresAt: Date.now() + catalogCacheTTL,
+      });
+      if (catalogResponseCache.size > 120) {
+        const now = Date.now();
+        for (const [key, value] of catalogResponseCache) {
+          if (value.expiresAt <= now || catalogResponseCache.size > 80) {
+            catalogResponseCache.delete(key);
+          }
+        }
+      }
+      return payload;
+    })
+    .finally(() => {
+      catalogInFlight.delete(cacheKey);
+    });
+
+  catalogInFlight.set(cacheKey, promise);
+  return await promise;
+};
 
 const normalizeFormat = (value) => {
   const requestedFormat = String(value ?? preferredFormat).trim();
@@ -269,6 +304,8 @@ app.post("/api/loginArl", asyncHandler(async (request, response) => {
   sdkState = null;
   mediaURLCache.clear();
   trackMediaCache.clear();
+  catalogResponseCache.clear();
+  catalogInFlight.clear();
 
   const sdk = await ensureSDK();
   response.json({
@@ -286,14 +323,19 @@ app.post("/api/loginArl", asyncHandler(async (request, response) => {
 
 app.get("/api/search", asyncHandler(async (request, response) => {
   const term = String(request.query.term ?? "").trim();
-  const scope = String(request.query.type ?? "track");
-  const count = Number(request.query.nb ?? 30);
+  const scope = String(request.query.type ?? "track").trim().toLowerCase();
+  const count = normalizeCatalogLimit(request.query.nb);
+  if (!["track", "artist", "album", "smart"].includes(scope)) {
+    response.status(400).json({ result: false, errid: "InvalidSearchType", error: "type must be smart, track, artist, or album" });
+    return;
+  }
+
   if (!term) {
     response.json({ data: [], total: 0, type: scope });
     return;
   }
 
-  response.json(await callCatalog([
+  response.json(await cachedCatalogCall([
     "search",
     "--query",
     term,
@@ -312,7 +354,7 @@ app.get("/api/getTracklist", asyncHandler(async (request, response) => {
     return;
   }
 
-  response.json(await callCatalog([type, "--id", id], { timeoutMs: 30000 }));
+  response.json(await cachedCatalogCall([type, "--id", id], { timeoutMs: 30000 }));
 }));
 
 app.get("/api/trackMedia/:trackId", asyncHandler(async (request, response) => {
@@ -321,7 +363,7 @@ app.get("/api/trackMedia/:trackId", asyncHandler(async (request, response) => {
     return;
   }
 
-  response.json(await callCatalog(["track-media", "--id", request.params.trackId]));
+  response.json(await cachedCatalogCall(["track-media", "--id", request.params.trackId]));
 }));
 
 app.get("/api/lyrics/:trackId", asyncHandler(async (request, response) => {
@@ -330,7 +372,7 @@ app.get("/api/lyrics/:trackId", asyncHandler(async (request, response) => {
     return;
   }
 
-  const payload = await callCatalog(["lyrics", "--id", request.params.trackId], { timeoutMs: 22000 });
+  const payload = await cachedCatalogCall(["lyrics", "--id", request.params.trackId], { timeoutMs: 22000 });
   response.json(normalizeLyricsPayload(payload, request.params.trackId));
 }));
 

@@ -10,6 +10,13 @@ from typing import Any
 
 from deezer_python_gql import DeezerGQLClient
 
+CATALOG_DEFAULT_LIMIT = 80
+CATALOG_MAX_LIMIT = 500
+SMART_ALBUM_LIMIT = 180
+SMART_ARTIST_LIMIT = 120
+DETAIL_PAGE_LIMIT = 100
+DETAIL_SAFETY_LIMIT = 1000
+
 
 def read_arl() -> str:
     from_env = os.environ.get("NOIRWAVE_DEEZER_ARL", "").strip()
@@ -63,7 +70,7 @@ def artist_payload(artist: Any, album_count: int | None = None) -> dict[str, Any
         "picture_xl": picture,
         "nb_album": album_count,
         "nb_fan": getattr(artist, "fans_count", None),
-        "tracklist": f"https://api.deezer.com/artist/{artist_id}/top?limit=50" if artist_id else None,
+        "tracklist": f"https://api.deezer.com/artist/{artist_id}/top?limit={DETAIL_SAFETY_LIMIT}" if artist_id else None,
     }
 
 
@@ -133,7 +140,7 @@ def track_payload(track: Any, fallback_index: int = 0, album_context: Any | None
             "picture_xl": None,
             "nb_album": None,
             "nb_fan": None,
-            "tracklist": f"https://api.deezer.com/artist/{artist.get('id')}/top?limit=50" if artist.get("id") else None,
+            "tracklist": f"https://api.deezer.com/artist/{artist.get('id')}/top?limit={DETAIL_SAFETY_LIMIT}" if artist.get("id") else None,
         }
         if artist
         else None,
@@ -161,11 +168,102 @@ def track_payload(track: Any, fallback_index: int = 0, album_context: Any | None
 
 async def enrich_artist(client: DeezerGQLClient, artist: Any) -> dict[str, Any]:
     try:
-        detail = await client.get_artist(str(artist.id), top_tracks_first=0, albums_first=100)
+        detail = await client.get_artist(str(artist.id), top_tracks_first=0, albums_first=DETAIL_PAGE_LIMIT)
         album_count = len(getattr(getattr(detail, "albums", None), "edges", []) or []) if detail else None
         return artist_payload(detail or artist, album_count=album_count)
     except Exception:
         return artist_payload(artist)
+
+
+def connection_edges(connection: Any) -> list[Any]:
+    return list(getattr(connection, "edges", []) or [])
+
+
+def connection_page_info(connection: Any) -> Any | None:
+    return getattr(connection, "page_info", None)
+
+
+def connection_has_next(connection: Any) -> bool:
+    return bool(getattr(connection_page_info(connection), "has_next_page", False))
+
+
+def connection_end_cursor(connection: Any) -> str | None:
+    return getattr(connection_page_info(connection), "end_cursor", None)
+
+
+async def fetch_all_artist_detail(client: DeezerGQLClient, artist_id: str) -> tuple[Any, list[Any], list[Any]]:
+    artist = await client.get_artist(
+        artist_id,
+        top_tracks_first=DETAIL_PAGE_LIMIT,
+        albums_first=DETAIL_PAGE_LIMIT,
+    )
+    if artist is None:
+        raise ValueError("Artist not found")
+
+    top_edges = connection_edges(getattr(artist, "top_tracks", None))
+    album_edges = connection_edges(getattr(artist, "albums", None))
+
+    top_connection = getattr(artist, "top_tracks", None)
+    top_cursor = connection_end_cursor(top_connection)
+    top_has_next = connection_has_next(top_connection)
+    while top_has_next and top_cursor and len(top_edges) < DETAIL_SAFETY_LIMIT:
+        page = await client.get_artist(
+            artist_id,
+            top_tracks_first=min(DETAIL_PAGE_LIMIT, DETAIL_SAFETY_LIMIT - len(top_edges)),
+            top_tracks_after=top_cursor,
+            albums_first=0,
+        )
+        if page is None:
+            break
+        top_connection = getattr(page, "top_tracks", None)
+        top_edges.extend(connection_edges(top_connection))
+        top_has_next = connection_has_next(top_connection)
+        top_cursor = connection_end_cursor(top_connection)
+
+    album_connection = getattr(artist, "albums", None)
+    album_cursor = connection_end_cursor(album_connection)
+    album_has_next = connection_has_next(album_connection)
+    while album_has_next and album_cursor and len(album_edges) < DETAIL_SAFETY_LIMIT:
+        page = await client.get_artist(
+            artist_id,
+            top_tracks_first=0,
+            albums_first=min(DETAIL_PAGE_LIMIT, DETAIL_SAFETY_LIMIT - len(album_edges)),
+            albums_after=album_cursor,
+        )
+        if page is None:
+            break
+        album_connection = getattr(page, "albums", None)
+        album_edges.extend(connection_edges(album_connection))
+        album_has_next = connection_has_next(album_connection)
+        album_cursor = connection_end_cursor(album_connection)
+
+    return artist, top_edges, album_edges
+
+
+async def fetch_all_album_detail(client: DeezerGQLClient, album_id: str) -> tuple[Any, list[Any]]:
+    album = await client.get_album(album_id, tracks_first=DETAIL_PAGE_LIMIT)
+    if album is None:
+        raise ValueError("Album not found")
+
+    track_connection = getattr(album, "tracks", None)
+    track_edges = connection_edges(track_connection)
+    cursor = connection_end_cursor(track_connection)
+    has_next = connection_has_next(track_connection)
+
+    while has_next and cursor and len(track_edges) < DETAIL_SAFETY_LIMIT:
+        page = await client.get_album(
+            album_id,
+            tracks_first=min(DETAIL_PAGE_LIMIT, DETAIL_SAFETY_LIMIT - len(track_edges)),
+            tracks_after=cursor,
+        )
+        if page is None:
+            break
+        track_connection = getattr(page, "tracks", None)
+        track_edges.extend(connection_edges(track_connection))
+        has_next = connection_has_next(track_connection)
+        cursor = connection_end_cursor(track_connection)
+
+    return album, track_edges
 
 
 async def status(client: DeezerGQLClient) -> dict[str, Any]:
@@ -183,6 +281,41 @@ async def status(client: DeezerGQLClient) -> dict[str, Any]:
 
 
 async def search(client: DeezerGQLClient, query: str, scope: str, limit: int) -> dict[str, Any]:
+    limit = min(max(limit, 1), CATALOG_MAX_LIMIT)
+    if scope == "smart":
+        result = await client.search(
+            query=query,
+            tracks_first=limit,
+            albums_first=min(limit, SMART_ALBUM_LIMIT),
+            artists_first=min(limit, SMART_ARTIST_LIMIT),
+            playlists_first=0,
+            livestreams_first=0,
+            podcasts_first=0,
+        )
+        results = result.results
+        tracks = [
+            track_payload(edge.node, index)
+            for index, edge in enumerate(results.tracks.edges)
+            if edge.node is not None
+        ]
+        albums = [
+            album_payload(edge.node)
+            for edge in results.albums.edges
+            if edge.node is not None
+        ]
+        artists = [
+            artist_payload(edge.node)
+            for edge in results.artists.edges
+            if edge.node is not None
+        ]
+        return {
+            "type": "smart",
+            "total": len(tracks) + len(albums) + len(artists),
+            "tracks": tracks,
+            "albums": albums,
+            "artists": artists,
+        }
+
     result = await client.search(
         query=query,
         tracks_first=limit if scope == "track" else 0,
@@ -204,29 +337,26 @@ async def search(client: DeezerGQLClient, query: str, scope: str, limit: int) ->
 
     if scope == "album":
         albums = [
-            album_payload(edge.node, index)
+            album_payload(edge.node)
             for index, edge in enumerate(results.albums.edges)
             if edge.node is not None
         ]
         return {"data": albums, "total": len(albums), "type": "album"}
 
-    artists = [
-        edge.node
+    enriched = [
+        artist_payload(edge.node)
         for edge in results.artists.edges
         if edge.node is not None
     ]
-    enriched = await asyncio.gather(*(enrich_artist(client, artist) for artist in artists[:limit]))
     return {"data": enriched, "total": len(enriched), "type": "artist"}
 
 
 async def artist_detail(client: DeezerGQLClient, artist_id: str) -> dict[str, Any]:
-    artist = await client.get_artist(artist_id, top_tracks_first=50, albums_first=100)
-    if artist is None:
-        raise ValueError("Artist not found")
+    artist, top_edges, album_edges = await fetch_all_artist_detail(client, artist_id)
 
-    artist_data = artist_payload(artist, album_count=len(artist.albums.edges))
-    albums = [album_payload(edge.node, artist_context={"id": artist.id, "name": artist.name}) for edge in artist.albums.edges if edge.node]
-    top_tracks = [track_payload(edge.node, index) for index, edge in enumerate(artist.top_tracks.edges if artist.top_tracks else []) if edge.node]
+    artist_data = artist_payload(artist, album_count=len(album_edges))
+    albums = [album_payload(edge.node, artist_context={"id": artist.id, "name": artist.name}) for edge in album_edges if edge.node]
+    top_tracks = [track_payload(edge.node, index) for index, edge in enumerate(top_edges) if edge.node]
     return {
         **artist_data,
         "releases": {"all": albums},
@@ -235,12 +365,10 @@ async def artist_detail(client: DeezerGQLClient, artist_id: str) -> dict[str, An
 
 
 async def album_detail(client: DeezerGQLClient, album_id: str) -> dict[str, Any]:
-    album = await client.get_album(album_id, tracks_first=100)
-    if album is None:
-        raise ValueError("Album not found")
+    album, track_edges = await fetch_all_album_detail(client, album_id)
 
     data = album_payload(album)
-    tracks = [track_payload(edge.node, index, album_context=album) for index, edge in enumerate(album.tracks.edges) if edge.node]
+    tracks = [track_payload(edge.node, index, album_context=album) for index, edge in enumerate(track_edges) if edge.node]
     return {
         **data,
         "tracks": tracks,
@@ -315,8 +443,8 @@ async def main() -> None:
 
     search_parser = subcommands.add_parser("search")
     search_parser.add_argument("--query", required=True)
-    search_parser.add_argument("--scope", choices=["track", "artist", "album"], required=True)
-    search_parser.add_argument("--limit", type=int, default=30)
+    search_parser.add_argument("--scope", choices=["track", "artist", "album", "smart"], required=True)
+    search_parser.add_argument("--limit", type=int, default=CATALOG_DEFAULT_LIMIT)
 
     artist_parser = subcommands.add_parser("artist")
     artist_parser.add_argument("--id", required=True)
