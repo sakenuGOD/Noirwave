@@ -828,6 +828,26 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         )
     }
 
+    func testNoirwavePrimaryAccentUsesMintCyan() {
+        XCTAssertEqual(NoirwaveTheme.primaryAccentHex, "#5EE0C2")
+        XCTAssertEqual(TrackPalette.fallback.accentHex, NoirwaveTheme.primaryAccentHex)
+    }
+
+    func testLibrarySurfaceLayoutPlacesPlaylistsAtBottom() {
+        XCTAssertEqual(
+            LibrarySurfaceLayout.sections(hasTracks: true, hasSavedCollections: true, hasLocalPlaylists: true),
+            [.collections, .favoriteTracks, .playlists]
+        )
+        XCTAssertEqual(
+            LibrarySurfaceLayout.sections(hasTracks: false, hasSavedCollections: true, hasLocalPlaylists: true),
+            [.collections, .playlists]
+        )
+        XCTAssertEqual(
+            LibrarySurfaceLayout.sections(hasTracks: false, hasSavedCollections: false, hasLocalPlaylists: true),
+            [.playlists]
+        )
+    }
+
     func testLibraryTrackOrganizerSortsByTitleArtistAlbumAndDuration() {
         let slowdive = Self.makeLibraryTrack(1, title: "Alison", artist: "Slowdive", album: "Souvlaki", duration: 171)
         let aphex = Self.makeLibraryTrack(2, title: "Xtal", artist: "Aphex Twin", album: "Selected Ambient Works 85-92", duration: 293)
