@@ -524,6 +524,11 @@ final class PlayerStore: ObservableObject {
         return playlist
     }
 
+    @discardableResult
+    func createPlaylist(title: String, track: Track) -> LocalPlaylist {
+        createPlaylist(title: title, tracks: [track])
+    }
+
     func renamePlaylist(playlistID: String, title: String) {
         updatePlaylist(playlistID: playlistID) { playlist in
             _ = playlist.rename(to: title)
