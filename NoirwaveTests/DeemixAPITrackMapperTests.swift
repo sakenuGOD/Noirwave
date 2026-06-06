@@ -821,6 +821,45 @@ final class DeemixAPITrackMapperTests: XCTestCase {
     }
 
     @MainActor
+    func testSavedCollectionsPersistNewestFirstAcrossStoreInstances() {
+        let defaults = Self.makeIsolatedDefaults(name: "saved-collections-order")
+        let album = Self.makeAlbum(id: "10", title: "Souvlaki", trackCount: 10, releaseDate: "1993-05-17", recordType: "album")
+        let artist = Self.makeArtist(id: "20", title: "Slowdive", albumCount: 6)
+        let store = PlayerStore(provider: PrewarmRecordingProvider(tracks: []), userDefaults: defaults)
+
+        XCTAssertFalse(store.isSavedCollection(album))
+
+        store.toggleSavedCollection(album)
+        store.toggleSavedCollection(artist)
+
+        XCTAssertTrue(store.isSavedCollection(album))
+        XCTAssertTrue(store.isSavedCollection(artist))
+        XCTAssertEqual(store.savedCollections().map(\.id), [artist.id, album.id])
+
+        let restoredStore = PlayerStore(provider: PrewarmRecordingProvider(tracks: []), userDefaults: defaults)
+
+        XCTAssertTrue(restoredStore.isSavedCollection(album))
+        XCTAssertEqual(restoredStore.savedCollections().map(\.id), [artist.id, album.id])
+
+        restoredStore.toggleSavedCollection(album)
+
+        XCTAssertFalse(restoredStore.isSavedCollection(album))
+        XCTAssertEqual(restoredStore.savedCollections().map(\.id), [artist.id])
+    }
+
+    @MainActor
+    func testSavedCollectionsIgnorePlayableTracks() {
+        let defaults = Self.makeIsolatedDefaults(name: "saved-collections-ignore-tracks")
+        let track = Self.makeLibraryTrack(1, title: "Only Shallow", artist: "My Bloody Valentine", album: "Loveless")
+        let store = PlayerStore(provider: PrewarmRecordingProvider(tracks: [track]), userDefaults: defaults)
+
+        store.toggleSavedCollection(track)
+
+        XCTAssertFalse(store.isSavedCollection(track))
+        XCTAssertTrue(store.savedCollections().isEmpty)
+    }
+
+    @MainActor
     func testVolumeIsClampedAndForwardedToProvider() {
         let provider = PrewarmRecordingProvider(tracks: [])
         let store = PlayerStore(provider: provider)
@@ -1153,6 +1192,21 @@ final class DeemixAPITrackMapperTests: XCTestCase {
             trackCount: trackCount,
             releaseDate: releaseDate,
             recordType: recordType
+        )
+    }
+
+    private static func makeArtist(id: String, title: String, albumCount: Int) -> Track {
+        Track(
+            id: "deemix-artist.\(id)",
+            title: title,
+            artist: title,
+            album: "Artist",
+            duration: 0,
+            palette: .fallback,
+            catalogID: "https://www.deezer.com/artist/\(id)",
+            previewURL: nil,
+            kind: .artist,
+            albumCount: albumCount
         )
     }
 }
