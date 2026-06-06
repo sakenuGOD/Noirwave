@@ -106,6 +106,118 @@ struct Track: Codable, Identifiable, Hashable {
     }
 }
 
+struct LocalPlaylist: Codable, Identifiable, Hashable {
+    static let fallbackTitle = "New Playlist"
+
+    let id: String
+    var title: String
+    var trackIDs: [String]
+    var trackSnapshots: [String: Track]
+    let createdAt: Date
+    var updatedAt: Date
+
+    init(
+        id: String = UUID().uuidString,
+        title: String,
+        tracks: [Track] = [],
+        createdAt: Date = Date(),
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.title = Self.normalizedTitle(title)
+        self.trackIDs = []
+        self.trackSnapshots = [:]
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        append(tracks, updatedAt: updatedAt)
+    }
+
+    var trackCount: Int {
+        trackIDs.count
+    }
+
+    var artworkTracks: [Track] {
+        Array(orderedTracks(preferredTracks: []).prefix(4))
+    }
+
+    func orderedTracks(preferredTracks: [Track]) -> [Track] {
+        let trackedIDs = Set(trackIDs)
+        var trackByID = trackSnapshots.filter { trackedIDs.contains($0.key) }
+        for track in preferredTracks where trackedIDs.contains(track.id) {
+            trackByID[track.id] = track
+        }
+
+        var seenIDs: Set<String> = []
+        return trackIDs.compactMap { id in
+            guard seenIDs.insert(id).inserted,
+                  let track = trackByID[id],
+                  track.isPlayable
+            else { return nil }
+
+            return track
+        }
+    }
+
+    mutating func rename(to title: String, updatedAt: Date = Date()) -> Bool {
+        let normalizedTitle = Self.normalizedTitle(title)
+        guard normalizedTitle != self.title else { return false }
+
+        self.title = normalizedTitle
+        self.updatedAt = updatedAt
+        return true
+    }
+
+    mutating func append(_ track: Track, updatedAt: Date = Date()) -> Bool {
+        append([track], updatedAt: updatedAt)
+    }
+
+    @discardableResult
+    mutating func append(_ tracks: [Track], updatedAt: Date = Date()) -> Bool {
+        var changed = false
+        var existingIDs = Set(trackIDs)
+
+        for track in tracks {
+            guard track.isPlayable,
+                  existingIDs.insert(track.id).inserted
+            else { continue }
+
+            trackIDs.append(track.id)
+            trackSnapshots[track.id] = track
+            changed = true
+        }
+
+        if changed {
+            self.updatedAt = updatedAt
+        }
+
+        return changed
+    }
+
+    @discardableResult
+    mutating func remove(_ track: Track, updatedAt: Date = Date()) -> Bool {
+        let originalCount = trackIDs.count
+        trackIDs.removeAll { $0 == track.id }
+        trackSnapshots.removeValue(forKey: track.id)
+        guard trackIDs.count != originalCount else { return false }
+
+        self.updatedAt = updatedAt
+        return true
+    }
+
+    mutating func normalize() {
+        title = Self.normalizedTitle(title)
+
+        var seenIDs: Set<String> = []
+        trackIDs = trackIDs.filter { seenIDs.insert($0).inserted }
+        let validIDs = Set(trackIDs)
+        trackSnapshots = trackSnapshots.filter { validIDs.contains($0.key) && $0.value.isPlayable }
+    }
+
+    static func normalizedTitle(_ title: String) -> String {
+        title.nonEmpty ?? fallbackTitle
+    }
+}
+
 struct ArtistReleaseGroups: Equatable {
     let studioAlbums: [Track]
     let otherReleases: [Track]

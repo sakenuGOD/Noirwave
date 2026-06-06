@@ -24,6 +24,7 @@ final class PlayerStore: ObservableObject {
     @Published private(set) var savedCollectionIDs: Set<String> = []
     @Published private(set) var savedCollectionOrder: [String] = []
     @Published private(set) var savedCollectionSnapshots: [String: Track] = [:]
+    @Published private(set) var localPlaylists: [LocalPlaylist] = []
     @Published private(set) var listeningScores: [String: Int] = [:]
 
     @Published var searchQuery = ""
@@ -39,6 +40,7 @@ final class PlayerStore: ObservableObject {
     private static let savedCollectionIDsKey = "noirwave.savedCollectionIDs"
     private static let savedCollectionOrderKey = "noirwave.savedCollectionOrder"
     private static let savedCollectionSnapshotsKey = "noirwave.savedCollectionSnapshots"
+    private static let localPlaylistsKey = "noirwave.localPlaylists"
     private static let listeningScoresKey = "noirwave.listeningScores"
     private let playbackContextLimit = 16
     private let userDefaults: UserDefaults
@@ -64,6 +66,7 @@ final class PlayerStore: ObservableObject {
             savedIDs: savedCollectionIDs
         )
         savedCollectionSnapshots = Self.loadSavedCollectionSnapshots(from: userDefaults, savedIDs: savedCollectionIDs)
+        localPlaylists = Self.loadLocalPlaylists(from: userDefaults)
         listeningScores = (userDefaults.dictionary(forKey: Self.listeningScoresKey) ?? [:]).reduce(into: [:]) { result, item in
             if let score = item.value as? Int {
                 result[item.key] = score
@@ -508,6 +511,52 @@ final class PlayerStore: ObservableObject {
         return Array(orderedItems.prefix(limit))
     }
 
+    @discardableResult
+    func createPlaylist(title: String, tracks: [Track] = []) -> LocalPlaylist {
+        let playlist = LocalPlaylist(title: title, tracks: uniquePlayableTracks(in: tracks))
+        localPlaylists.insert(playlist, at: localPlaylists.startIndex)
+        persistLocalPlaylists()
+        return playlist
+    }
+
+    func renamePlaylist(playlistID: String, title: String) {
+        updatePlaylist(playlistID: playlistID) { playlist in
+            _ = playlist.rename(to: title)
+        }
+    }
+
+    func deletePlaylist(playlistID: String) {
+        let originalCount = localPlaylists.count
+        localPlaylists.removeAll { $0.id == playlistID }
+        guard localPlaylists.count != originalCount else { return }
+
+        persistLocalPlaylists()
+    }
+
+    func addToPlaylist(_ track: Track, playlistID: String) {
+        addToPlaylist([track], playlistID: playlistID)
+    }
+
+    func addToPlaylist(_ tracks: [Track], playlistID: String) {
+        let playableTracks = uniquePlayableTracks(in: tracks)
+        guard !playableTracks.isEmpty else { return }
+
+        updatePlaylist(playlistID: playlistID) { playlist in
+            _ = playlist.append(playableTracks)
+        }
+    }
+
+    func removeFromPlaylist(_ track: Track, playlistID: String) {
+        updatePlaylist(playlistID: playlistID) { playlist in
+            _ = playlist.remove(track)
+        }
+    }
+
+    func playlistTracks(playlistID: String) -> [Track] {
+        guard let playlist = localPlaylists.first(where: { $0.id == playlistID }) else { return [] }
+        return playlist.orderedTracks(preferredTracks: knownPlaybackTracks)
+    }
+
     func startWave() {
         let wave = smartWaveTracks(limit: playbackContextLimit)
         guard let firstTrack = wave.first else { return }
@@ -890,6 +939,7 @@ final class PlayerStore: ObservableObject {
         tracks.append(contentsOf: featuredTracks)
         tracks.append(contentsOf: visibleTracks)
         tracks.append(contentsOf: queue)
+        tracks.append(contentsOf: localPlaylists.flatMap { $0.orderedTracks(preferredTracks: []) })
         return uniquePlayableTracks(in: tracks)
     }
 
@@ -1042,6 +1092,22 @@ final class PlayerStore: ObservableObject {
         Self.persistSavedCollectionSnapshots(savedCollectionSnapshots, to: userDefaults)
     }
 
+    private func updatePlaylist(playlistID: String, _ update: (inout LocalPlaylist) -> Void) {
+        guard let index = localPlaylists.firstIndex(where: { $0.id == playlistID }) else { return }
+
+        let originalPlaylist = localPlaylists[index]
+        update(&localPlaylists[index])
+        localPlaylists[index].normalize()
+
+        guard localPlaylists[index] != originalPlaylist else { return }
+        persistLocalPlaylists()
+    }
+
+    private func persistLocalPlaylists() {
+        localPlaylists = Self.normalizedLocalPlaylists(localPlaylists)
+        Self.persistLocalPlaylists(localPlaylists, to: userDefaults)
+    }
+
     private static func normalizedLikedTrackOrder(_ order: [String], likedIDs: Set<String>) -> [String] {
         var seenIDs: Set<String> = []
         var normalizedOrder = order.filter { id in
@@ -1088,6 +1154,30 @@ final class PlayerStore: ObservableObject {
     private static func persistSavedCollectionSnapshots(_ snapshots: [String: Track], to userDefaults: UserDefaults) {
         guard let data = try? JSONEncoder().encode(snapshots) else { return }
         userDefaults.set(data, forKey: Self.savedCollectionSnapshotsKey)
+    }
+
+    private static func loadLocalPlaylists(from userDefaults: UserDefaults) -> [LocalPlaylist] {
+        guard let data = userDefaults.data(forKey: Self.localPlaylistsKey),
+              let playlists = try? JSONDecoder().decode([LocalPlaylist].self, from: data)
+        else { return [] }
+
+        return normalizedLocalPlaylists(playlists)
+    }
+
+    private static func normalizedLocalPlaylists(_ playlists: [LocalPlaylist]) -> [LocalPlaylist] {
+        var seenIDs: Set<String> = []
+        return playlists.compactMap { playlist in
+            guard seenIDs.insert(playlist.id).inserted else { return nil }
+
+            var normalizedPlaylist = playlist
+            normalizedPlaylist.normalize()
+            return normalizedPlaylist
+        }
+    }
+
+    private static func persistLocalPlaylists(_ playlists: [LocalPlaylist], to userDefaults: UserDefaults) {
+        guard let data = try? JSONEncoder().encode(playlists) else { return }
+        userDefaults.set(data, forKey: Self.localPlaylistsKey)
     }
 
     private func persistListeningScores() {
