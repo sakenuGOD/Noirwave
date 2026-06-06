@@ -776,6 +776,27 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         )
     }
 
+    func testFavoriteTracksOrganizerComposesLibraryAndLocalSearch() {
+        let slowdive = Self.makeLibraryTrack(1, title: "Alison", artist: "Slowdive", album: "Souvlaki")
+        let slowdiveSecond = Self.makeLibraryTrack(2, title: "When the Sun Hits", artist: "Slowdive", album: "Souvlaki")
+        let radiohead = Self.makeLibraryTrack(3, title: "Everything In Its Right Place", artist: "Radiohead", album: "Kid A")
+        let aphex = Self.makeLibraryTrack(4, title: "Xtal", artist: "Aphex Twin", album: "Selected Ambient Works 85-92")
+        let tracks = [slowdiveSecond, radiohead, aphex, slowdive]
+
+        XCTAssertEqual(
+            FavoriteTracksOrganizer.tracks(tracks, libraryQuery: "slowdive", localQuery: "souvlaki", sortMode: .recentlyAdded).map(\.id),
+            [slowdiveSecond.id, slowdive.id]
+        )
+        XCTAssertEqual(
+            FavoriteTracksOrganizer.tracks(tracks, libraryQuery: "", localQuery: "kid", sortMode: .title).map(\.id),
+            [radiohead.id]
+        )
+        XCTAssertEqual(
+            FavoriteTracksOrganizer.tracks(tracks, libraryQuery: "slowdive", localQuery: "alison", sortMode: .recentlyAdded).map(\.id),
+            [slowdive.id]
+        )
+    }
+
     func testPlaylistTrackFilterKeepsPlaylistOrderAndMatchesTrackMetadata() {
         let tracks = [
             Self.makeLibraryTrack(1, title: "Only Shallow", artist: "My Bloody Valentine", album: "Loveless"),
