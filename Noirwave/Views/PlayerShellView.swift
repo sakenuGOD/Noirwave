@@ -126,7 +126,6 @@ private struct DynamicStudioBackground: View {
 private struct SidebarView: View {
     @EnvironmentObject private var store: PlayerStore
     @Binding var selection: ShellDestination
-    @State private var isShowingSessionSettings = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -165,85 +164,14 @@ private struct SidebarView: View {
                 }
             }
 
-            if !store.likedTracks().isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Favorites")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.42))
-                        .padding(.horizontal, 8)
-
-                    ForEach(store.likedTracks(limit: 4)) { track in
-                        SidebarPlaylistRow(track: track)
-                    }
-                }
-            }
-
             Spacer(minLength: 12)
 
-            HStack(spacing: 8) {
-                Button {
-                    isShowingSessionSettings = true
-                } label: {
-                    Image(systemName: "key.viewfinder")
-                        .frame(width: 34, height: 32)
-                }
-                .buttonStyle(.plain)
-                .help("Configure Deezer ARL")
-
-                Button {
-                    store.connectProvider()
-                } label: {
-                    Image(systemName: store.providerStatus.canPlayCatalogContent ? "arrow.clockwise" : "network")
-                        .frame(width: 34, height: 32)
-                }
-                .buttonStyle(.plain)
-                .help("Connect or refresh the local stream source")
-
-                Spacer()
-            }
-            .foregroundStyle(.white.opacity(0.72))
-
-            SourceStatusCard()
-        }
-        .sheet(isPresented: $isShowingSessionSettings) {
-            SessionSettingsSheet()
-                .environmentObject(store)
+            SidebarPlaylistPreview()
         }
         .padding(.horizontal, 12)
         .padding(.bottom, 12)
         .foregroundStyle(.white)
         .background(Color(hex: "#070707"))
-    }
-}
-
-private struct SidebarSearchField: View {
-    @EnvironmentObject private var store: PlayerStore
-    @Binding var selection: ShellDestination
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.42))
-            TextField(
-                "Search",
-                text: Binding(
-                    get: { store.searchQuery },
-                    set: { value in
-                        store.updateSearchQuery(value)
-                        if !value.trimmed.isEmpty {
-                            selection = .search
-                            store.leaveCatalogContext()
-                        }
-                    }
-                )
-            )
-            .textFieldStyle(.plain)
-            .font(.system(size: 13, weight: .medium))
-        }
-        .padding(.horizontal, 10)
-        .frame(height: 34)
-        .background(Color(hex: "#151515"), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
     }
 }
 
@@ -281,31 +209,140 @@ private struct SidebarItem: View {
     }
 }
 
+private struct SidebarLibraryCollection: Identifiable {
+    let id: String
+    let title: String
+    let subtitle: String
+    let symbol: String
+    let tracks: [Track]
+
+    var artworkTracks: [Track] {
+        Array(tracks.prefix(4))
+    }
+}
+
 private struct SidebarPlaylistPreview: View {
     @EnvironmentObject private var store: PlayerStore
 
-    private var items: [Track] {
-        Array((store.featuredTracks.isEmpty ? store.visibleTracks : store.featuredTracks).filter(\.isPlayable).prefix(7))
+    private var collections: [SidebarLibraryCollection] {
+        let savedTracks = store.likedTracks(limit: 120).filter(\.isPlayable)
+
+        if savedTracks.isEmpty {
+            let discoveryTracks = Array(store.featuredTracks.filter(\.isPlayable).prefix(18))
+            guard !discoveryTracks.isEmpty else { return [] }
+            return [
+                SidebarLibraryCollection(
+                    id: "discovery.mix",
+                    title: "Noirwave Mix",
+                    subtitle: "\(discoveryTracks.count) tracks",
+                    symbol: "waveform",
+                    tracks: discoveryTracks
+                )
+            ]
+        }
+
+        var output: [SidebarLibraryCollection] = [
+            SidebarLibraryCollection(
+                id: "liked.songs",
+                title: "Liked Songs",
+                subtitle: "\(savedTracks.count) saved",
+                symbol: "heart.fill",
+                tracks: savedTracks
+            )
+        ]
+
+        if let album = topAlbumCollection(from: savedTracks) {
+            output.append(album)
+        }
+
+        if let artist = topArtistCollection(from: savedTracks) {
+            output.append(artist)
+        }
+
+        return Array(output.prefix(3))
+    }
+
+    private var accent: Color {
+        store.currentTrack?.palette.accent ?? collections.first?.tracks.first?.palette.accent ?? .white
+    }
+
+    private func topAlbumCollection(from tracks: [Track]) -> SidebarLibraryCollection? {
+        var order: [String] = []
+        var grouped: [String: [Track]] = [:]
+
+        for track in tracks {
+            guard let album = track.album.nonEmpty else { continue }
+            let key = "\(album.searchNormalized).\(track.artist.searchNormalized)"
+            guard !key.isEmpty else { continue }
+            if grouped[key] == nil {
+                order.append(key)
+                grouped[key] = []
+            }
+            grouped[key]?.append(track)
+        }
+
+        guard let key = order.max(by: { (grouped[$0]?.count ?? 0) < (grouped[$1]?.count ?? 0) }),
+              let tracks = grouped[key],
+              let first = tracks.first
+        else { return nil }
+
+        return SidebarLibraryCollection(
+            id: "album.\(key)",
+            title: first.album,
+            subtitle: "\(tracks.count) saved · \(first.artist)",
+            symbol: "square.stack.fill",
+            tracks: tracks
+        )
+    }
+
+    private func topArtistCollection(from tracks: [Track]) -> SidebarLibraryCollection? {
+        var order: [String] = []
+        var grouped: [String: [Track]] = [:]
+
+        for track in tracks {
+            let key = track.artist.searchNormalized
+            guard !key.isEmpty else { continue }
+            if grouped[key] == nil {
+                order.append(key)
+                grouped[key] = []
+            }
+            grouped[key]?.append(track)
+        }
+
+        guard let key = order.max(by: { (grouped[$0]?.count ?? 0) < (grouped[$1]?.count ?? 0) }),
+              let tracks = grouped[key],
+              let first = tracks.first
+        else { return nil }
+
+        return SidebarLibraryCollection(
+            id: "artist.\(key)",
+            title: first.artist,
+            subtitle: "\(tracks.count) saved tracks",
+            symbol: "music.mic",
+            tracks: tracks
+        )
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("Playlists")
-                    .font(.system(size: 15, weight: .semibold))
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.9))
                 Spacer()
-                Image(systemName: "plus")
-                Image(systemName: "list.bullet")
-                Image(systemName: "chevron.down")
+                Text("\(collections.count)")
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.42))
             }
-            .font(.system(size: 11, weight: .semibold))
-            .foregroundStyle(.white.opacity(0.62))
             .padding(.horizontal, 8)
 
-            VStack(spacing: 6) {
-                ForEach(items) { track in
-                    SidebarPlaylistRow(track: track)
+            if collections.isEmpty {
+                SidebarCollectionEmptyRow(accent: accent)
+            } else {
+                VStack(spacing: 6) {
+                    ForEach(collections) { collection in
+                        SidebarPlaylistRow(collection: collection)
+                    }
                 }
             }
         }
@@ -314,120 +351,84 @@ private struct SidebarPlaylistPreview: View {
 
 private struct SidebarPlaylistRow: View {
     @EnvironmentObject private var store: PlayerStore
-    let track: Track
+    let collection: SidebarLibraryCollection
+
+    private var accent: Color {
+        store.currentTrack?.palette.accent ?? collection.tracks.first?.palette.accent ?? .white
+    }
 
     var body: some View {
         Button {
-            store.activate(track)
+            store.playAll(collection.tracks)
         } label: {
-            HStack(spacing: 8) {
-                ArtworkTile(track: track, size: 34, cornerRadius: 4)
+            HStack(spacing: 9) {
+                LibraryMosaicArtwork(tracks: collection.artworkTracks, size: 38, accent: accent)
+
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(track.album.nonEmpty ?? track.title)
+                    Text(collection.title)
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.84))
                         .lineLimit(1)
-                    Text("♫ \(track.artist)  ◷ \(track.durationLabel)")
+                    Text(collection.subtitle)
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(.white.opacity(0.45))
                         .lineLimit(1)
                 }
+
                 Spacer()
+
+                Image(systemName: collection.symbol)
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(accent.opacity(0.86))
+                    .frame(width: 22, height: 22)
+                    .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
             }
             .padding(.horizontal, 8)
+            .frame(height: 46)
+            .background(.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
         }
         .buttonStyle(.plain)
-        .help(track.title)
+        .help(collection.title)
     }
 }
 
-private struct SidebarNowPlayingCard: View {
-    @EnvironmentObject private var store: PlayerStore
-
-    var body: some View {
-        if let track = store.currentTrack {
-            VStack(alignment: .leading, spacing: 8) {
-                ArtworkTile(track: track, size: 276, cornerRadius: 5)
-
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(track.title)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
-                    Text(track.artist)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.58))
-                        .lineLimit(1)
-                    Text(track.album)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.42))
-                        .lineLimit(1)
-                }
-                .padding(.horizontal, 2)
-            }
-        }
-    }
-}
-
-private struct SourceStatusCard: View {
-    @EnvironmentObject private var store: PlayerStore
-
-    private var statusTitle: String {
-        store.providerStatus.canPlayCatalogContent ? "Stream connected" : "Stream offline"
-    }
-
-    private var statusSubtitle: String {
-        if store.needsBackendSession {
-            return "Session required"
-        }
-        if !store.providerStatus.canPlayCatalogContent,
-           let message = store.providerStatus.message?.nonEmpty {
-            return message
-        }
-        return store.providerStatus.canPlayCatalogContent
-            ? store.provider.sourceName
-            : "Connect source"
-    }
+private struct SidebarCollectionEmptyRow: View {
+    let accent: Color
 
     var body: some View {
         HStack(spacing: 9) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(.white.opacity(0.09))
-                Image(systemName: store.providerStatus.canPlayCatalogContent ? "bolt.horizontal.fill" : "server.rack")
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(store.providerStatus.canPlayCatalogContent ? .green : .white.opacity(0.58))
-            }
-            .frame(width: 32, height: 32)
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(accent.opacity(0.2))
+                .frame(width: 38, height: 38)
+                .overlay(
+                    Image(systemName: "rectangle.stack.badge.plus")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.54))
+                )
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(statusTitle)
+                Text("No saved collections")
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.84))
-                Text(statusSubtitle)
+                    .foregroundStyle(.white.opacity(0.72))
+                    .lineLimit(1)
+                Text("Library")
                     .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.42))
+                    .foregroundStyle(.white.opacity(0.38))
                     .lineLimit(1)
             }
 
             Spacer()
-
-            Circle()
-                .fill(store.providerStatus.canPlayCatalogContent ? .green : .orange.opacity(0.82))
-                .frame(width: 7, height: 7)
         }
-        .padding(12)
-        .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(.white.opacity(0.07), lineWidth: 1)
-        )
+        .padding(.horizontal, 8)
+        .frame(height: 46)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
     }
 }
 
 private struct TopBarView: View {
     @EnvironmentObject private var store: PlayerStore
     @Binding var selection: ShellDestination
+    @State private var isShowingSessionSettings = false
 
     var body: some View {
         HStack(spacing: 12) {
@@ -482,7 +483,62 @@ private struct TopBarView: View {
             )
             .frame(maxWidth: 680)
 
+            TopBarSourceControls(isShowingSessionSettings: $isShowingSessionSettings)
+
             Spacer(minLength: 0)
+        }
+        .sheet(isPresented: $isShowingSessionSettings) {
+            SessionSettingsSheet()
+                .environmentObject(store)
+        }
+    }
+}
+
+private struct TopBarSourceControls: View {
+    @EnvironmentObject private var store: PlayerStore
+    @Binding var isShowingSessionSettings: Bool
+
+    private var statusText: String {
+        store.providerStatus.canPlayCatalogContent ? "Online" : "Offline"
+    }
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Button {
+                isShowingSessionSettings = true
+            } label: {
+                Image(systemName: "key.viewfinder")
+                    .font(.system(size: 12, weight: .bold))
+                    .frame(width: 34, height: 34)
+                    .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.white.opacity(0.78))
+            .help("Configure Deezer ARL")
+
+            Button {
+                store.connectProvider()
+            } label: {
+                Image(systemName: store.providerStatus.canPlayCatalogContent ? "arrow.clockwise" : "network")
+                    .font(.system(size: 12, weight: .bold))
+                    .frame(width: 34, height: 34)
+                    .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.white.opacity(0.78))
+            .help("Connect or refresh stream source")
+
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(store.providerStatus.canPlayCatalogContent ? .green : .orange.opacity(0.86))
+                    .frame(width: 7, height: 7)
+                Text(statusText)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.64))
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 34)
+            .background(.white.opacity(0.065), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
     }
 }
@@ -727,35 +783,6 @@ private struct SearchResultsView: View {
                 )
                 TrackListSection(title: "Треки", subtitle: "\(tracks.count)", tracks: tracks, numbered: false)
             }
-        }
-    }
-}
-
-private struct SearchScopeControl: View {
-    @EnvironmentObject private var store: PlayerStore
-
-    var body: some View {
-        HStack(spacing: 8) {
-            ForEach(SearchScope.allCases) { scope in
-                Button {
-                    store.setScope(scope)
-                } label: {
-                    Image(systemName: scope.systemImage)
-                        .font(.system(size: 13, weight: .bold))
-                    .foregroundStyle(store.selectedScope == scope ? .black : .white.opacity(0.7))
-                    .frame(width: 38, height: 34)
-                    .background(
-                        store.selectedScope == scope
-                            ? (store.currentTrack?.palette.accent ?? .white)
-                            : .white.opacity(0.055),
-                        in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    )
-                }
-                .buttonStyle(.plain)
-                .help(scope.resultsTitle)
-            }
-
-            Spacer()
         }
     }
 }
@@ -1188,105 +1215,6 @@ private struct MetricTile: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(.white.opacity(0.08), lineWidth: 1)
         )
-    }
-}
-
-private struct QueueStageView: View {
-    @EnvironmentObject private var store: PlayerStore
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 24) {
-            NowPlayingHero()
-            TrackListSection(title: "Up Next", subtitle: "\(store.queue.count) queued", tracks: store.queue, numbered: true)
-        }
-    }
-}
-
-private struct RightInspectorRail: View {
-    @EnvironmentObject private var store: PlayerStore
-    @State private var selectedPanel: NowPlayingPanelMode = .lyrics
-
-    private var queuedTracks: [Track] {
-        Array(store.queue.prefix(8))
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Picker("Inspector", selection: $selectedPanel) {
-                ForEach(NowPlayingPanelMode.allCases) { panel in
-                    Label(panel.rawValue, systemImage: panel.symbol)
-                        .tag(panel)
-                }
-            }
-            .pickerStyle(.segmented)
-            .controlSize(.small)
-
-            switch selectedPanel {
-            case .lyrics:
-                if let track = store.currentTrack {
-                    LyricsReaderContentView(track: track, isExpanded: false)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                } else {
-                    InspectorEmptyState(title: "Lyrics", symbol: "text.quote")
-                }
-            case .queue:
-                HStack {
-                    Text("\(store.queue.count) queued")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.48))
-                    Spacer()
-                    if !store.queue.isEmpty {
-                        Button {
-                            store.clearQueue()
-                        } label: {
-                            Image(systemName: "trash")
-                                .font(.system(size: 11, weight: .bold))
-                                .frame(width: 26, height: 26)
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.white.opacity(0.46))
-                        .help("Clear queue")
-                    }
-                }
-
-                if queuedTracks.isEmpty {
-                    InspectorEmptyState(title: "Queue", symbol: "text.line.last.and.arrowtriangle.forward")
-                } else {
-                    ScrollView {
-                        VStack(spacing: 9) {
-                            ForEach(queuedTracks) { track in
-                                QueueRowView(track: track)
-                            }
-                        }
-                    }
-                    .scrollIndicators(.hidden)
-                }
-            }
-
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 16)
-        .padding(.top, 20)
-        .padding(.bottom, 14)
-        .foregroundStyle(.white)
-        .background(Color(hex: "#080808").opacity(0.98))
-    }
-}
-
-private struct InspectorEmptyState: View {
-    let title: String
-    let symbol: String
-
-    var body: some View {
-        VStack(spacing: 10) {
-            Image(systemName: symbol)
-                .font(.system(size: 22, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.28))
-            Text(title)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.42))
-        }
-        .frame(maxWidth: .infinity, minHeight: 160)
     }
 }
 
@@ -2309,104 +2237,6 @@ private struct NowPlayingPanelPicker: View {
     }
 }
 
-private struct LyricsPanelView: View {
-    @EnvironmentObject private var store: PlayerStore
-    @State private var isShowingExpandedLyrics = false
-    let track: Track
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Label("Lyrics", systemImage: "text.quote")
-                    .font(.system(size: 15, weight: .semibold))
-                Spacer()
-
-                Button {
-                    isShowingExpandedLyrics = true
-                } label: {
-                    Image(systemName: "arrow.up.left.and.arrow.down.right")
-                        .font(.system(size: 12, weight: .semibold))
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.white.opacity(0.72))
-                .frame(width: 28, height: 24)
-                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .stroke(.white.opacity(0.08), lineWidth: 1)
-                )
-                .help("Expand lyrics")
-            }
-
-            LyricsReaderContentView(track: track, isExpanded: false)
-        }
-        .padding(12)
-        .frame(minHeight: 220, maxHeight: 310)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(.white.opacity(0.07), lineWidth: 1)
-        )
-        .sheet(isPresented: $isShowingExpandedLyrics) {
-            ExpandedLyricsSheet(track: track)
-                .environmentObject(store)
-        }
-    }
-}
-
-private struct ExpandedLyricsSheet: View {
-    @Environment(\.dismiss) private var dismiss
-    let track: Track
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            HStack(spacing: 14) {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(track.title)
-                        .font(.system(size: 24, weight: .bold, design: .rounded))
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
-
-                    Text([track.artist, track.album].filter { !$0.isEmpty }.joined(separator: " · "))
-                        .font(.system(size: 13, weight: .semibold, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.58))
-                        .lineLimit(1)
-                }
-
-                Spacer()
-
-                Button {
-                    dismiss()
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 12, weight: .bold))
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.white.opacity(0.7))
-                .frame(width: 30, height: 30)
-                .background(.thinMaterial, in: Circle())
-                .overlay(
-                    Circle()
-                        .stroke(.white.opacity(0.08), lineWidth: 1)
-                )
-                .help("Close")
-            }
-
-            LyricsReaderContentView(track: track, isExpanded: true)
-        }
-        .padding(22)
-        .frame(minWidth: 560, idealWidth: 660, minHeight: 640, idealHeight: 760)
-        .background {
-            ZStack {
-                track.palette.base.opacity(0.56)
-                track.palette.mid.opacity(0.32)
-                Rectangle().fill(.regularMaterial)
-            }
-            .ignoresSafeArea()
-        }
-    }
-}
-
 private struct LyricsReaderContentView: View {
     @EnvironmentObject private var store: PlayerStore
     let track: Track
@@ -2523,14 +2353,27 @@ private struct LyricsLineView: View {
 
 private struct QueuePanelView: View {
     @EnvironmentObject private var store: PlayerStore
+    @State private var queueQuery = ""
+
+    private var filteredQueue: [Track] {
+        QueueSearchFilter.filteredTracks(store.queue, query: queueQuery)
+    }
+
+    private var countLabel: String {
+        if queueQuery.trimmed.isEmpty {
+            return "\(store.queue.count)"
+        }
+
+        return "\(filteredQueue.count)/\(store.queue.count)"
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text("Up Next")
                     .font(.system(size: 15, weight: .semibold))
                 Spacer()
-                Text("\(store.queue.count)")
+                Text(countLabel)
                     .font(.system(size: 12, weight: .medium, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.5))
                 if !store.queue.isEmpty {
@@ -2547,10 +2390,32 @@ private struct QueuePanelView: View {
                 }
             }
 
-            VStack(spacing: 6) {
-                ForEach(store.queue.prefix(7)) { track in
-                    QueueRowView(track: track)
+            if !store.queue.isEmpty {
+                QueueSearchField(query: $queueQuery)
+            }
+
+            if store.queue.isEmpty {
+                QueuePanelStateView(title: "Queue is empty", symbol: "text.line.last.and.arrowtriangle.forward")
+                    .frame(maxHeight: .infinity)
+            } else if filteredQueue.isEmpty {
+                QueuePanelStateView(title: "No queued tracks found", symbol: "magnifyingglass")
+                    .frame(maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 7) {
+                        ForEach(filteredQueue) { track in
+                            QueueRowView(
+                                track: track,
+                                canMoveUp: canMoveUp(track),
+                                canMoveDown: canMoveDown(track),
+                                moveUp: { moveUp(track) },
+                                moveDown: { moveDown(track) }
+                            )
+                        }
+                    }
+                    .padding(.vertical, 1)
                 }
+                .scrollIndicators(.hidden)
             }
         }
         .padding(12)
@@ -2560,11 +2425,102 @@ private struct QueuePanelView: View {
                 .stroke(.white.opacity(0.07), lineWidth: 1)
         )
     }
+
+    private func canMoveUp(_ track: Track) -> Bool {
+        guard let index = store.queue.firstIndex(of: track) else { return false }
+        return index > store.queue.startIndex
+    }
+
+    private func canMoveDown(_ track: Track) -> Bool {
+        guard let index = store.queue.firstIndex(of: track) else { return false }
+        return index < store.queue.index(before: store.queue.endIndex)
+    }
+
+    private func moveUp(_ track: Track) {
+        guard let index = store.queue.firstIndex(of: track),
+              index > store.queue.startIndex
+        else { return }
+
+        store.moveQueueItem(track, before: store.queue[store.queue.index(before: index)])
+    }
+
+    private func moveDown(_ track: Track) {
+        guard let index = store.queue.firstIndex(of: track),
+              index < store.queue.index(before: store.queue.endIndex)
+        else { return }
+
+        let targetIndex = store.queue.index(index, offsetBy: 2, limitedBy: store.queue.endIndex)
+        if let targetIndex, targetIndex < store.queue.endIndex {
+            store.moveQueueItem(track, before: store.queue[targetIndex])
+        } else {
+            store.moveQueueItem(track, before: nil)
+        }
+    }
+}
+
+private struct QueueSearchField: View {
+    @Binding var query: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.48))
+
+            TextField("Search queue", text: $query)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12, weight: .medium))
+
+            if !query.trimmed.isEmpty {
+                Button {
+                    query = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white.opacity(0.52))
+                .help("Clear queue search")
+            }
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 34)
+        .background(.white.opacity(0.075), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(.white.opacity(0.08), lineWidth: 1)
+        )
+    }
+}
+
+private struct QueuePanelStateView: View {
+    let title: String
+    let symbol: String
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Image(systemName: symbol)
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.3))
+
+            Text(title)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.52))
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, minHeight: 180)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
 }
 
 private struct QueueRowView: View {
     @EnvironmentObject private var store: PlayerStore
+    @State private var isHovering = false
     let track: Track
+    let canMoveUp: Bool
+    let canMoveDown: Bool
+    let moveUp: () -> Void
+    let moveDown: () -> Void
 
     var body: some View {
         HStack(spacing: 9) {
@@ -2579,6 +2535,32 @@ private struct QueueRowView: View {
                     .lineLimit(1)
             }
             Spacer()
+
+            HStack(spacing: 4) {
+                QueueActionButton(
+                    symbol: "chevron.up",
+                    helpText: "Move up",
+                    isEnabled: canMoveUp,
+                    action: moveUp
+                )
+
+                QueueActionButton(
+                    symbol: "chevron.down",
+                    helpText: "Move down",
+                    isEnabled: canMoveDown,
+                    action: moveDown
+                )
+
+                QueueActionButton(
+                    symbol: "arrow.up.to.line",
+                    helpText: "Play next",
+                    isEnabled: true
+                ) {
+                    store.playNext(track)
+                }
+            }
+            .opacity(isHovering ? 1 : 0.32)
+
             Button {
                 store.removeFromQueue(track)
             } label: {
@@ -2590,6 +2572,30 @@ private struct QueueRowView: View {
             .foregroundStyle(.white.opacity(0.42))
             .help("Remove")
         }
+        .padding(.horizontal, 8)
+        .frame(height: 42)
+        .background(.white.opacity(isHovering ? 0.075 : 0.035), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .onHover { isHovering = $0 }
+    }
+}
+
+private struct QueueActionButton: View {
+    let symbol: String
+    let helpText: String
+    let isEnabled: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 10, weight: .bold))
+                .frame(width: 22, height: 22)
+                .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.white.opacity(isEnabled ? 0.64 : 0.24))
+        .disabled(!isEnabled)
+        .help(helpText)
     }
 }
 

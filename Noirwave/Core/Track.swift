@@ -456,6 +456,12 @@ enum LibrarySearchFilter {
     }
 }
 
+enum QueueSearchFilter {
+    static func filteredTracks(_ tracks: [Track], query: String) -> [Track] {
+        LibrarySearchFilter.filteredTracks(tracks, query: query)
+    }
+}
+
 extension Int {
     var compactCountLabel: String {
         let value = Double(self)

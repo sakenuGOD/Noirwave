@@ -862,6 +862,44 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         XCTAssertEqual(store.queue, [tracks[1], tracks[2]])
     }
 
+    func testQueueSearchFilterMatchesTitleArtistAndAlbum() {
+        let radiohead = Self.makeLibraryTrack(1, title: "Everything In Its Right Place", artist: "Radiohead", album: "Kid A")
+        let cocteau = Self.makeLibraryTrack(2, title: "Cherry-Coloured Funk", artist: "Cocteau Twins", album: "Heaven or Las Vegas")
+        let deftones = Self.makeLibraryTrack(3, title: "Digital Bath", artist: "Deftones", album: "White Pony")
+
+        XCTAssertEqual(
+            QueueSearchFilter.filteredTracks([radiohead, cocteau, deftones], query: "kid").map(\.id),
+            [radiohead.id]
+        )
+        XCTAssertEqual(
+            QueueSearchFilter.filteredTracks([radiohead, cocteau, deftones], query: "cocteau").map(\.id),
+            [cocteau.id]
+        )
+        XCTAssertEqual(
+            QueueSearchFilter.filteredTracks([radiohead, cocteau, deftones], query: "digital").map(\.id),
+            [deftones.id]
+        )
+    }
+
+    @MainActor
+    func testMoveQueueItemReordersQueueWithoutDuplicatingTracks() async throws {
+        let tracks = (1...5).map { Self.makePlaybackTrack($0) }
+        let provider = PrewarmRecordingProvider(tracks: tracks)
+        let store = PlayerStore(provider: provider)
+
+        store.play(tracks[0])
+        try await Task.sleep(for: .milliseconds(80))
+        store.enqueue([tracks[1], tracks[2], tracks[3], tracks[4]])
+
+        store.moveQueueItem(tracks[3], before: tracks[1])
+        XCTAssertEqual(store.queue, [tracks[3], tracks[1], tracks[2], tracks[4]])
+        XCTAssertEqual(Set(store.queue).count, store.queue.count)
+
+        store.moveQueueItem(tracks[1], before: nil)
+        XCTAssertEqual(store.queue, [tracks[3], tracks[2], tracks[4], tracks[1]])
+        XCTAssertEqual(Set(store.queue).count, store.queue.count)
+    }
+
     @MainActor
     func testPlayNextMovesTrackToFrontWithoutDuplicatingQueue() async throws {
         let tracks = (1...4).map { Self.makePlaybackTrack($0) }

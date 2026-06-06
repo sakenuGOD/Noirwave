@@ -437,6 +437,20 @@ final class PlayerStore: ObservableObject {
         preparePlaybackContext()
     }
 
+    func moveQueueItem(_ track: Track, before target: Track?) {
+        guard let currentIndex = queue.firstIndex(of: track) else { return }
+        let movedTrack = queue.remove(at: currentIndex)
+
+        if let target,
+           let targetIndex = queue.firstIndex(of: target) {
+            queue.insert(movedTrack, at: targetIndex)
+        } else {
+            queue.append(movedTrack)
+        }
+
+        preparePlaybackContext()
+    }
+
     func clearQueue() {
         queue.removeAll()
         preparePlaybackContext()
