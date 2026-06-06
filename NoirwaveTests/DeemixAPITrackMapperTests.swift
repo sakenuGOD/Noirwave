@@ -982,6 +982,43 @@ final class DeemixAPITrackMapperTests: XCTestCase {
     }
 
     @MainActor
+    func testPlaylistPlaybackContextRepeatsWithinPlaylistOrder() async throws {
+        let tracks = (1...4).map { Self.makePlaybackTrack($0) }
+        let provider = PrewarmRecordingProvider(tracks: tracks)
+        let store = PlayerStore(provider: provider)
+        let playlist = store.createPlaylist(title: "Night Drive", tracks: [tracks[1], tracks[2]])
+
+        await store.bootstrap()
+        store.cycleRepeatMode()
+        store.playAll(store.playlistTracks(playlistID: playlist.id))
+        try await Task.sleep(for: .milliseconds(80))
+        store.next()
+        try await Task.sleep(for: .milliseconds(80))
+        store.next()
+        try await Task.sleep(for: .milliseconds(80))
+
+        XCTAssertEqual(store.repeatMode, .all)
+        XCTAssertEqual(Array(provider.playedIDs.suffix(3)), [tracks[1].id, tracks[2].id, tracks[1].id])
+    }
+
+    @MainActor
+    func testPlaylistPreviousUsesPlaylistOrderInsteadOfVisibleCatalog() async throws {
+        let tracks = (1...4).map { Self.makePlaybackTrack($0) }
+        let provider = PrewarmRecordingProvider(tracks: tracks)
+        let store = PlayerStore(provider: provider)
+        let playlist = store.createPlaylist(title: "Sequenced", tracks: [tracks[1], tracks[2]])
+
+        await store.bootstrap()
+        store.cycleRepeatMode()
+        store.playAll(store.playlistTracks(playlistID: playlist.id))
+        try await Task.sleep(for: .milliseconds(80))
+        store.previous()
+        try await Task.sleep(for: .milliseconds(80))
+
+        XCTAssertEqual(Array(provider.playedIDs.suffix(2)), [tracks[1].id, tracks[2].id])
+    }
+
+    @MainActor
     func testQueueAllDeduplicatesAndSkipsCurrentTrack() async throws {
         let tracks = (1...4).map { Self.makePlaybackTrack($0) }
         let provider = PrewarmRecordingProvider(tracks: tracks)
