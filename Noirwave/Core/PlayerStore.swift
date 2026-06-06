@@ -522,7 +522,20 @@ final class PlayerStore: ObservableObject {
 
     @discardableResult
     func createPlaylist(title: String, tracks: [Track] = []) -> LocalPlaylist {
-        let playlist = LocalPlaylist(title: title, tracks: uniquePlayableTracks(in: tracks))
+        let playableTracks = uniquePlayableTracks(in: tracks)
+        let normalizedTitle = LocalPlaylist.normalizedTitle(title)
+
+        if let existingIndex = localPlaylists.firstIndex(where: { $0.title == normalizedTitle }) {
+            let originalPlaylist = localPlaylists[existingIndex]
+            _ = localPlaylists[existingIndex].append(playableTracks)
+            localPlaylists[existingIndex].normalize()
+            if localPlaylists[existingIndex] != originalPlaylist {
+                persistLocalPlaylists()
+            }
+            return localPlaylists[existingIndex]
+        }
+
+        let playlist = LocalPlaylist(title: normalizedTitle, tracks: playableTracks)
         localPlaylists.insert(playlist, at: localPlaylists.startIndex)
         persistLocalPlaylists()
         return playlist
@@ -1204,13 +1217,31 @@ final class PlayerStore: ObservableObject {
 
     private static func normalizedLocalPlaylists(_ playlists: [LocalPlaylist]) -> [LocalPlaylist] {
         var seenIDs: Set<String> = []
-        return playlists.compactMap { playlist in
-            guard seenIDs.insert(playlist.id).inserted else { return nil }
+        var titleIndex: [String: Int] = [:]
+        var normalizedPlaylists: [LocalPlaylist] = []
+
+        for playlist in playlists {
+            guard seenIDs.insert(playlist.id).inserted else { continue }
 
             var normalizedPlaylist = playlist
             normalizedPlaylist.normalize()
-            return normalizedPlaylist
+
+            let titleKey = normalizedPlaylist.title.searchNormalized
+            if let existingIndex = titleIndex[titleKey] {
+                var existingPlaylist = normalizedPlaylists[existingIndex]
+                let mergedUpdatedAt = max(existingPlaylist.updatedAt, normalizedPlaylist.updatedAt)
+                _ = existingPlaylist.append(
+                    normalizedPlaylist.orderedTracks(preferredTracks: []),
+                    updatedAt: mergedUpdatedAt
+                )
+                normalizedPlaylists[existingIndex] = existingPlaylist
+            } else {
+                titleIndex[titleKey] = normalizedPlaylists.count
+                normalizedPlaylists.append(normalizedPlaylist)
+            }
         }
+
+        return normalizedPlaylists
     }
 
     private static func persistLocalPlaylists(_ playlists: [LocalPlaylist], to userDefaults: UserDefaults) {

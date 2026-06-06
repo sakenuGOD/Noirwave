@@ -6,6 +6,7 @@ import { readARL, setRuntimeARL } from "./session.mjs";
 import {
   publicDeezerAlbumDetail,
   publicDeezerArtistDetail,
+  publicDeezerArtistTracks,
   publicDeezerSearch,
 } from "./publicDeezerSearch.mjs";
 import {
@@ -62,6 +63,7 @@ let activeStartupPrefetches = 0;
 app.use(express.json());
 
 const isValidTrackId = (value) => /^\d+$/.test(String(value ?? ""));
+const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 
 const estimatedSizeForFormat = (media, format) => {
   const size = format === "MP3_320"
@@ -117,7 +119,7 @@ const searchCatalog = async ({ term, scope, count }) => {
     .catch((error) => ({ source: "catalog", error }));
 
   const fallbackPromise = delay(publicSearchFallbackDelayMs).then(async () => {
-    if (catalogSucceeded && !isWeakSearchPayload(catalogPayload)) {
+    if (catalogSucceeded && !isWeakSearchPayload(catalogPayload, count)) {
       return { source: "fallback", skipped: true };
     }
     try {
@@ -129,7 +131,7 @@ const searchCatalog = async ({ term, scope, count }) => {
   });
 
   const first = await Promise.race([catalogPromise, fallbackPromise]);
-  if (first.payload && !isWeakSearchPayload(first.payload)) {
+  if (first.payload && !isWeakSearchPayload(first.payload, count)) {
     if (first.source === "fallback") {
       console.warn("[search] using public Deezer fallback", {
         scope,
@@ -144,7 +146,7 @@ const searchCatalog = async ({ term, scope, count }) => {
     first.source === "catalog"
     && first.payload
     && second.source === "fallback"
-    && shouldPreferFallbackSearchPayload(first.payload, second.payload)
+    && shouldPreferFallbackSearchPayload(first.payload, second.payload, count)
   ) {
     console.warn("[search] using public Deezer fallback for weak catalog payload", {
       scope,
@@ -220,7 +222,7 @@ const shouldRefreshAlbumDetail = (payload) => {
   const declaredCount = albumDeclaredTrackCount(payload);
   if (declaredCount === 0) return false;
   const trackCount = albumPayloadTracks(payload).length;
-  if (trackCount < Math.min(declaredCount, 100)) return true;
+  if (trackCount < Math.min(declaredCount, 500)) return true;
 
   const recordType = String(payload?.record_type ?? "").toLowerCase();
   const title = String(payload?.title ?? "").toLowerCase();
@@ -295,7 +297,7 @@ const shouldRefreshArtistDetail = (payload) => {
   const releaseCount = artistPayloadReleaseCount(payload);
   const declaredAlbumCount = artistDeclaredAlbumCount(payload);
   if (topTrackCount === 0 && releaseCount === 0) return true;
-  return declaredAlbumCount > 0 && releaseCount === 0;
+  return declaredAlbumCount > 0 && releaseCount < Math.min(declaredAlbumCount, 500);
 };
 
 const isFallbackArtistDetailBetter = (fallbackPayload, catalogPayload) => {
@@ -364,6 +366,22 @@ const artistDetailPayload = async (id) => cachedDetailPayload(`artist:${id}`, as
 
   if (first.payload) return first.payload;
   throw first.error ?? second.error;
+});
+
+const artistTracksPayload = async (id) => cachedDetailPayload(`artist-tracks:${id}`, async () => {
+  try {
+    const payload = await callCatalog(["artist-tracks", "--id", id], { timeoutMs: 45_000, attempts: 1 });
+    cacheTrackMediaFromPayload(payload);
+    return payload;
+  } catch (catalogError) {
+    const payload = await publicDeezerArtistTracks({ id }, { timeoutMs: 20_000 });
+    console.warn("[tracklist] using public Deezer artist tracks fallback", {
+      id,
+      tracks: Array.isArray(payload?.data) ? payload.data.length : 0,
+      catalogError: catalogError?.name,
+    });
+    return payload;
+  }
 });
 
 const isRetryableMediaResolutionError = (error) =>
@@ -1001,7 +1019,7 @@ app.post("/api/loginArl", asyncHandler(async (request, response) => {
 app.get("/api/search", asyncHandler(async (request, response) => {
   const term = String(request.query.term ?? "").trim();
   const scope = String(request.query.type ?? "track");
-  const count = Number(request.query.nb ?? 30);
+  const count = clamp(Number.parseInt(String(request.query.nb ?? 30), 10) || 30, 1, 500);
   if (!term) {
     response.json({ data: [], total: 0, type: scope });
     return;
@@ -1023,14 +1041,16 @@ app.get("/api/search", asyncHandler(async (request, response) => {
 app.get("/api/getTracklist", asyncHandler(async (request, response) => {
   const type = String(request.query.type ?? "");
   const id = String(request.query.id ?? "");
-  if (!id || !["artist", "album"].includes(type)) {
+  if (!id || !["artist", "album", "artist-tracks"].includes(type)) {
     response.status(400).json({ result: false, error: "type and id are required" });
     return;
   }
 
   const payload = type === "album"
     ? await cachedDetailPayload(`album:${id}`, () => albumDetailPayload(id))
-    : await artistDetailPayload(id);
+    : type === "artist-tracks"
+      ? await artistTracksPayload(id)
+      : await artistDetailPayload(id);
   cacheTrackMediaFromPayload(payload);
   response.json(payload);
   scheduleBackgroundPrefetch(extractTrackIds(payload), preferredFormat);

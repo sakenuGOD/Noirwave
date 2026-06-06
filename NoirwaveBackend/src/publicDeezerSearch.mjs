@@ -10,7 +10,8 @@ const deezerSearchEndpointByScope = new Map([
   ["album", "search/album"],
 ]);
 
-const maxPublicSearchLimit = 50;
+const maxPublicSearchPageLimit = 100;
+const maxPublicSearchResultCount = 500;
 const weakArtistPrefixMinFans = 5_000;
 const weakArtistContainsMinFans = 50_000;
 
@@ -23,11 +24,13 @@ const normalizeSearchText = (value) =>
     .trim()
     .replace(/\s+/g, " ");
 
-const boundedLimit = (count) => {
+const boundedResultCount = (count) => {
   const numeric = Number(count);
   if (!Number.isFinite(numeric)) return 30;
-  return Math.min(Math.max(1, Math.trunc(numeric)), maxPublicSearchLimit);
+  return Math.min(Math.max(1, Math.trunc(numeric)), maxPublicSearchResultCount);
 };
+
+const publicSearchPageLimit = (targetCount) => Math.min(targetCount, maxPublicSearchPageLimit);
 
 const allowsPublicArtist = (artist, term) => {
   const name = normalizeSearchText(artist?.name);
@@ -70,7 +73,7 @@ const deduplicatePublicArtists = (artists) => {
   return [...bestByName.values()];
 };
 
-const normalizePublicResponse = ({ json, query, scope, limit }) => {
+const normalizePublicResponse = ({ json, query, scope, targetCount }) => {
   if (json?.error) {
     const message = json.error.message ?? json.error.code ?? "Deezer public search failed.";
     const error = new Error(message);
@@ -80,7 +83,7 @@ const normalizePublicResponse = ({ json, query, scope, limit }) => {
   }
 
   const term = normalizeSearchText(query);
-  let data = Array.isArray(json?.data) ? json.data.slice(0, limit) : [];
+  let data = Array.isArray(json?.data) ? json.data.slice(0, targetCount) : [];
   if (scope === "artist") {
     data = deduplicatePublicArtists(data)
       .filter((artist) => allowsPublicArtist(artist, term))
@@ -256,6 +259,47 @@ const collectPublicAlbumTracks = async (albumJson, albumPayload, { fetchImpl, ti
   return tracks.map((track, index) => publicTrackPayload(track, index, albumJson));
 };
 
+const mapWithConcurrency = async (items, limit, mapper) => {
+  const output = new Array(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, limit), items.length);
+
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      output[index] = await mapper(items[index], index);
+    }
+  });
+
+  await Promise.all(workers);
+  return output;
+};
+
+const samePublicArtist = (track, artist) => {
+  const trackArtist = track?.artist;
+  const artistID = String(artist?.id ?? "");
+  if (artistID && String(trackArtist?.id ?? "") === artistID) return true;
+
+  return normalizeSearchText(trackArtist?.name) === normalizeSearchText(artist?.name);
+};
+
+const deduplicatePublicTracks = (tracks) => {
+  const seen = new Set();
+  const output = [];
+
+  for (const track of tracks) {
+    const key = track?.id == null
+      ? `${normalizeSearchText(track?.title)}:${normalizeSearchText(track?.artist?.name)}:${normalizeSearchText(track?.album?.title)}`
+      : String(track.id);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    output.push(track);
+  }
+
+  return output;
+};
+
 const requestPublicJSON = async (url, { fetchImpl, timeoutMs }) => {
   if (fetchImpl) {
     const controller = new AbortController();
@@ -299,13 +343,20 @@ export const publicDeezerSearch = async (
     throw error;
   }
 
-  const limit = boundedLimit(count);
+  const targetCount = boundedResultCount(count);
+  const pageLimit = publicSearchPageLimit(targetCount);
   const url = new URL(`https://api.deezer.com/${endpoint}`);
   url.searchParams.set("q", String(query ?? ""));
-  url.searchParams.set("limit", String(limit));
+  url.searchParams.set("limit", String(pageLimit));
 
   const json = await requestPublicJSON(url, { fetchImpl, timeoutMs });
-  return normalizePublicResponse({ json, query, scope, limit });
+  const data = await collectPublicDataPages(json, {
+    fetchImpl,
+    timeoutMs,
+    limit: targetCount,
+    maxPages: Math.ceil(targetCount / pageLimit) + 1,
+  });
+  return normalizePublicResponse({ json: { ...json, data }, query, scope, targetCount });
 };
 
 export const publicDeezerAlbumDetail = async (
@@ -354,16 +405,16 @@ export const publicDeezerArtistDetail = async (
 
   const artistUrl = new URL(`https://api.deezer.com/artist/${artistID}`);
   const topUrl = new URL(`https://api.deezer.com/artist/${artistID}/top`);
-  topUrl.searchParams.set("limit", "50");
+  topUrl.searchParams.set("limit", "100");
   const albumsUrl = new URL(`https://api.deezer.com/artist/${artistID}/albums`);
-  albumsUrl.searchParams.set("limit", "50");
+  albumsUrl.searchParams.set("limit", "100");
 
   const artistPromise = requestPublicJSON(artistUrl, { fetchImpl, timeoutMs });
   const topTracksPromise = requestPublicJSON(topUrl, { fetchImpl, timeoutMs })
     .then((json) => publicDataPageItems(json))
     .catch(() => []);
   const albumsPromise = requestPublicJSON(albumsUrl, { fetchImpl, timeoutMs })
-    .then((json) => collectPublicDataPages(json, { fetchImpl, timeoutMs, limit: 100, maxPages: 5 }))
+    .then((json) => collectPublicDataPages(json, { fetchImpl, timeoutMs, limit: 500, maxPages: 25 }))
     .catch(() => []);
 
   const [artistJson, topTrackItems, albumItems] = await Promise.all([
@@ -396,5 +447,67 @@ export const publicDeezerArtistDetail = async (
     releases: splitArtistReleases(albums),
     top_tracks: topTracks,
     source: "deezer-public-artist",
+  };
+};
+
+export const publicDeezerArtistTracks = async (
+  { id },
+  { fetchImpl = null, timeoutMs = 18000, maxAlbums = 500, concurrency = 5 } = {}
+) => {
+  const artistID = String(id ?? "").trim();
+  if (!/^\d+$/.test(artistID)) {
+    const error = new Error("Artist id must be numeric.");
+    error.name = "InvalidArtistID";
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const artistUrl = new URL(`https://api.deezer.com/artist/${artistID}`);
+  const albumsUrl = new URL(`https://api.deezer.com/artist/${artistID}/albums`);
+  albumsUrl.searchParams.set("limit", "100");
+
+  const [artistJson, firstAlbumsJson] = await Promise.all([
+    requestPublicJSON(artistUrl, { fetchImpl, timeoutMs }),
+    requestPublicJSON(albumsUrl, { fetchImpl, timeoutMs }),
+  ]);
+  if (artistJson?.error) {
+    const message = artistJson.error.message ?? artistJson.error.code ?? "Deezer public artist lookup failed.";
+    const error = new Error(message);
+    error.name = "PublicDeezerArtistError";
+    error.statusCode = 503;
+    throw error;
+  }
+
+  const artist = publicArtistPayload(artistJson);
+  const albumItems = await collectPublicDataPages(firstAlbumsJson, {
+    fetchImpl,
+    timeoutMs,
+    limit: maxAlbums,
+    maxPages: 25,
+  });
+
+  const albumTrackGroups = await mapWithConcurrency(albumItems, concurrency, async (albumItem) => {
+    try {
+      const albumID = albumItem?.id;
+      if (!albumID) return [];
+      const albumPayload = await publicDeezerAlbumDetail({ id: albumID }, { fetchImpl, timeoutMs });
+      return (albumPayload.tracks ?? [])
+        .filter((track) => samePublicArtist(track, artist))
+        .map((track) => ({
+          ...track,
+          album: track.album ?? publicAlbumPayload({ ...albumItem, artist: albumItem?.artist ?? artistJson }),
+        }));
+    } catch (_error) {
+      return [];
+    }
+  });
+
+  const data = deduplicatePublicTracks(albumTrackGroups.flat());
+  return {
+    data,
+    total: data.length,
+    type: "artist-tracks",
+    artist,
+    source: "deezer-public-artist-tracks",
   };
 };

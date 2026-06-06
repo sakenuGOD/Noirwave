@@ -854,18 +854,18 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         XCTAssertEqual(TrackPalette.fallback.accentHex, NoirwaveTheme.primaryAccentHex)
     }
 
-    func testLibrarySurfaceLayoutPlacesPlaylistsAtBottom() {
+    func testLibrarySurfaceLayoutKeepsPlaylistsOutOfOverview() {
         XCTAssertEqual(
             LibrarySurfaceLayout.sections(hasTracks: true, hasSavedCollections: true, hasLocalPlaylists: true),
-            [.collections, .favoriteTracks, .playlists]
+            [.collections, .favoriteTracks]
         )
         XCTAssertEqual(
             LibrarySurfaceLayout.sections(hasTracks: false, hasSavedCollections: true, hasLocalPlaylists: true),
-            [.collections, .playlists]
+            [.collections]
         )
         XCTAssertEqual(
             LibrarySurfaceLayout.sections(hasTracks: false, hasSavedCollections: false, hasLocalPlaylists: true),
-            [.playlists]
+            []
         )
     }
 
@@ -1116,6 +1116,27 @@ final class DeemixAPITrackMapperTests: XCTestCase {
     }
 
     @MainActor
+    func testLocalPlaylistLoadCollapsesLegacyDuplicateNamesAndMergesTracks() {
+        let defaults = Self.makeIsolatedDefaults(name: "local-playlists-collapse-legacy")
+        let tracks = [
+            Self.makeLibraryTrack(1, title: "Alison", artist: "Slowdive", album: "Souvlaki"),
+            Self.makeLibraryTrack(2, title: "When the Sun Hits", artist: "Slowdive", album: "Souvlaki"),
+            Self.makeLibraryTrack(3, title: "Joga", artist: "Bjork", album: "Homogenic")
+        ]
+        let playlists = [
+            LocalPlaylist(id: "sequenced-new", title: "Sequenced", tracks: [tracks[0], tracks[1]]),
+            LocalPlaylist(id: "night-drive", title: "Night Drive", tracks: [tracks[2]]),
+            LocalPlaylist(id: "sequenced-old", title: "  Sequenced  ", tracks: [tracks[0]])
+        ]
+        defaults.set(try! JSONEncoder().encode(playlists), forKey: "noirwave.localPlaylists")
+
+        let store = PlayerStore(provider: PrewarmRecordingProvider(tracks: tracks), userDefaults: defaults)
+
+        XCTAssertEqual(store.localPlaylists.map(\.id), ["sequenced-new", "night-drive"])
+        XCTAssertEqual(store.playlistTracks(playlistID: "sequenced-new").map(\.id), [tracks[0].id, tracks[1].id])
+    }
+
+    @MainActor
     func testLocalPlaylistsRenameRemoveAndDeleteWithoutTouchingLikedTracks() {
         let defaults = Self.makeIsolatedDefaults(name: "local-playlists-edit")
         let tracks = [
@@ -1233,7 +1254,10 @@ final class DeemixAPITrackMapperTests: XCTestCase {
     func testPlaylistPlaybackContextRepeatsWithinPlaylistOrder() async throws {
         let tracks = (1...4).map { Self.makePlaybackTrack($0) }
         let provider = PrewarmRecordingProvider(tracks: tracks)
-        let store = PlayerStore(provider: provider)
+        let store = PlayerStore(
+            provider: provider,
+            userDefaults: Self.makeIsolatedDefaults(name: "playlist-repeat-order")
+        )
         let playlist = store.createPlaylist(title: "Night Drive", tracks: [tracks[1], tracks[2]])
 
         await store.bootstrap()
@@ -1253,7 +1277,10 @@ final class DeemixAPITrackMapperTests: XCTestCase {
     func testPlaylistPreviousUsesPlaylistOrderInsteadOfVisibleCatalog() async throws {
         let tracks = (1...4).map { Self.makePlaybackTrack($0) }
         let provider = PrewarmRecordingProvider(tracks: tracks)
-        let store = PlayerStore(provider: provider)
+        let store = PlayerStore(
+            provider: provider,
+            userDefaults: Self.makeIsolatedDefaults(name: "playlist-previous-order")
+        )
         let playlist = store.createPlaylist(title: "Sequenced", tracks: [tracks[1], tracks[2]])
 
         await store.bootstrap()

@@ -306,9 +306,32 @@ def track_payload(track: Any, fallback_index: int = 0, album_context: Any | None
     }
 
 
+def same_artist_track(payload: dict[str, Any], artist: dict[str, Any]) -> bool:
+    track_artist = payload.get("artist") or {}
+    artist_id = artist.get("id")
+    if artist_id is not None and track_artist.get("id") == artist_id:
+        return True
+
+    return normalize_release_text(track_artist.get("name")) == normalize_release_text(artist.get("name"))
+
+
+def track_deduplication_key(payload: dict[str, Any]) -> str:
+    track_id = payload.get("id")
+    if track_id is not None and not str(track_id).startswith("fallback-"):
+        return str(track_id)
+
+    artist = (payload.get("artist") or {}).get("name")
+    album = (payload.get("album") or {}).get("title")
+    return ".".join([
+        normalize_release_text(payload.get("title")),
+        normalize_release_text(artist),
+        normalize_release_text(album),
+    ])
+
+
 async def enrich_artist(client: DeezerGQLClient, artist: Any) -> dict[str, Any]:
     try:
-        detail = await client.get_artist(str(artist.id), top_tracks_first=0, albums_first=100)
+        detail = await client.get_artist(str(artist.id), top_tracks_first=0, albums_first=500)
         album_count = len(getattr(getattr(detail, "albums", None), "edges", []) or []) if detail else None
         return artist_payload(detail or artist, album_count=album_count)
     except Exception:
@@ -351,7 +374,7 @@ async def search(client: DeezerGQLClient, query: str, scope: str, limit: int) ->
 
     if scope == "album":
         albums = [
-            album_payload(edge.node, index)
+            album_payload(edge.node)
             for index, edge in enumerate(results.albums.edges)
             if edge.node is not None
         ]
@@ -367,7 +390,7 @@ async def search(client: DeezerGQLClient, query: str, scope: str, limit: int) ->
 
 
 async def artist_detail(client: DeezerGQLClient, artist_id: str) -> dict[str, Any]:
-    artist = await client.get_artist(artist_id, top_tracks_first=50, albums_first=100)
+    artist = await client.get_artist(artist_id, top_tracks_first=100, albums_first=500)
     if artist is None:
         raise ValueError("Artist not found")
 
@@ -382,8 +405,68 @@ async def artist_detail(client: DeezerGQLClient, artist_id: str) -> dict[str, An
     }
 
 
+async def artist_tracks(client: DeezerGQLClient, artist_id: str) -> dict[str, Any]:
+    artist = await client.get_artist(artist_id, top_tracks_first=100, albums_first=500)
+    if artist is None:
+        raise ValueError("Artist not found")
+
+    album_edges = getattr(getattr(artist, "albums", None), "edges", []) or []
+    artist_data = artist_payload(artist, album_count=len(album_edges))
+    album_nodes = [
+        edge.node
+        for edge in album_edges
+        if edge.node and getattr(edge.node, "id", None)
+    ]
+    seen: set[str] = set()
+    output: list[dict[str, Any]] = []
+    semaphore = asyncio.Semaphore(6)
+
+    async def tracks_for_album(album: Any) -> list[dict[str, Any]]:
+        async with semaphore:
+            try:
+                hydrated_album = await client.get_album(str(album.id), tracks_first=500)
+            except Exception:
+                hydrated_album = album
+
+        track_edges = getattr(getattr(hydrated_album, "tracks", None), "edges", []) or []
+        mapped: list[dict[str, Any]] = []
+        for index, edge in enumerate(track_edges):
+            if edge.node is None:
+                continue
+            payload = track_payload(edge.node, index, album_context=hydrated_album or album)
+            if same_artist_track(payload, artist_data):
+                mapped.append(payload)
+        return mapped
+
+    for album_tracks in await asyncio.gather(*(tracks_for_album(album) for album in album_nodes)):
+        for payload in album_tracks:
+            key = track_deduplication_key(payload)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            output.append(payload)
+
+    if not output:
+        top_edges = getattr(getattr(artist, "top_tracks", None), "edges", []) or []
+        for index, edge in enumerate(top_edges):
+            if edge.node is None:
+                continue
+            payload = track_payload(edge.node, index)
+            key = track_deduplication_key(payload)
+            if key and key not in seen:
+                seen.add(key)
+                output.append(payload)
+
+    return {
+        "data": output,
+        "total": len(output),
+        "type": "artist-tracks",
+        "artist": artist_data,
+    }
+
+
 async def album_detail(client: DeezerGQLClient, album_id: str) -> dict[str, Any]:
-    album = await client.get_album(album_id, tracks_first=100)
+    album = await client.get_album(album_id, tracks_first=500)
     if album is None:
         raise ValueError("Album not found")
 
@@ -469,6 +552,9 @@ async def main() -> None:
     artist_parser = subcommands.add_parser("artist")
     artist_parser.add_argument("--id", required=True)
 
+    artist_tracks_parser = subcommands.add_parser("artist-tracks")
+    artist_tracks_parser.add_argument("--id", required=True)
+
     album_parser = subcommands.add_parser("album")
     album_parser.add_argument("--id", required=True)
 
@@ -490,6 +576,8 @@ async def main() -> None:
             payload = await search(client, args.query, args.scope, args.limit)
         elif args.command == "artist":
             payload = await artist_detail(client, args.id)
+        elif args.command == "artist-tracks":
+            payload = await artist_tracks(client, args.id)
         elif args.command == "album":
             payload = await album_detail(client, args.id)
         elif args.command == "track-media":

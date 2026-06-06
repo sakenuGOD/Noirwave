@@ -1257,6 +1257,22 @@ struct DeemixAPIClient {
         )
     }
 
+    func artistTracks(id: String) async throws -> [DeemixAPITrackPayload] {
+        let response: DeemixAPISearchResponse = try await get(
+            "getTracklist",
+            queryItems: [
+                URLQueryItem(name: "type", value: "artist-tracks"),
+                URLQueryItem(name: "id", value: id)
+            ]
+        )
+
+        if let error = response.error?.nonEmpty {
+            throw MusicProviderError.providerNotReady(error)
+        }
+
+        return response.data ?? []
+    }
+
     func albumDetail(id: String) async throws -> DeemixAPIAlbumDetailPayload {
         try await get(
             "getTracklist",
@@ -1369,6 +1385,8 @@ final class DeemixAPIProvider: MusicProviding {
     private let client: DeemixAPIClient
     private let downloadTimeout: TimeInterval
     private let immediatePlaybackPrefetchTimeoutMs = 350
+    private let expandedTrackSearchCount = 500
+    private let expandedEntitySearchCount = 250
     private let sessionVault: DeemixAPISessionVault
     private var player: AVPlayer?
     private var lastPlaybackFileURL: URL?
@@ -1416,9 +1434,9 @@ final class DeemixAPIProvider: MusicProviding {
 
         switch scope {
         case .smart:
-            async let artistPayloads = (try? await client.searchArtists(term: term, count: 10)) ?? []
-            async let trackPayloads = (try? await client.searchTracks(term: term, count: 30)) ?? []
-            async let albumPayloads = (try? await client.searchAlbums(term: term, count: 12)) ?? []
+            async let artistPayloads = (try? await client.searchArtists(term: term, count: expandedEntitySearchCount)) ?? []
+            async let trackPayloads = (try? await client.searchTracks(term: term, count: expandedTrackSearchCount)) ?? []
+            async let albumPayloads = (try? await client.searchAlbums(term: term, count: expandedEntitySearchCount)) ?? []
             let (artistsPayload, tracksPayload, albumsPayload) = await (artistPayloads, trackPayloads, albumPayloads)
             let artists = artistsPayload.enumerated().map { index, payload in
                 DeemixAPITrackMapper.mapArtist(payload, fallbackIndex: index)
@@ -1431,8 +1449,8 @@ final class DeemixAPIProvider: MusicProviding {
             }
             return SmartSearchRanker.ranked(query: term, artists: artists, tracks: tracks, albums: albums)
         case .catalog:
-            async let trackPayloads = client.searchTracks(term: term, count: 30)
-            async let artistPayloads = client.searchArtists(term: term, count: 6)
+            async let trackPayloads = client.searchTracks(term: term, count: expandedTrackSearchCount)
+            async let artistPayloads = client.searchArtists(term: term, count: expandedEntitySearchCount)
 
             let payloads = try await trackPayloads
             let tracks = payloads.enumerated().compactMap { index, payload in
@@ -1443,13 +1461,13 @@ final class DeemixAPIProvider: MusicProviding {
             }
             return CatalogSearchResultComposer.catalogResults(term: term, tracks: tracks, artists: artists)
         case .library:
-            let payloads = try await client.searchArtists(term: term, count: 30)
+            let payloads = try await client.searchArtists(term: term, count: expandedEntitySearchCount)
             let artists = payloads.enumerated().map { index, payload in
                 DeemixAPITrackMapper.mapArtist(payload, fallbackIndex: index)
             }
             return DeemixAPIMediaSorter.sortedArtistsByAudience(artists)
         case .playlists:
-            let payloads = try await client.searchAlbums(term: term, count: 30)
+            let payloads = try await client.searchAlbums(term: term, count: expandedEntitySearchCount)
             let albums = payloads.enumerated().map { index, payload in
                 DeemixAPITrackMapper.mapAlbum(payload, fallbackIndex: index)
             }
@@ -1466,15 +1484,24 @@ final class DeemixAPIProvider: MusicProviding {
                 return try await search(item.title, scope: .catalog)
             }
 
-            let detail = try await client.artistDetail(id: artistID)
+            async let detailResponse = client.artistDetail(id: artistID)
+            async let artistTrackPayloadsResponse = client.artistTracks(id: artistID)
+
+            let detail = try await detailResponse
             let artistPayload = detail.artistPayload
-            let popularTracks: [Track]
-            if let topTrackPayloads = detail.topTracks {
-                popularTracks = topTrackPayloads.enumerated().compactMap { index, payload in
+            let artistTrackPayloads = (try? await artistTrackPayloadsResponse) ?? []
+            let fullArtistTracks = artistTrackPayloads.enumerated().compactMap { index, payload in
+                try? DeemixAPITrackMapper.map(payload, fallbackIndex: index, artistContext: artistPayload)
+            }
+            let fallbackTracks: [Track]
+            if fullArtistTracks.isEmpty, let topTrackPayloads = detail.topTracks {
+                fallbackTracks = topTrackPayloads.enumerated().compactMap { index, payload in
                     try? DeemixAPITrackMapper.map(payload, fallbackIndex: index, artistContext: artistPayload)
                 }
+            } else if fullArtistTracks.isEmpty {
+                fallbackTracks = try await artistTopTracks(artistPayload)
             } else {
-                popularTracks = try await artistTopTracks(artistPayload)
+                fallbackTracks = []
             }
             let releaseBuckets = detail.releases ?? [:]
             let groupedReleases = (releaseBuckets["studio"] ?? []) + (releaseBuckets["other"] ?? [])
@@ -1490,8 +1517,10 @@ final class DeemixAPIProvider: MusicProviding {
                 ? albums
                 : DeemixAPIMediaSorter.sortedAlbumsForArtist(albums)
 
-            let topTracks = Array(DeemixAPITrackSorter.sortedByPopularity(popularTracks).prefix(12))
-            return topTracks + orderedAlbums
+            let tracks = fullArtistTracks.isEmpty
+                ? DeemixAPITrackSorter.sortedByPopularity(fallbackTracks)
+                : fullArtistTracks
+            return tracks + orderedAlbums
         case .album:
             guard let albumID = deemixID(from: item, prefix: "deemix-album.") else {
                 return try await search([item.title, item.artist].joined(separator: " "), scope: .catalog)
@@ -1868,7 +1897,7 @@ final class DeemixAPIProvider: MusicProviding {
         let term = artist.name?.nonEmpty ?? ""
         guard !term.isEmpty else { return [] }
 
-        let payloads = try await client.searchTracks(term: term, count: 50)
+        let payloads = try await client.searchTracks(term: term, count: expandedTrackSearchCount)
         return payloads.enumerated().compactMap { index, payload in
             let sameArtistID = payload.artist?.id == artist.id
             let sameArtistName = payload.artist?.name?.localizedCaseInsensitiveCompare(term) == .orderedSame

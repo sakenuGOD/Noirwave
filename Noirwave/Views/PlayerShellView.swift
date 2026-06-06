@@ -1,6 +1,6 @@
 import SwiftUI
 
-private enum ShellDestination: String, CaseIterable, Identifiable {
+enum ShellDestination: String, CaseIterable, Identifiable {
     case listenNow = "Listen Now"
     case search = "Search"
     case library = "Library"
@@ -26,6 +26,31 @@ private enum ShellDestination: String, CaseIterable, Identifiable {
             "Catalog"
         case .library:
             "Albums & artists"
+        }
+    }
+}
+
+enum ShellContentRoute: Equatable {
+    case listenNow
+    case searchLanding
+    case searchResults
+    case library
+    case catalogDetail
+}
+
+enum ShellContentRouteResolver {
+    static func route(selection: ShellDestination, hasSearchQuery: Bool, hasCatalogContext: Bool) -> ShellContentRoute {
+        if hasCatalogContext {
+            return .catalogDetail
+        }
+
+        switch selection {
+        case .listenNow:
+            return .listenNow
+        case .search:
+            return hasSearchQuery ? .searchResults : .searchLanding
+        case .library:
+            return .library
         }
     }
 }
@@ -59,8 +84,19 @@ enum LibraryPlaylistSelection: Equatable {
 }
 
 enum PlaylistTargetMenuBuilder {
+    static let visibleTargetLimit = 5
+
     static func targetPlaylists(_ playlists: [LocalPlaylist], excludingPlaylistID: String?) -> [LocalPlaylist] {
-        playlists.filter { $0.id != excludingPlaylistID }
+        var seenTitles: Set<String> = []
+
+        return playlists.compactMap { playlist in
+            guard playlist.id != excludingPlaylistID else { return nil }
+            let key = playlist.title.searchNormalized
+            guard seenTitles.insert(key).inserted else { return nil }
+            return playlist
+        }
+        .prefix(visibleTargetLimit)
+        .map(\.self)
     }
 }
 
@@ -91,7 +127,7 @@ struct PlayerShellView: View {
     @EnvironmentObject private var store: PlayerStore
     @State private var selectedDestination: ShellDestination = .listenNow
     @State private var selectedPlaylist: LibraryPlaylistSelection?
-    @State private var isShowingNowPlaying = false
+    @State private var visibleNowPlayingPanel: NowPlayingPanelMode?
     @State private var nowPlayingPanelMode: NowPlayingPanelMode = .lyrics
     @State private var playlistEditor: PlaylistEditor?
 
@@ -120,40 +156,44 @@ struct PlayerShellView: View {
                         .padding(.top, 16)
                         .padding(.bottom, 8)
 
-                    ContentDeckView(
-                        selection: selectedDestination,
-                        selectedPlaylist: $selectedPlaylist
-                    )
-                    .environment(\.requestPlaylistCreationFromTrack) { track in
-                        playlistEditor = PlaylistEditor(
-                            playlistID: nil,
-                            title: LocalPlaylist.fallbackTitle,
-                            tracks: [track]
+                    HStack(spacing: 14) {
+                        ContentDeckView(
+                            selection: selectedDestination,
+                            selectedPlaylist: $selectedPlaylist
                         )
+                        .environment(\.requestPlaylistCreationFromTrack) { track in
+                            playlistEditor = PlaylistEditor(
+                                playlistID: nil,
+                                title: LocalPlaylist.fallbackTitle,
+                                tracks: [track]
+                            )
+                        }
+                        .environment(\.requestPlaylistCreationFromTracks) { tracks in
+                            playlistEditor = PlaylistEditor(
+                                playlistID: nil,
+                                title: LocalPlaylist.fallbackTitle,
+                                tracks: tracks
+                            )
+                        }
+
+                        if let visibleNowPlayingPanel, store.currentTrack != nil {
+                            InlineNowPlayingPanel(selectedPanel: $nowPlayingPanelMode)
+                                .id(visibleNowPlayingPanel)
+                                .frame(width: 390)
+                                .transition(AnyTransition.move(edge: .trailing).combined(with: .opacity))
+                        }
                     }
-                    .environment(\.requestPlaylistCreationFromTracks) { tracks in
-                        playlistEditor = PlaylistEditor(
-                            playlistID: nil,
-                            title: LocalPlaylist.fallbackTitle,
-                            tracks: tracks
-                        )
-                    }
+                    .animation(.snappy(duration: 0.22), value: visibleNowPlayingPanel)
 
                     MiniPlayerBar(
                         selectedPanel: $nowPlayingPanelMode,
-                        isShowingNowPlaying: $isShowingNowPlaying
+                        visiblePanel: $visibleNowPlayingPanel
                     )
                     .padding(.horizontal, 24)
                     .padding(.vertical, 14)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-        }
-        .sheet(isPresented: $isShowingNowPlaying) {
-            NowPlayingPanel(selectedPanel: $nowPlayingPanelMode)
-                .environmentObject(store)
-                .frame(minWidth: 900, idealWidth: 980, minHeight: 680, idealHeight: 760)
-                .background(.regularMaterial)
         }
         .sheet(item: $playlistEditor) { editor in
             PlaylistTitleSheet(title: editor.title, primaryLabel: "Create") { title in
@@ -207,7 +247,7 @@ private struct SidebarView: View {
             HStack(spacing: 10) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill((store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent).opacity(0.95))
+                        .fill(NoirwaveTheme.primaryAccent.opacity(0.95))
                     Image(systemName: "waveform")
                         .font(.system(size: 16, weight: .bold))
                         .foregroundStyle(.black)
@@ -225,6 +265,11 @@ private struct SidebarView: View {
             }
             .padding(.top, 18)
             .padding(.horizontal, 8)
+
+            SidebarSearchField(
+                selection: $selection,
+                selectedPlaylist: $selectedPlaylist
+            )
 
             VStack(alignment: .leading, spacing: 5) {
                 ForEach(ShellDestination.allCases) { destination in
@@ -254,6 +299,70 @@ private struct SidebarView: View {
     }
 }
 
+private struct SidebarSearchField: View {
+    @EnvironmentObject private var store: PlayerStore
+    @Binding var selection: ShellDestination
+    @Binding var selectedPlaylist: LibraryPlaylistSelection?
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(isFocused ? accent : .white.opacity(0.48))
+                .frame(width: 16)
+
+            TextField(
+                "Search",
+                text: Binding(
+                    get: { store.searchQuery },
+                    set: { value in
+                        store.updateSearchQuery(value)
+                        store.leaveCatalogContext()
+                        if !value.trimmed.isEmpty {
+                            selection = .search
+                            selectedPlaylist = nil
+                        }
+                    }
+                )
+            )
+            .textFieldStyle(.plain)
+            .font(.system(size: 13, weight: .semibold))
+            .focused($isFocused)
+
+            if !store.searchQuery.trimmed.isEmpty {
+                Button {
+                    store.updateSearchQuery("")
+                    isFocused = false
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12, weight: .bold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white.opacity(0.42))
+                .frame(width: 22, height: 22)
+                .help("Clear search")
+            }
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 11)
+        .frame(height: 36)
+        .background(
+            isFocused ? Color.white.opacity(0.085) : Color.white.opacity(0.045),
+            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(isFocused ? accent.opacity(0.38) : .white.opacity(0.075), lineWidth: 1)
+        )
+        .padding(.horizontal, 2)
+    }
+
+    private var accent: Color {
+        NoirwaveTheme.primaryAccent
+    }
+}
+
 private struct SidebarItem: View {
     @EnvironmentObject private var store: PlayerStore
     let title: String
@@ -278,7 +387,7 @@ private struct SidebarItem: View {
             .frame(height: 34)
             .background(
                 active
-                    ? (store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent)
+                    ? NoirwaveTheme.primaryAccent
                     : .white.opacity(0.045),
                 in: RoundedRectangle(cornerRadius: 6, style: .continuous)
             )
@@ -321,10 +430,13 @@ private struct SidebarPlaylistPreview: View {
     @EnvironmentObject private var store: PlayerStore
     @Binding var selection: ShellDestination
     @Binding var selectedPlaylist: LibraryPlaylistSelection?
+    @State private var isExpanded = false
+
+    private let collapsedLimit = 5
 
     private var collections: [SidebarLibraryCollection] {
         let savedTracks = store.likedTracks(limit: 120).filter(\.isPlayable)
-        let localCollections = store.localPlaylists.prefix(3).map { playlist in
+        let localCollections = store.localPlaylists.map { playlist in
             let tracks = store.playlistTracks(playlistID: playlist.id)
             return SidebarLibraryCollection(
                 id: "playlist.\(playlist.id)",
@@ -348,7 +460,7 @@ private struct SidebarPlaylistPreview: View {
                     tracks: discoveryTracks
                 )
             ]
-            return Array((localCollections + discoveryCollections).prefix(3))
+            return localCollections + discoveryCollections
         }
 
         var output: [SidebarLibraryCollection] = [
@@ -370,11 +482,19 @@ private struct SidebarPlaylistPreview: View {
             output.append(artist)
         }
 
-        return Array(output.prefix(3))
+        return output
+    }
+
+    private var visibleCollections: [SidebarLibraryCollection] {
+        isExpanded ? collections : Array(collections.prefix(collapsedLimit))
+    }
+
+    private var hiddenCount: Int {
+        max(collections.count - collapsedLimit, 0)
     }
 
     private var accent: Color {
-        store.currentTrack?.palette.accent ?? collections.first?.tracks.first?.palette.accent ?? NoirwaveTheme.primaryAccent
+        NoirwaveTheme.primaryAccent
     }
 
     private func topAlbumCollection(from tracks: [Track]) -> SidebarLibraryCollection? {
@@ -451,7 +571,7 @@ private struct SidebarPlaylistPreview: View {
                 SidebarCollectionEmptyRow(accent: accent)
             } else {
                 VStack(spacing: 6) {
-                    ForEach(collections) { collection in
+                    ForEach(visibleCollections) { collection in
                         let isSelected = collection.selection != nil
                             && selection == .library
                             && selectedPlaylist == collection.selection
@@ -464,6 +584,28 @@ private struct SidebarPlaylistPreview: View {
                                 store.playAll(collection.tracks)
                             }
                         }
+                    }
+
+                    if hiddenCount > 0 {
+                        Button {
+                            withAnimation(.snappy(duration: 0.18)) {
+                                isExpanded.toggle()
+                            }
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                                    .font(.system(size: 10, weight: .bold))
+                                Text(isExpanded ? "Hide" : "Show \(hiddenCount)")
+                                    .font(.system(size: 11, weight: .bold))
+                                Spacer()
+                            }
+                            .foregroundStyle(.white.opacity(0.68))
+                            .padding(.horizontal, 10)
+                            .frame(height: 30)
+                            .background(.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                        .help(isExpanded ? "Collapse playlists" : "Show more playlists")
                     }
                 }
             }
@@ -478,7 +620,7 @@ private struct SidebarPlaylistRow: View {
     let action: () -> Void
 
     private var accent: Color {
-        store.currentTrack?.palette.accent ?? collection.tracks.first?.palette.accent ?? NoirwaveTheme.primaryAccent
+        NoirwaveTheme.primaryAccent
     }
 
     var body: some View {
@@ -576,44 +718,7 @@ private struct TopBarView: View {
 
             Spacer(minLength: 0)
 
-            HStack(spacing: 9) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.white.opacity(0.52))
-                TextField(
-                    "Search music",
-                    text: Binding(
-                        get: { store.searchQuery },
-                        set: { value in
-                            store.updateSearchQuery(value)
-                            if !value.trimmed.isEmpty {
-                                selection = .search
-                                store.leaveCatalogContext()
-                            }
-                        }
-                    )
-                )
-                .textFieldStyle(.plain)
-                .font(.system(size: 15))
-
-                if store.isSearching {
-                    ProgressView()
-                        .controlSize(.small)
-                        .scaleEffect(0.7)
-                        .frame(width: 16, height: 16)
-                }
-            }
-            .padding(.horizontal, 13)
-            .frame(height: 42)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(.white.opacity(0.11), lineWidth: 1)
-            )
-            .frame(maxWidth: 680)
-
             TopBarSourceControls(isShowingSessionSettings: $isShowingSessionSettings)
-
-            Spacer(minLength: 0)
         }
         .sheet(isPresented: $isShowingSessionSettings) {
             SessionSettingsSheet()
@@ -677,6 +782,12 @@ private struct ContentDeckView: View {
     @Binding var selectedPlaylist: LibraryPlaylistSelection?
 
     var body: some View {
+        let route = ShellContentRouteResolver.route(
+            selection: selection,
+            hasSearchQuery: !store.searchQuery.trimmed.isEmpty,
+            hasCatalogContext: store.catalogContext != nil
+        )
+
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 if store.needsBackendSession,
@@ -684,18 +795,20 @@ private struct ContentDeckView: View {
                     PlaybackErrorBanner(message: errorMessage)
                 }
 
-                if let context = store.catalogContext {
+                if let context = store.catalogContext, route == .catalogDetail {
                     CatalogDetailContent(context: context)
-                } else if !store.searchQuery.trimmed.isEmpty {
+                } else if route == .searchResults {
                     SearchResultsView(items: store.visibleTracks, isLoading: store.isSearching)
                 } else {
-                    switch selection {
+                    switch route {
                     case .listenNow:
                         ListenNowView()
-                    case .search:
+                    case .searchLanding:
                         SearchLandingView()
                     case .library:
                         LibraryView(selectedPlaylistSelection: $selectedPlaylist)
+                    case .searchResults, .catalogDetail:
+                        EmptyView()
                     }
                 }
             }
@@ -805,7 +918,7 @@ private struct WaveLaunchHero: View {
                                 .foregroundStyle(.black)
                                 .padding(.horizontal, 20)
                                 .frame(height: 50)
-                                .background(track.palette.accent, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                .background(NoirwaveTheme.primaryAccent, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                         }
                         .buttonStyle(.plain)
                         .help("Start wave")
@@ -819,7 +932,7 @@ private struct WaveLaunchHero: View {
                                 .background(.white.opacity(0.11), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                         }
                         .buttonStyle(.plain)
-                        .foregroundStyle(store.isLiked(track) ? track.palette.accent : .white.opacity(0.82))
+                        .foregroundStyle(store.isLiked(track) ? NoirwaveTheme.primaryAccent : .white.opacity(0.82))
                         .help(store.isLiked(track) ? "Unlike" : "Like")
                     }
                 }
@@ -850,7 +963,7 @@ private struct SearchLandingView: View {
                 SearchPromptStage()
                 CollectionActionCluster(
                     tracks: tracks,
-                    accent: store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent,
+                    accent: NoirwaveTheme.primaryAccent,
                     primaryLabel: "Play"
                 )
                 FeaturedTrackShelf(title: "Можно включить", tracks: tracks)
@@ -864,10 +977,10 @@ private struct SearchPromptStage: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Поиск")
+            Text("Каталог")
                 .font(.system(size: 42, weight: .bold, design: .rounded))
                 .foregroundStyle(.white)
-            Text("Введи артиста, альбом или трек сверху.")
+            Text(store.provider.sourceName)
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.46))
         }
@@ -907,7 +1020,7 @@ private struct SearchResultsView: View {
                 EntityShelf(title: "Релизы", items: albums, cardSize: 190, roundArtists: false)
                 CollectionActionCluster(
                     tracks: tracks,
-                    accent: store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent,
+                    accent: NoirwaveTheme.primaryAccent,
                     primaryLabel: "Play"
                 )
                 TrackListSection(title: "Треки", subtitle: "\(tracks.count)", tracks: tracks, numbered: false)
@@ -945,9 +1058,6 @@ enum LibrarySurfaceLayout {
         }
         if hasTracks {
             sections.append(.favoriteTracks)
-        }
-        if hasLocalPlaylists {
-            sections.append(.playlists)
         }
         return sections
     }
@@ -1185,7 +1295,7 @@ private struct LibraryView: View {
                 query: $favoriteTracksQuery,
                 tracks: favoriteTracks,
                 totalTracks: filteredTracks.count,
-                accent: store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent,
+                accent: NoirwaveTheme.primaryAccent,
                 primaryLabel: "Play Favorites"
             )
         case .playlists:
@@ -1332,7 +1442,7 @@ private struct LocalPlaylistDetailView: View {
     }
 
     private var accent: Color {
-        tracks.first?.palette.accent ?? store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent
+        NoirwaveTheme.primaryAccent
     }
 
     private var trackCountLabel: String {
@@ -1679,7 +1789,7 @@ private struct LibraryCreatePlaylistMenu: View {
     let onCreatePlaylist: () -> Void
 
     private var accent: Color {
-        store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent
+        NoirwaveTheme.primaryAccent
     }
 
     var body: some View {
@@ -1705,7 +1815,7 @@ private struct LibrarySortMenu: View {
     @Binding var selection: LibrarySortMode
 
     private var accent: Color {
-        store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent
+        NoirwaveTheme.primaryAccent
     }
 
     var body: some View {
@@ -1752,7 +1862,7 @@ private struct PlaylistSortMenu: View {
     @Binding var selection: PlaylistSortMode
 
     private var accent: Color {
-        store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent
+        NoirwaveTheme.primaryAccent
     }
 
     var body: some View {
@@ -1802,7 +1912,7 @@ private struct LocalLibrarySearchField: View {
     let clearHelp: String
 
     private var accent: Color {
-        store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent
+        NoirwaveTheme.primaryAccent
     }
 
     private var borderColor: Color {
@@ -1954,7 +2064,7 @@ private struct LibraryCollectionsShelf: View {
                                 subtitle: "\(tracks.count) tracks",
                                 symbol: "heart.fill",
                                 artworkTracks: Array(tracks.prefix(4)),
-                                accent: store.currentTrack?.palette.accent ?? tracks.first?.palette.accent ?? NoirwaveTheme.primaryAccent
+                                accent: NoirwaveTheme.primaryAccent
                             ) {
                                 store.playAll(tracks)
                             }
@@ -2049,31 +2159,60 @@ private struct LibraryPlaylistsShelf: View {
     let items: [LibraryPlaylistShelfItem]
     let onSelectPlaylist: (LibraryPlaylistSelection) -> Void
 
+    @State private var isExpanded = false
+
+    private let collapsedLimit = 5
+
+    private var visibleItems: [LibraryPlaylistShelfItem] {
+        isExpanded ? items : Array(items.prefix(collapsedLimit))
+    }
+
+    private var hiddenCount: Int {
+        max(items.count - collapsedLimit, 0)
+    }
+
     var body: some View {
         if !items.isEmpty {
             VStack(alignment: .leading, spacing: 12) {
                 SectionTitle(title: "Плейлисты", subtitle: "\(items.count)")
 
-                ScrollView(.horizontal) {
-                    HStack(alignment: .top, spacing: 14) {
-                        ForEach(items.prefix(10)) { item in
-                            let accent = item.artworkTracks.first?.palette.accent
-                                ?? store.currentTrack?.palette.accent
-                                ?? NoirwaveTheme.primaryAccent
-                            LibraryCollectionCard(
-                                title: item.title,
-                                subtitle: item.subtitle,
-                                symbol: item.symbol,
-                                artworkTracks: item.artworkTracks,
-                                accent: accent
-                            ) {
-                                onSelectPlaylist(item.selection)
-                            }
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 156, maximum: 178), spacing: 14, alignment: .top)],
+                    alignment: .leading,
+                    spacing: 16
+                ) {
+                    ForEach(visibleItems) { item in
+                        let accent = item.artworkTracks.first?.palette.accent
+                            ?? NoirwaveTheme.primaryAccent
+                        LibraryCollectionCard(
+                            title: item.title,
+                            subtitle: item.subtitle,
+                            symbol: item.symbol,
+                            artworkTracks: item.artworkTracks,
+                            accent: accent
+                        ) {
+                            onSelectPlaylist(item.selection)
                         }
                     }
-                    .padding(.vertical, 2)
                 }
-                .scrollIndicators(.hidden)
+                .animation(.snappy(duration: 0.2), value: isExpanded)
+
+                if hiddenCount > 0 {
+                    Button {
+                        withAnimation(.snappy(duration: 0.2)) {
+                            isExpanded.toggle()
+                        }
+                    } label: {
+                        Label(isExpanded ? "Скрыть" : "Показать еще \(hiddenCount)", systemImage: isExpanded ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(.white.opacity(0.76))
+                            .padding(.horizontal, 12)
+                            .frame(height: 34)
+                            .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .help(isExpanded ? "Collapse playlists" : "Show more playlists")
+                }
             }
         }
     }
@@ -2087,6 +2226,10 @@ private struct LibraryCollectionCard: View {
     let accent: Color
     let action: () -> Void
 
+    private var controlAccent: Color {
+        NoirwaveTheme.primaryAccent
+    }
+
     var body: some View {
         Button(action: action) {
             VStack(alignment: .leading, spacing: 10) {
@@ -2097,7 +2240,7 @@ private struct LibraryCollectionCard: View {
                         .font(.system(size: 12, weight: .bold))
                         .foregroundStyle(.black)
                         .frame(width: 30, height: 30)
-                        .background(accent, in: Circle())
+                        .background(controlAccent, in: Circle())
                         .padding(8)
                 }
 
@@ -2350,7 +2493,7 @@ private struct NowPlayingHero: View {
                             .foregroundStyle(.black)
                             .padding(.horizontal, 16)
                             .padding(.vertical, 10)
-                            .background(track.palette.accent, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            .background(NoirwaveTheme.primaryAccent, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                         }
                         .buttonStyle(.plain)
 
@@ -2422,13 +2565,13 @@ private struct BestMatchCard: View {
                     .font(.system(size: 16, weight: .bold))
                     .foregroundStyle(.black)
                     .frame(width: 42, height: 42)
-                    .background(item.palette.accent, in: Circle())
+                    .background(NoirwaveTheme.primaryAccent, in: Circle())
             }
             .padding(16)
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(item.palette.accent.opacity(0.22), lineWidth: 1)
+                    .stroke(NoirwaveTheme.primaryAccent.opacity(0.18), lineWidth: 1)
             )
         }
         .buttonStyle(.plain)
@@ -2489,7 +2632,7 @@ private struct TrackFeatureCard: View {
                             .font(.system(size: 12, weight: .bold))
                             .foregroundStyle(.black)
                             .frame(width: 30, height: 30)
-                            .background(track.palette.accent, in: Circle())
+                            .background(NoirwaveTheme.primaryAccent, in: Circle())
                             .padding(8)
                     }
 
@@ -2713,7 +2856,7 @@ private struct TrackRowView: View {
 
     private var rowBackground: AnyShapeStyle {
         isCurrent
-            ? AnyShapeStyle(track.palette.accent.opacity(0.16))
+            ? AnyShapeStyle(NoirwaveTheme.primaryAccent.opacity(0.14))
             : AnyShapeStyle(.ultraThinMaterial)
     }
 
@@ -2791,7 +2934,7 @@ private struct TrackRowView: View {
         .background(rowBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(isCurrent ? track.palette.accent.opacity(0.38) : .white.opacity(0.07), lineWidth: 1)
+                .stroke(isCurrent ? NoirwaveTheme.primaryAccent.opacity(0.36) : .white.opacity(0.07), lineWidth: 1)
         )
         .contextMenu {
             Button {
@@ -2952,9 +3095,9 @@ private struct ArtistDetailView: View {
             } else if tracks.isEmpty && releases.isEmpty {
                 EmptySearchView()
             } else {
+                TrackListSection(title: "Songs", subtitle: "\(tracks.count) tracks", tracks: tracks, numbered: true)
                 EntityShelf(title: "Studio Albums", items: groups.studioAlbums, cardSize: 214, roundArtists: false)
                 EntityShelf(title: "Reissues & Live", items: groups.otherReleases, cardSize: 178, roundArtists: false)
-                TrackListSection(title: "Popular Tracks", subtitle: "\(tracks.count) tracks", tracks: tracks, numbered: true)
             }
         }
     }
@@ -3029,7 +3172,7 @@ private struct ArtistHeroView: View {
             HStack(spacing: 8) {
                 CollectionActionCluster(
                     tracks: tracks,
-                    accent: artist.palette.accent,
+                    accent: NoirwaveTheme.primaryAccent,
                     primaryLabel: "Play Artist"
                 )
 
@@ -3130,7 +3273,7 @@ private struct AlbumHeroView: View {
             HStack(spacing: 8) {
                 CollectionActionCluster(
                     tracks: tracks,
-                    accent: album.palette.accent,
+                    accent: NoirwaveTheme.primaryAccent,
                     primaryLabel: "Play Album"
                 )
 
@@ -3150,7 +3293,7 @@ private struct AlbumHeroView: View {
 private struct MiniPlayerBar: View {
     @EnvironmentObject private var store: PlayerStore
     @Binding var selectedPanel: NowPlayingPanelMode
-    @Binding var isShowingNowPlaying: Bool
+    @Binding var visiblePanel: NowPlayingPanelMode?
 
     private var playSymbol: String {
         switch store.playbackState {
@@ -3170,7 +3313,8 @@ private struct MiniPlayerBar: View {
 
                 HStack(spacing: 14) {
                     Button {
-                        isShowingNowPlaying = true
+                        selectedPanel = .lyrics
+                        visiblePanel = .lyrics
                     } label: {
                         HStack(spacing: 10) {
                             ArtworkTile(track: track, size: 52, cornerRadius: 9)
@@ -3201,24 +3345,22 @@ private struct MiniPlayerBar: View {
 
                     HStack(spacing: 10) {
                         Button {
-                            selectedPanel = .lyrics
-                            isShowingNowPlaying = true
+                            togglePanel(.lyrics)
                         } label: {
                             PlayerPanelButtonLabel(
                                 symbol: "text.quote",
-                                active: isShowingNowPlaying && selectedPanel == .lyrics
+                                active: visiblePanel == .lyrics
                             )
                         }
                         .buttonStyle(.plain)
                         .help("Lyrics")
 
                         Button {
-                            selectedPanel = .queue
-                            isShowingNowPlaying = true
+                            togglePanel(.queue)
                         } label: {
                             PlayerPanelButtonLabel(
                                 symbol: "text.line.last.and.arrowtriangle.forward",
-                                active: isShowingNowPlaying && selectedPanel == .queue
+                                active: visiblePanel == .queue
                             )
                         }
                         .buttonStyle(.plain)
@@ -3231,17 +3373,53 @@ private struct MiniPlayerBar: View {
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(.white.opacity(0.12), lineWidth: 1)
+            .background(
+                ZStack {
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(.ultraThinMaterial)
+                    LinearGradient(
+                        colors: [
+                            .white.opacity(0.16),
+                            .white.opacity(0.045),
+                            .black.opacity(0.16)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                }
             )
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(
+                        LinearGradient(
+                            colors: [.white.opacity(0.28), NoirwaveTheme.primaryAccent.opacity(0.22), .white.opacity(0.08)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 1
+                    )
+            )
+            .shadow(
+                color: NoirwaveTheme.primaryAccent.opacity(0.16),
+                radius: 24,
+                x: 0,
+                y: 12
+            )
+        }
+    }
+
+    private func togglePanel(_ panel: NowPlayingPanelMode) {
+        if visiblePanel == panel {
+            visiblePanel = nil
+        } else {
+            selectedPanel = panel
+            visiblePanel = panel
         }
     }
 }
 
 private struct PlayerPanelButtonLabel: View {
-    @EnvironmentObject private var store: PlayerStore
     let symbol: String
     let active: Bool
 
@@ -3252,7 +3430,7 @@ private struct PlayerPanelButtonLabel: View {
             .frame(width: 32, height: 32)
             .background(
                 active
-                    ? (store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent)
+                    ? NoirwaveTheme.primaryAccent
                     : .white.opacity(0.08),
                 in: RoundedRectangle(cornerRadius: 9, style: .continuous)
             )
@@ -3273,7 +3451,7 @@ private struct FavoriteButton: View {
                 .frame(width: size, height: size)
         }
         .buttonStyle(.plain)
-        .foregroundStyle(store.isLiked(track) ? track.palette.accent : .white.opacity(0.62))
+        .foregroundStyle(store.isLiked(track) ? NoirwaveTheme.primaryAccent : .white.opacity(0.62))
         .help(store.isLiked(track) ? "Remove from favorites" : "Add to favorites")
     }
 }
@@ -3299,12 +3477,12 @@ private struct SavedCollectionButton: View {
             .buttonStyle(.plain)
             .foregroundStyle(isSaved ? .black : .white.opacity(0.76))
             .background(
-                isSaved ? item.palette.accent : Color(hex: "#1C1C1E"),
+                isSaved ? NoirwaveTheme.primaryAccent : Color(hex: "#1C1C1E"),
                 in: RoundedRectangle(cornerRadius: 8, style: .continuous)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(isSaved ? item.palette.accent.opacity(0.38) : .white.opacity(0.1), lineWidth: 1)
+                    .stroke(isSaved ? NoirwaveTheme.primaryAccent.opacity(0.38) : .white.opacity(0.1), lineWidth: 1)
             )
             .help(isSaved ? "Remove from Library" : "Save to Library")
         }
@@ -3334,7 +3512,7 @@ private struct VolumeControl: View {
                 ),
                 in: 0...1
             )
-            .tint(store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent)
+            .tint(NoirwaveTheme.primaryAccent)
             .frame(width: 104)
         }
         .help("Volume")
@@ -3396,7 +3574,7 @@ private struct PlayerModeButton: View {
                 .frame(width: 30, height: 30)
                 .background(
                     active
-                        ? (store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent)
+                        ? NoirwaveTheme.primaryAccent
                         : .white.opacity(0.07),
                     in: Circle()
                 )
@@ -3421,12 +3599,57 @@ private struct PlayerIconButton: View {
                 .frame(width: size, height: size)
                 .background(
                     primary
-                        ? (store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent)
+                        ? NoirwaveTheme.primaryAccent
                         : .white.opacity(0.1),
                     in: Circle()
                 )
         }
         .buttonStyle(.plain)
+    }
+}
+
+private struct InlineNowPlayingPanel: View {
+    @EnvironmentObject private var store: PlayerStore
+    @Binding var selectedPanel: NowPlayingPanelMode
+
+    var body: some View {
+        if let track = store.currentTrack {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(selectedPanel.rawValue)
+                            .font(.system(size: 20, weight: .bold, design: .rounded))
+                            .foregroundStyle(.white)
+                        Text(track.title)
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.48))
+                            .lineLimit(1)
+                    }
+
+                    Spacer()
+
+                    NowPlayingPanelPicker(selectedPanel: $selectedPanel)
+                        .frame(width: 142)
+                }
+
+                switch selectedPanel {
+                case .lyrics:
+                    LyricsReaderContentView(track: track, isExpanded: true)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                case .queue:
+                    QueuePanelView()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                }
+            }
+            .padding(16)
+            .foregroundStyle(.white)
+            .frame(maxHeight: .infinity)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(.white.opacity(0.12), lineWidth: 1)
+            )
+        }
     }
 }
 
@@ -3615,13 +3838,19 @@ private struct LyricsReaderContentView: View {
             ScrollView(showsIndicators: isExpanded) {
                 VStack(alignment: .leading, spacing: isExpanded ? 18 : 12) {
                     ForEach(Array(lyrics.lines.enumerated()), id: \.offset) { index, line in
-                        LyricsLineView(
-                            text: line.text,
-                            isActive: index == activeLineIndex,
-                            accent: track.palette.accent,
-                            isExpanded: isExpanded
-                        )
+                        Button {
+                            seek(to: line)
+                        } label: {
+                            LyricsLineView(
+                                text: line.text,
+                                isActive: index == activeLineIndex,
+                                accent: NoirwaveTheme.primaryAccent,
+                                isExpanded: isExpanded
+                            )
+                        }
+                        .buttonStyle(.plain)
                         .id(index)
+                        .help("Jump to lyric")
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -3639,6 +3868,11 @@ private struct LyricsReaderContentView: View {
                 }
             }
         }
+    }
+
+    private func seek(to line: TrackLyricsLine) {
+        guard track.duration > 0 else { return }
+        store.seek(to: line.startTime / track.duration)
     }
 
     private func plainLyrics(_ lyrics: TrackLyrics) -> some View {
@@ -3943,7 +4177,7 @@ private struct ProgressStack: View {
                 ),
                 in: 0...1
             )
-            .tint(track.palette.accent)
+            .tint(NoirwaveTheme.primaryAccent)
 
             HStack {
                 Text(store.progress.playbackLabel)
@@ -3972,7 +4206,7 @@ private struct SessionSettingsSheet: View {
             HStack(alignment: .top, spacing: 12) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill((store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent).opacity(0.92))
+                        .fill(NoirwaveTheme.primaryAccent.opacity(0.92))
                     Image(systemName: "key.fill")
                         .font(.system(size: 17, weight: .bold))
                         .foregroundStyle(.black)
@@ -4045,7 +4279,7 @@ private struct SessionSettingsSheet: View {
                     .frame(maxWidth: .infinity)
                     .frame(height: 38)
                     .background(
-                        (store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent).opacity(canSubmit ? 1 : 0.5),
+                        NoirwaveTheme.primaryAccent.opacity(canSubmit ? 1 : 0.5),
                         in: RoundedRectangle(cornerRadius: 8, style: .continuous)
                     )
                 }
@@ -4214,7 +4448,7 @@ private struct MusicConnectPanel: View {
                 .foregroundStyle(.black)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
-                .background((store.currentTrack?.palette.accent ?? NoirwaveTheme.primaryAccent), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .background(NoirwaveTheme.primaryAccent, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
             .buttonStyle(.plain)
             .help(actionTitle)
@@ -4328,6 +4562,10 @@ private struct CollectionActionCluster: View {
     let accent: Color
     let primaryLabel: String
 
+    private var controlAccent: Color {
+        NoirwaveTheme.primaryAccent
+    }
+
     private var playableTracks: [Track] {
         tracks.filter(\.isPlayable)
     }
@@ -4343,7 +4581,7 @@ private struct CollectionActionCluster: View {
                         .foregroundStyle(.black)
                         .padding(.horizontal, 14)
                         .frame(height: 34)
-                        .background(accent, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .background(controlAccent, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 }
                 .buttonStyle(.plain)
                 .help(primaryLabel)
