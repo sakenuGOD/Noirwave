@@ -793,11 +793,19 @@ private struct LibraryView: View {
     @State private var librarySortMode: LibrarySortMode = .recentlyAdded
 
     private var likedTracks: [Track] {
-        store.likedTracks(limit: 100)
+        store.likedTracks(limit: Int.max)
+    }
+
+    private var savedCollections: [Track] {
+        store.savedCollections(limit: 16)
     }
 
     private var filteredTracks: [Track] {
         LibraryTrackOrganizer.tracks(likedTracks, query: libraryQuery, sortMode: librarySortMode)
+    }
+
+    private var filteredSavedCollections: [Track] {
+        LibrarySearchFilter.filteredTracks(savedCollections, query: libraryQuery)
     }
 
     private var albums: [Track] {
@@ -809,23 +817,28 @@ private struct LibraryView: View {
     }
 
     var body: some View {
-        if likedTracks.isEmpty {
+        if likedTracks.isEmpty && savedCollections.isEmpty {
             EmptyLibraryPanel()
         } else {
             VStack(alignment: .leading, spacing: 24) {
                 LibraryHeaderView(
                     query: $libraryQuery,
                     sortMode: $librarySortMode,
-                    totalCount: likedTracks.count,
-                    filteredCount: filteredTracks.count
+                    totalCount: likedTracks.count + savedCollections.count,
+                    filteredCount: filteredTracks.count + filteredSavedCollections.count
                 )
 
                 LibraryStatsView(artists: artists, albums: albums, tracks: filteredTracks)
-                LibraryCollectionsShelf(tracks: filteredTracks, albums: albums, artists: artists)
+                LibraryCollectionsShelf(
+                    tracks: filteredTracks,
+                    savedCollections: filteredSavedCollections,
+                    albums: albums,
+                    artists: artists
+                )
 
-                if filteredTracks.isEmpty {
+                if filteredTracks.isEmpty && filteredSavedCollections.isEmpty {
                     EmptyLibrarySearchPanel(query: libraryQuery)
-                } else {
+                } else if !filteredTracks.isEmpty {
                     CollectionActionCluster(
                         tracks: filteredTracks,
                         accent: store.currentTrack?.palette.accent ?? .white,
@@ -979,28 +992,44 @@ private struct LocalLibrarySearchField: View {
 private struct LibraryCollectionsShelf: View {
     @EnvironmentObject private var store: PlayerStore
     let tracks: [Track]
+    let savedCollections: [Track]
     let albums: [Track]
     let artists: [Track]
 
     private var collectionCount: Int {
-        (tracks.isEmpty ? 0 : 1) + albums.count + artists.count
+        min(savedCollections.count, 10) + (tracks.isEmpty ? 0 : 1) + min(albums.count, 8) + min(artists.count, 6)
     }
 
     var body: some View {
-        if !tracks.isEmpty {
+        if !tracks.isEmpty || !savedCollections.isEmpty {
             VStack(alignment: .leading, spacing: 12) {
                 SectionTitle(title: "Плейлисты", subtitle: "\(collectionCount)")
 
                 ScrollView(.horizontal) {
                     HStack(alignment: .top, spacing: 14) {
-                        LibraryCollectionCard(
-                            title: "Любимые треки",
-                            subtitle: "\(tracks.count) tracks",
-                            symbol: "heart.fill",
-                            artworkTracks: Array(tracks.prefix(4)),
-                            accent: store.currentTrack?.palette.accent ?? tracks.first?.palette.accent ?? .white
-                        ) {
-                            store.playAll(tracks)
+                        if !tracks.isEmpty {
+                            LibraryCollectionCard(
+                                title: "Любимые треки",
+                                subtitle: "\(tracks.count) tracks",
+                                symbol: "heart.fill",
+                                artworkTracks: Array(tracks.prefix(4)),
+                                accent: store.currentTrack?.palette.accent ?? tracks.first?.palette.accent ?? .white
+                            ) {
+                                store.playAll(tracks)
+                            }
+                        }
+
+                        ForEach(savedCollections.prefix(10)) { collection in
+                            let collectionTracks = savedCollectionTracks(for: collection)
+                            LibraryCollectionCard(
+                                title: collection.title,
+                                subtitle: savedCollectionSubtitle(for: collection, matchingTracks: collectionTracks),
+                                symbol: collection.kind == .artist ? "music.mic" : "square.stack.fill",
+                                artworkTracks: collectionTracks,
+                                accent: collection.palette.accent
+                            ) {
+                                store.activate(collection)
+                            }
                         }
 
                         ForEach(albums.prefix(8)) { album in
@@ -1038,6 +1067,38 @@ private struct LibraryCollectionsShelf: View {
                 }
                 .scrollIndicators(.hidden)
             }
+        }
+    }
+
+    private func savedCollectionTracks(for collection: Track) -> [Track] {
+        switch collection.kind {
+        case .track:
+            []
+        case .artist:
+            tracks.filter { $0.artist.searchNormalized == collection.title.searchNormalized }
+        case .album:
+            tracks.filter {
+                let sameAlbum = $0.album.searchNormalized == collection.title.searchNormalized
+                let sameArtist = collection.artist.searchNormalized.isEmpty
+                    || collection.artist.searchNormalized == "unknown artist"
+                    || $0.artist.searchNormalized == collection.artist.searchNormalized
+                return sameAlbum && sameArtist
+            }
+        }
+    }
+
+    private func savedCollectionSubtitle(for collection: Track, matchingTracks: [Track]) -> String {
+        if !matchingTracks.isEmpty {
+            return "\(matchingTracks.count) liked track\(matchingTracks.count == 1 ? "" : "s")"
+        }
+
+        switch collection.kind {
+        case .artist:
+            return "Saved artist"
+        case .album:
+            return "Saved album"
+        case .track:
+            return collection.detailLabel
         }
     }
 }
@@ -1394,6 +1455,21 @@ private struct BestMatchCard: View {
         }
         .buttonStyle(.plain)
         .help(item.isPlayable ? "Play \(item.title)" : "Open \(item.title)")
+        .contextMenu {
+            Button {
+                store.activate(item)
+            } label: {
+                Label(item.isPlayable ? "Play" : "Open", systemImage: item.isPlayable ? "play.fill" : "chevron.right")
+            }
+
+            if !item.isPlayable {
+                Button {
+                    store.toggleSavedCollection(item)
+                } label: {
+                    Label(store.isSavedCollection(item) ? "Remove from Library" : "Save to Library", systemImage: store.isSavedCollection(item) ? "checkmark" : "plus")
+                }
+            }
+        }
     }
 }
 
@@ -1542,6 +1618,21 @@ private struct EntityCard: View {
         }
         .buttonStyle(.plain)
         .help(item.isPlayable ? "Play \(item.title)" : "Open \(item.title)")
+        .contextMenu {
+            Button {
+                store.activate(item)
+            } label: {
+                Label(item.isPlayable ? "Play" : "Open", systemImage: item.isPlayable ? "play.fill" : "chevron.right")
+            }
+
+            if !item.isPlayable {
+                Button {
+                    store.toggleSavedCollection(item)
+                } label: {
+                    Label(store.isSavedCollection(item) ? "Remove from Library" : "Save to Library", systemImage: store.isSavedCollection(item) ? "checkmark" : "plus")
+                }
+            }
+        }
     }
 }
 
@@ -1797,12 +1888,16 @@ private struct ArtistHeroView: View {
 
             Spacer(minLength: 12)
 
-            CollectionActionCluster(
-                tracks: tracks,
-                accent: artist.palette.accent,
-                primaryLabel: "Play Artist"
-            )
-            .frame(maxWidth: 310, alignment: .trailing)
+            HStack(spacing: 8) {
+                CollectionActionCluster(
+                    tracks: tracks,
+                    accent: artist.palette.accent,
+                    primaryLabel: "Play Artist"
+                )
+
+                SavedCollectionButton(item: artist, size: 38)
+            }
+            .frame(maxWidth: 360, alignment: .trailing)
         }
         .padding(18)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -1894,12 +1989,16 @@ private struct AlbumHeroView: View {
 
             Spacer(minLength: 12)
 
-            CollectionActionCluster(
-                tracks: tracks,
-                accent: album.palette.accent,
-                primaryLabel: "Play Album"
-            )
-            .frame(maxWidth: 310, alignment: .trailing)
+            HStack(spacing: 8) {
+                CollectionActionCluster(
+                    tracks: tracks,
+                    accent: album.palette.accent,
+                    primaryLabel: "Play Album"
+                )
+
+                SavedCollectionButton(item: album, size: 38)
+            }
+            .frame(maxWidth: 360, alignment: .trailing)
         }
         .padding(18)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -2038,6 +2137,39 @@ private struct FavoriteButton: View {
         .buttonStyle(.plain)
         .foregroundStyle(store.isLiked(track) ? track.palette.accent : .white.opacity(0.62))
         .help(store.isLiked(track) ? "Remove from favorites" : "Add to favorites")
+    }
+}
+
+private struct SavedCollectionButton: View {
+    @EnvironmentObject private var store: PlayerStore
+    let item: Track
+    let size: CGFloat
+
+    private var isSaved: Bool {
+        store.isSavedCollection(item)
+    }
+
+    var body: some View {
+        if !item.isPlayable {
+            Button {
+                store.toggleSavedCollection(item)
+            } label: {
+                Image(systemName: isSaved ? "checkmark" : "plus")
+                    .font(.system(size: size > 36 ? 14 : 12, weight: .bold))
+                    .frame(width: size, height: size)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(isSaved ? .black : .white.opacity(0.76))
+            .background(
+                isSaved ? item.palette.accent : Color(hex: "#1C1C1E"),
+                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(isSaved ? item.palette.accent.opacity(0.38) : .white.opacity(0.1), lineWidth: 1)
+            )
+            .help(isSaved ? "Remove from Library" : "Save to Library")
+        }
     }
 }
 
