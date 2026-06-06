@@ -1187,6 +1187,7 @@ private struct LocalPlaylistDetailView: View {
                     LocalPlaylistActionBar(
                         tracks: actionTracks,
                         accent: accent,
+                        isFiltered: isFiltering,
                         onRename: onRename,
                         onDelete: {
                             isConfirmingDelete = true
@@ -1272,11 +1273,32 @@ private struct LocalPlaylistActionBar: View {
     @EnvironmentObject private var store: PlayerStore
     let tracks: [Track]
     let accent: Color
+    let isFiltered: Bool
     let onRename: () -> Void
     let onDelete: () -> Void
 
     private var playableTracks: [Track] {
         tracks.filter(\.isPlayable)
+    }
+
+    private var primaryLabel: String {
+        isFiltered ? "Play Matches" : "Play"
+    }
+
+    private var playHelp: String {
+        isFiltered ? "Play matching tracks" : "Play playlist"
+    }
+
+    private var shuffleHelp: String {
+        isFiltered ? "Shuffle matching tracks" : "Shuffle playlist"
+    }
+
+    private var playNextHelp: String {
+        isFiltered ? "Play matching tracks next" : "Play next"
+    }
+
+    private var queueHelp: String {
+        isFiltered ? "Add matching tracks to queue" : "Add playlist to queue"
     }
 
     var body: some View {
@@ -1285,7 +1307,7 @@ private struct LocalPlaylistActionBar: View {
                 Button {
                     store.playAll(playableTracks)
                 } label: {
-                    Label("Play", systemImage: "play.fill")
+                    Label(primaryLabel, systemImage: "play.fill")
                         .font(.system(size: 13, weight: .bold))
                         .foregroundStyle(.black)
                         .padding(.horizontal, 14)
@@ -1293,7 +1315,7 @@ private struct LocalPlaylistActionBar: View {
                         .background(accent, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 }
                 .buttonStyle(.plain)
-                .help("Play playlist")
+                .help(playHelp)
 
                 Button {
                     store.shufflePlay(playableTracks)
@@ -1305,7 +1327,7 @@ private struct LocalPlaylistActionBar: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.white.opacity(0.78))
-                .help("Shuffle playlist")
+                .help(shuffleHelp)
 
                 Button {
                     store.playNext(playableTracks)
@@ -1317,7 +1339,7 @@ private struct LocalPlaylistActionBar: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.white.opacity(0.78))
-                .help("Play next")
+                .help(playNextHelp)
 
                 Button {
                     store.enqueue(playableTracks)
@@ -1329,7 +1351,7 @@ private struct LocalPlaylistActionBar: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.white.opacity(0.78))
-                .help("Add playlist to queue")
+                .help(queueHelp)
             }
 
             Menu {
