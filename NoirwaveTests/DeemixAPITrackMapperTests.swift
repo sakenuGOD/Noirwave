@@ -1108,6 +1108,21 @@ final class DeemixAPITrackMapperTests: XCTestCase {
     }
 
     @MainActor
+    func testActivatingVisibleListTrackQueuesVisibleListOrder() async throws {
+        let tracks = (1...4).map { Self.makePlaybackTrack($0) }
+        let provider = PrewarmRecordingProvider(tracks: tracks)
+        let store = PlayerStore(provider: provider)
+        let visiblePlaylistOrder = [tracks[0], tracks[2], tracks[1], tracks[3]]
+
+        await store.bootstrap()
+        store.activate(tracks[2], in: visiblePlaylistOrder)
+        try await Task.sleep(for: .milliseconds(80))
+
+        XCTAssertEqual(provider.playedIDs.last, tracks[2].id)
+        XCTAssertEqual(store.queue, [tracks[1], tracks[3]])
+    }
+
+    @MainActor
     func testQueueAllDeduplicatesAndSkipsCurrentTrack() async throws {
         let tracks = (1...4).map { Self.makePlaybackTrack($0) }
         let provider = PrewarmRecordingProvider(tracks: tracks)
