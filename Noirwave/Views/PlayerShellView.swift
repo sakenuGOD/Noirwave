@@ -58,16 +58,32 @@ enum LibraryPlaylistSelection: Equatable {
     }
 }
 
+enum PlaylistTargetMenuBuilder {
+    static func targetPlaylists(_ playlists: [LocalPlaylist], excludingPlaylistID: String?) -> [LocalPlaylist] {
+        playlists.filter { $0.id != excludingPlaylistID }
+    }
+}
+
 private typealias PlaylistCreationRequest = @MainActor @Sendable (Track) -> Void
+private typealias PlaylistTracksCreationRequest = @MainActor @Sendable ([Track]) -> Void
 
 private struct PlaylistCreationRequestKey: EnvironmentKey {
     static let defaultValue: PlaylistCreationRequest = { _ in }
+}
+
+private struct PlaylistTracksCreationRequestKey: EnvironmentKey {
+    static let defaultValue: PlaylistTracksCreationRequest = { _ in }
 }
 
 private extension EnvironmentValues {
     var requestPlaylistCreationFromTrack: PlaylistCreationRequest {
         get { self[PlaylistCreationRequestKey.self] }
         set { self[PlaylistCreationRequestKey.self] = newValue }
+    }
+
+    var requestPlaylistCreationFromTracks: PlaylistTracksCreationRequest {
+        get { self[PlaylistTracksCreationRequestKey.self] }
+        set { self[PlaylistTracksCreationRequestKey.self] = newValue }
     }
 }
 
@@ -113,6 +129,13 @@ struct PlayerShellView: View {
                             playlistID: nil,
                             title: LocalPlaylist.fallbackTitle,
                             tracks: [track]
+                        )
+                    }
+                    .environment(\.requestPlaylistCreationFromTracks) { tracks in
+                        playlistEditor = PlaylistEditor(
+                            playlistID: nil,
+                            title: LocalPlaylist.fallbackTitle,
+                            tracks: tracks
                         )
                     }
 
@@ -1366,6 +1389,7 @@ private struct LocalPlaylistDetailView: View {
                     LocalPlaylistActionBar(
                         tracks: actionTracks,
                         accent: accent,
+                        playlistID: playlist.id,
                         isFiltered: isFiltering,
                         onRename: onRename,
                         onDelete: onDelete == nil ? nil : {
@@ -1456,6 +1480,7 @@ private struct LocalPlaylistActionBar: View {
     @EnvironmentObject private var store: PlayerStore
     let tracks: [Track]
     let accent: Color
+    let playlistID: String?
     let isFiltered: Bool
     let onRename: (() -> Void)?
     let onDelete: (() -> Void)?
@@ -1535,6 +1560,13 @@ private struct LocalPlaylistActionBar: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(.white.opacity(0.78))
                 .help(queueHelp)
+
+                AddTracksToPlaylistMenu(
+                    tracks: playableTracks,
+                    excludingPlaylistID: playlistID,
+                    help: "Add visible tracks to playlist",
+                    size: 36
+                )
             }
 
             if onRename != nil || onDelete != nil {
@@ -2808,7 +2840,7 @@ private struct AddToPlaylistMenu: View {
     let excludingPlaylistID: String?
 
     private var targetPlaylists: [LocalPlaylist] {
-        store.localPlaylists.filter { $0.id != excludingPlaylistID }
+        PlaylistTargetMenuBuilder.targetPlaylists(store.localPlaylists, excludingPlaylistID: excludingPlaylistID)
     }
 
     var body: some View {
@@ -2832,6 +2864,56 @@ private struct AddToPlaylistMenu: View {
             }
         } label: {
             Label("Add to Playlist", systemImage: "music.note.list")
+        }
+    }
+}
+
+private struct AddTracksToPlaylistMenu: View {
+    @EnvironmentObject private var store: PlayerStore
+    @Environment(\.requestPlaylistCreationFromTracks) private var requestPlaylistCreationFromTracks
+    let tracks: [Track]
+    let excludingPlaylistID: String?
+    let help: String
+    let size: CGFloat
+
+    private var playableTracks: [Track] {
+        tracks.filter(\.isPlayable)
+    }
+
+    private var targetPlaylists: [LocalPlaylist] {
+        PlaylistTargetMenuBuilder.targetPlaylists(store.localPlaylists, excludingPlaylistID: excludingPlaylistID)
+    }
+
+    var body: some View {
+        if !playableTracks.isEmpty {
+            Menu {
+                ForEach(targetPlaylists) { playlist in
+                    Button {
+                        store.addToPlaylist(playableTracks, playlistID: playlist.id)
+                    } label: {
+                        Label(playlist.title, systemImage: "music.note.list")
+                    }
+                }
+
+                if !targetPlaylists.isEmpty {
+                    Divider()
+                }
+
+                Button {
+                    requestPlaylistCreationFromTracks(playableTracks)
+                } label: {
+                    Label("New Playlist...", systemImage: "plus")
+                }
+            } label: {
+                Image(systemName: "music.note.list")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.78))
+                    .frame(width: size, height: size)
+                    .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .help(help)
         }
     }
 }
@@ -4301,6 +4383,13 @@ private struct CollectionActionCluster: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(.white.opacity(0.78))
                 .help("Add all to queue")
+
+                AddTracksToPlaylistMenu(
+                    tracks: playableTracks,
+                    excludingPlaylistID: nil,
+                    help: "Add visible tracks to playlist",
+                    size: 34
+                )
 
                 Spacer(minLength: 0)
             }
