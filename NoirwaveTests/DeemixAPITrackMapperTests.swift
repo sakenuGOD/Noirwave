@@ -798,6 +798,36 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         )
     }
 
+    func testPlaylistTrackOrganizerComposesSearchWithPlaylistSortModes() {
+        let tracks = [
+            Self.makeLibraryTrack(1, title: "When the Sun Hits", artist: "Slowdive", album: "Souvlaki", duration: 285, trackPosition: 8),
+            Self.makeLibraryTrack(2, title: "Alison", artist: "Slowdive", album: "Souvlaki", duration: 171, trackPosition: 2),
+            Self.makeLibraryTrack(3, title: "Joga", artist: "Bjork", album: "Homogenic", duration: 301),
+            Self.makeLibraryTrack(4, title: "Xtal", artist: "Aphex Twin", album: "Selected Ambient Works 85-92", duration: 293)
+        ]
+
+        XCTAssertEqual(
+            PlaylistTrackOrganizer.tracks(tracks, query: "slowdive", sortMode: .playlistOrder).map(\.id),
+            [tracks[0].id, tracks[1].id]
+        )
+        XCTAssertEqual(
+            PlaylistTrackOrganizer.tracks(tracks, query: "", sortMode: .title).map(\.id),
+            [tracks[1].id, tracks[2].id, tracks[0].id, tracks[3].id]
+        )
+        XCTAssertEqual(
+            PlaylistTrackOrganizer.tracks(tracks, query: "", sortMode: .artist).map(\.id),
+            [tracks[3].id, tracks[2].id, tracks[1].id, tracks[0].id]
+        )
+        XCTAssertEqual(
+            PlaylistTrackOrganizer.tracks(tracks, query: "", sortMode: .album).map(\.id),
+            [tracks[2].id, tracks[3].id, tracks[1].id, tracks[0].id]
+        )
+        XCTAssertEqual(
+            PlaylistTrackOrganizer.tracks(tracks, query: "", sortMode: .duration).map(\.id),
+            [tracks[1].id, tracks[0].id, tracks[3].id, tracks[2].id]
+        )
+    }
+
     func testLibraryTrackOrganizerSortsByTitleArtistAlbumAndDuration() {
         let slowdive = Self.makeLibraryTrack(1, title: "Alison", artist: "Slowdive", album: "Souvlaki", duration: 171)
         let aphex = Self.makeLibraryTrack(2, title: "Xtal", artist: "Aphex Twin", album: "Selected Ambient Works 85-92", duration: 293)
