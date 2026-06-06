@@ -909,6 +909,23 @@ final class DeemixAPITrackMapperTests: XCTestCase {
     }
 
     @MainActor
+    func testCreatePlaylistWithSingleTrackUsesProvidedNameAndPersistsSnapshot() {
+        let defaults = Self.makeIsolatedDefaults(name: "local-playlists-single-track")
+        let track = Self.makeLibraryTrack(1, title: "Heaven or Las Vegas", artist: "Cocteau Twins", album: "Heaven or Las Vegas")
+        let store = PlayerStore(provider: PrewarmRecordingProvider(tracks: [track]), userDefaults: defaults)
+
+        let playlist = store.createPlaylist(title: "  New Light  ", track: track)
+
+        XCTAssertEqual(playlist.title, "New Light")
+        XCTAssertEqual(store.localPlaylists.map(\.id), [playlist.id])
+        XCTAssertEqual(store.playlistTracks(playlistID: playlist.id), [track])
+
+        let restoredStore = PlayerStore(provider: PrewarmRecordingProvider(tracks: []), userDefaults: defaults)
+
+        XCTAssertEqual(restoredStore.playlistTracks(playlistID: playlist.id), [track])
+    }
+
+    @MainActor
     func testVolumeIsClampedAndForwardedToProvider() {
         let provider = PrewarmRecordingProvider(tracks: [])
         let store = PlayerStore(provider: provider)
