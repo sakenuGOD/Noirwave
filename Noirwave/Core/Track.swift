@@ -1,6 +1,6 @@
 import SwiftUI
 
-enum TrackKind: String, Hashable {
+enum TrackKind: String, Codable, Hashable {
     case track = "Track"
     case artist = "Artist"
     case album = "Album"
@@ -17,7 +17,7 @@ enum TrackKind: String, Hashable {
     }
 }
 
-struct Track: Identifiable, Hashable {
+struct Track: Codable, Identifiable, Hashable {
     let id: String
     let title: String
     let artist: String
@@ -456,6 +456,130 @@ enum LibrarySearchFilter {
     }
 }
 
+enum LibrarySortMode: String, CaseIterable, Identifiable {
+    case recentlyAdded
+    case title
+    case artist
+    case album
+    case duration
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .recentlyAdded:
+            "Recently Added"
+        case .title:
+            "Title"
+        case .artist:
+            "Artist"
+        case .album:
+            "Album"
+        case .duration:
+            "Duration"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .recentlyAdded:
+            "clock.arrow.circlepath"
+        case .title:
+            "textformat"
+        case .artist:
+            "music.mic"
+        case .album:
+            "square.stack"
+        case .duration:
+            "timer"
+        }
+    }
+}
+
+enum LibraryTrackOrganizer {
+    static func tracks(_ tracks: [Track], query: String, sortMode: LibrarySortMode) -> [Track] {
+        sortedTracks(
+            LibrarySearchFilter.filteredTracks(tracks, query: query),
+            sortMode: sortMode
+        )
+    }
+
+    private static func sortedTracks(_ tracks: [Track], sortMode: LibrarySortMode) -> [Track] {
+        switch sortMode {
+        case .recentlyAdded:
+            return tracks
+        case .title:
+            return tracks.sorted { compare($0.title, $1.title, lhsID: $0.id, rhsID: $1.id) }
+        case .artist:
+            return tracks.sorted {
+                compare(
+                    [$0.artist, $0.title, $0.album],
+                    [$1.artist, $1.title, $1.album],
+                    lhsID: $0.id,
+                    rhsID: $1.id
+                )
+            }
+        case .album:
+            return tracks.sorted { compareAlbum($0, $1) }
+        case .duration:
+            return tracks.sorted {
+                if $0.duration == $1.duration {
+                    return compare($0.title, $1.title, lhsID: $0.id, rhsID: $1.id)
+                }
+                return $0.duration < $1.duration
+            }
+        }
+    }
+
+    private static func compare(_ lhs: String, _ rhs: String, lhsID: String, rhsID: String) -> Bool {
+        let result = lhs.localizedCaseInsensitiveCompare(rhs)
+        if result == .orderedSame {
+            return lhsID < rhsID
+        }
+        return result == .orderedAscending
+    }
+
+    private static func compare(_ lhs: [String], _ rhs: [String], lhsID: String, rhsID: String) -> Bool {
+        for (leftValue, rightValue) in zip(lhs, rhs) {
+            let result = leftValue.localizedCaseInsensitiveCompare(rightValue)
+            if result != .orderedSame {
+                return result == .orderedAscending
+            }
+        }
+        return lhsID < rhsID
+    }
+
+    private static func compareAlbum(_ lhs: Track, _ rhs: Track) -> Bool {
+        let albumResult = lhs.album.localizedCaseInsensitiveCompare(rhs.album)
+        if albumResult != .orderedSame {
+            return albumResult == .orderedAscending
+        }
+
+        if let discResult = compareOptionalInt(lhs.discNumber, rhs.discNumber) {
+            return discResult
+        }
+
+        if let positionResult = compareOptionalInt(lhs.trackPosition, rhs.trackPosition) {
+            return positionResult
+        }
+
+        return compare(lhs.title, rhs.title, lhsID: lhs.id, rhsID: rhs.id)
+    }
+
+    private static func compareOptionalInt(_ lhs: Int?, _ rhs: Int?) -> Bool? {
+        switch (lhs, rhs) {
+        case let (left?, right?) where left != right:
+            return left < right
+        case (_?, nil):
+            return true
+        case (nil, _?):
+            return false
+        default:
+            return nil
+        }
+    }
+}
+
 enum QueueSearchFilter {
     static func filteredTracks(_ tracks: [Track], query: String) -> [Track] {
         LibrarySearchFilter.filteredTracks(tracks, query: query)
@@ -477,7 +601,7 @@ extension Int {
     }
 }
 
-struct TrackPalette: Hashable {
+struct TrackPalette: Codable, Hashable {
     let baseHex: String
     let midHex: String
     let accentHex: String

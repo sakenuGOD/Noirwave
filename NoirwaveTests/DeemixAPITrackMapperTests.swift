@@ -776,6 +776,50 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         )
     }
 
+    func testLibraryTrackOrganizerSortsByTitleArtistAlbumAndDuration() {
+        let slowdive = Self.makeLibraryTrack(1, title: "Alison", artist: "Slowdive", album: "Souvlaki", duration: 171)
+        let aphex = Self.makeLibraryTrack(2, title: "Xtal", artist: "Aphex Twin", album: "Selected Ambient Works 85-92", duration: 293)
+        let bjork = Self.makeLibraryTrack(3, title: "Joga", artist: "Bjork", album: "Homogenic", duration: 301)
+        let trackTen = Self.makeLibraryTrack(10, title: "Track Ten", artist: "Album Artist", album: "Numbered Album", trackPosition: 10)
+        let trackTwo = Self.makeLibraryTrack(11, title: "Track Two", artist: "Album Artist", album: "Numbered Album", trackPosition: 2)
+
+        XCTAssertEqual(
+            LibraryTrackOrganizer.tracks([slowdive, aphex, bjork], query: "", sortMode: .title).map(\.id),
+            [slowdive.id, bjork.id, aphex.id]
+        )
+        XCTAssertEqual(
+            LibraryTrackOrganizer.tracks([slowdive, aphex, bjork], query: "", sortMode: .artist).map(\.id),
+            [aphex.id, bjork.id, slowdive.id]
+        )
+        XCTAssertEqual(
+            LibraryTrackOrganizer.tracks([slowdive, aphex, bjork], query: "", sortMode: .album).map(\.id),
+            [bjork.id, aphex.id, slowdive.id]
+        )
+        XCTAssertEqual(
+            LibraryTrackOrganizer.tracks([trackTen, trackTwo], query: "", sortMode: .album).map(\.id),
+            [trackTwo.id, trackTen.id]
+        )
+        XCTAssertEqual(
+            LibraryTrackOrganizer.tracks([slowdive, aphex, bjork], query: "", sortMode: .duration).map(\.id),
+            [slowdive.id, aphex.id, bjork.id]
+        )
+    }
+
+    func testLibraryTrackOrganizerPreservesRecentlyAddedOrderAndComposesWithQuery() {
+        let radiohead = Self.makeLibraryTrack(1, title: "Everything In Its Right Place", artist: "Radiohead", album: "Kid A", duration: 251)
+        let cocteau = Self.makeLibraryTrack(2, title: "Cherry-Coloured Funk", artist: "Cocteau Twins", album: "Heaven or Las Vegas", duration: 193)
+        let deftones = Self.makeLibraryTrack(3, title: "Digital Bath", artist: "Deftones", album: "White Pony", duration: 255)
+
+        XCTAssertEqual(
+            LibraryTrackOrganizer.tracks([deftones, radiohead, cocteau], query: "", sortMode: .recentlyAdded).map(\.id),
+            [deftones.id, radiohead.id, cocteau.id]
+        )
+        XCTAssertEqual(
+            LibraryTrackOrganizer.tracks([deftones, radiohead, cocteau], query: "bath", sortMode: .artist).map(\.id),
+            [deftones.id]
+        )
+    }
+
     @MainActor
     func testVolumeIsClampedAndForwardedToProvider() {
         let provider = PrewarmRecordingProvider(tracks: [])
@@ -965,6 +1009,45 @@ final class DeemixAPITrackMapperTests: XCTestCase {
     }
 
     @MainActor
+    func testLikedTracksRestoreSavedTrackSnapshotWithoutProviderCatalog() async {
+        let defaults = Self.makeIsolatedDefaults(name: "liked-snapshot")
+        let track = Self.makeLibraryTrack(1, title: "Saved Song", artist: "Saved Artist", album: "Saved Album")
+        let store = PlayerStore(provider: PrewarmRecordingProvider(tracks: [track]), userDefaults: defaults)
+
+        await store.bootstrap()
+        store.toggleLike(track)
+
+        let restoredStore = PlayerStore(provider: PrewarmRecordingProvider(tracks: []), userDefaults: defaults)
+        await restoredStore.bootstrap()
+
+        XCTAssertTrue(restoredStore.isLiked(track))
+        XCTAssertEqual(restoredStore.likedTracks(), [track])
+    }
+
+    @MainActor
+    func testLikedTracksReturnNewestFirstAcrossStoreInstances() async {
+        let defaults = Self.makeIsolatedDefaults(name: "liked-order")
+        let tracks = (1...3).map { Self.makePlaybackTrack($0) }
+        let provider = PrewarmRecordingProvider(tracks: tracks)
+        let store = PlayerStore(provider: provider, userDefaults: defaults)
+
+        await store.bootstrap()
+        store.toggleLike(tracks[0])
+        store.toggleLike(tracks[1])
+        store.toggleLike(tracks[2])
+
+        XCTAssertEqual(store.likedTracks(limit: 3), [tracks[2], tracks[1], tracks[0]])
+
+        store.toggleLike(tracks[1])
+        XCTAssertEqual(store.likedTracks(limit: 3), [tracks[2], tracks[0]])
+
+        let restoredStore = PlayerStore(provider: provider, userDefaults: defaults)
+        await restoredStore.bootstrap()
+
+        XCTAssertEqual(restoredStore.likedTracks(limit: 3), [tracks[2], tracks[0]])
+    }
+
+    @MainActor
     func testStartWavePrioritizesLikedTracksAndRelatedArtists() async throws {
         let liked = Self.makePlaybackTrack(1, artist: "Daft Punk", album: "Homework", rank: 10)
         let related = Self.makePlaybackTrack(2, artist: "Daft Punk", album: "Discovery", rank: 5)
@@ -1032,18 +1115,21 @@ final class DeemixAPITrackMapperTests: XCTestCase {
         _ index: Int,
         title: String,
         artist: String,
-        album: String
+        album: String,
+        duration: TimeInterval = 180,
+        trackPosition: Int? = nil
     ) -> Track {
         Track(
             id: "library-track.\(index)",
             title: title,
             artist: artist,
             album: album,
-            duration: 180,
+            duration: duration,
             palette: .fallback,
             catalogID: "https://www.deezer.com/track/\(index)",
             previewURL: nil,
-            rank: nil
+            rank: nil,
+            trackPosition: trackPosition
         )
     }
 

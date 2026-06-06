@@ -790,13 +790,14 @@ private struct SearchResultsView: View {
 private struct LibraryView: View {
     @EnvironmentObject private var store: PlayerStore
     @State private var libraryQuery = ""
+    @State private var librarySortMode: LibrarySortMode = .recentlyAdded
 
     private var likedTracks: [Track] {
         store.likedTracks(limit: 100)
     }
 
     private var filteredTracks: [Track] {
-        LibrarySearchFilter.filteredTracks(likedTracks, query: libraryQuery)
+        LibraryTrackOrganizer.tracks(likedTracks, query: libraryQuery, sortMode: librarySortMode)
     }
 
     private var albums: [Track] {
@@ -814,6 +815,7 @@ private struct LibraryView: View {
             VStack(alignment: .leading, spacing: 24) {
                 LibraryHeaderView(
                     query: $libraryQuery,
+                    sortMode: $librarySortMode,
                     totalCount: likedTracks.count,
                     filteredCount: filteredTracks.count
                 )
@@ -854,11 +856,16 @@ private struct EmptyLibraryPanel: View {
 private struct LibraryHeaderView: View {
     @EnvironmentObject private var store: PlayerStore
     @Binding var query: String
+    @Binding var sortMode: LibrarySortMode
     let totalCount: Int
     let filteredCount: Int
 
     private var countLabel: String {
-        query.trimmed.isEmpty ? "\(totalCount) saved" : "\(filteredCount) found"
+        if query.trimmed.isEmpty {
+            return "\(totalCount) saved · \(sortMode.title)"
+        }
+
+        return "\(filteredCount) found · \(sortMode.title)"
     }
 
     var body: some View {
@@ -879,8 +886,57 @@ private struct LibraryHeaderView: View {
 
             LocalLibrarySearchField(query: $query)
                 .frame(maxWidth: 360)
+
+            LibrarySortMenu(selection: $sortMode)
         }
         .padding(.top, 18)
+    }
+}
+
+private struct LibrarySortMenu: View {
+    @EnvironmentObject private var store: PlayerStore
+    @Binding var selection: LibrarySortMode
+
+    private var accent: Color {
+        store.currentTrack?.palette.accent ?? .white
+    }
+
+    var body: some View {
+        Menu {
+            ForEach(LibrarySortMode.allCases) { mode in
+                Button {
+                    selection = mode
+                } label: {
+                    Label(mode.title, systemImage: selection == mode ? "checkmark" : mode.systemImage)
+                }
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: selection.systemImage)
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(accent)
+
+                Text(selection.title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.44))
+            }
+            .foregroundStyle(.white.opacity(0.84))
+            .padding(.horizontal, 12)
+            .frame(height: 40)
+            .background(.white.opacity(0.09), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(accent.opacity(0.22), lineWidth: 1)
+            )
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .help("Sort library")
     }
 }
 
