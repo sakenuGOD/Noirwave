@@ -101,6 +101,51 @@ cd /Users/fsociety/Noirwave/NoirwaveBackend
 npm run mcp
 ```
 
+For an agent that runs on another server, use the token-protected Streamable
+HTTP MCP server instead:
+
+```sh
+cd /Users/fsociety/Noirwave/NoirwaveBackend
+export NOIRWAVE_MCP_HTTP_TOKEN="$(openssl rand -hex 32)"
+export NOIRWAVE_MCP_HTTP_HOST=127.0.0.1
+export NOIRWAVE_MCP_HTTP_PORT=6615
+npm run mcp:http
+```
+
+Local endpoint:
+
+```sh
+http://127.0.0.1:6615/mcp
+```
+
+Expose only that endpoint to a remote agent through a private network or HTTPS
+tunnel, for example Tailscale Funnel, Tailscale Serve, or Cloudflare Tunnel.
+Keep the MCP server bound to `127.0.0.1` unless you intentionally protect it
+behind a firewall or reverse proxy. Do not expose it without HTTPS and the
+Bearer token.
+
+If the tunnel forwards the public domain in the `Host` header, allow that
+hostname explicitly:
+
+```sh
+export NOIRWAVE_MCP_HTTP_ALLOWED_HOSTS=your-tunnel.example,127.0.0.1,localhost
+```
+
+Generic remote MCP client configuration:
+
+```json
+{
+  "mcpServers": {
+    "noirwave": {
+      "url": "https://your-tunnel.example/mcp",
+      "headers": {
+        "Authorization": "Bearer <NOIRWAVE_MCP_HTTP_TOKEN>"
+      }
+    }
+  }
+}
+```
+
 The app writes the MCP bridge files under:
 
 ```sh
@@ -108,7 +153,10 @@ The app writes the MCP bridge files under:
 ```
 
 Set `NOIRWAVE_MCP_ROOT` only if you intentionally want a different bridge
-directory. MCP clients should use the command shown in Settings -> AI / MCP.
+directory. The MCP server only reads and writes this bridge directory; it does
+not expose arbitrary local filesystem access. MCP clients should use the command
+shown in Settings -> AI / MCP for local stdio access, or the HTTPS tunnel URL for
+remote HTTP access.
 
 Resources:
 

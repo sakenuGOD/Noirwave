@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node src/server.mjs",
     "mcp": "node src/mcpServer.mjs",
+    "mcp:http": "node src/mcpHttpServer.mjs",
     "test": "node --test tests/*.test.mjs",
     "setup:deemix": "node scripts/setup-deemix.mjs"
   },
