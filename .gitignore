@@ -47,3 +47,6 @@ NoirwaveBackend/.env.*
 *.log
 *.pid
 *.xcresult
+*.profraw
+builds/
+NoirwaveArtworkURLCache/

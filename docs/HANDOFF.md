@@ -1,0 +1,380 @@
+# Stabilization Handoff
+
+## Current State
+
+- Source of truth: `docs/STABILIZATION_MASTER_PLAN.md`.
+- Active repo: `/Users/fsociety/Noirwave`.
+- Current phase: complete. All 18 stabilization phases in `docs/STABILIZATION_MASTER_PLAN.md` are complete for the current pass.
+- Current subtask: none remaining in the master plan.
+- Current session resume checkpoint: post-plan panel glass split correction completed on 2026-06-07 20:42 MSK; the app was relaunched from the latest Debug build.
+- Repo state at start: unresolved merge conflicts were already present in multiple Swift and backend files. Do not revert user changes.
+
+## What Was Done
+
+- Located the available stabilization plan at `/Users/fsociety/TABILIZATION_MASTER_PLAN.md`.
+- Created `docs/STABILIZATION_MASTER_PLAN.md` from that plan and fixed the title typo.
+- Created this handoff file.
+- Created `docs/STABILIZATION_PROGRESS.md`.
+- Audited Phase 1 loading/fake-content paths in `PlayerShellView`, `PlayerStore`, provider factory, and existing docs.
+- Restored the missing `SearchCacheRecordingProvider` test double so the Swift test target compiles.
+- Captured a valid RED for `testBootstrapDoesNotSelectFeaturedTrackAsCurrentPlayback`: bootstrap selected the first featured track as `currentTrack` and queued it.
+- Changed `PlayerStore.applyFeaturedTracks(_:)` so featured/catalog loading updates catalog data and prewarm candidates without fabricating now-playing state, queue, playback state, progress, or lyrics.
+- Updated the neighboring prewarm expectation so it prewarms visible catalog candidates without skipping a fake current track.
+- Added `CatalogLoadingSkeletonView` plus hero/shelf/list skeleton blocks.
+- Changed `ListenNowView` to render the skeleton surface while featured tracks are loading and empty.
+- Changed `CatalogLandingView` to keep the Catalog prompt visible and render skeleton/empty states explicitly instead of a partial blank screen.
+- Removed hardcoded Deezer seed searches from `DeemixAPIProvider.featuredTracks()`.
+- Changed `DeemixAPIProvider.radioTracks(seed:)` so radio recommendations are derived only from an explicit seed track and return an empty result when there is no seed.
+- Updated README initial catalog documentation to state that the app waits for real library/search/playback data instead of issuing default Daft Punk/Nirvana/electronic searches.
+- Traced the "100 tracks" path for Phase 2:
+  - backend public artist detail has `publicArtistDetailItemLimit = 100`;
+  - `collectPublicDataPages(...)` also defaults to `limit = 100`;
+  - public artist detail applies that cap to both top tracks and albums;
+  - `ArtistProfileView` displays the received popular-track count as the section subtitle.
+- Checked live Deezer public endpoint behavior on June 7, 2026:
+  - `/artist/415/top?limit=120`, `limit=200`, and `limit=1000` returned 99 Nirvana top tracks;
+  - major artists such as Eminem, Daft Punk, Metallica, Taylor Swift, and Queen returned exactly 100 top tracks with `limit=200`;
+  - `/artist/12246/albums?limit=200` returned 125 albums, so the shared internal 100 cap can truncate release data even when pagination/data is available.
+- Added backend RED test `does not impose an internal 100 item cap on paginated public artist top tracks`.
+- Removed the internal public artist detail item cap from `NoirwaveBackend/src/publicDeezerSearch.mjs`.
+- `collectPublicDataPages(...)` now follows upstream `next` links until no next page, optional explicit item limit, or named safety page count.
+- Public artist detail top tracks and albums now use the shared page collector without passing a hidden 100-item cap.
+- Added Swift RED test `testArtistPopularTracksSubtitleDescribesDeezerTopWindow` for the artist popular-tracks subtitle copy.
+- Added `ArtistPopularTracksCopy` and changed the artist popular-tracks subtitle to describe a Deezer top-track window instead of generic full-track count copy.
+- Traced Phase 3 single-search behavior:
+  - `SidebarSearchField` is the only catalog search text field;
+  - it binds directly to `PlayerStore.searchQuery` through `store.updateSearchQuery(_:)`;
+  - `CatalogLandingView` only shows passive prompt/landing content and does not own a separate query;
+  - `SearchResultsView` consumes `store.visibleTracks` and `store.isSearching`;
+  - local Library/Queue filter fields are scoped filters, not catalog search flows.
+- Found Phase 3 navigation regression: `ContentDeckView` renders `SearchResultsView` for any non-empty `store.searchQuery` before switching on `selection`, so Library/Listen Now/Profile cannot display while the sidebar query remains non-empty.
+- Added Swift RED test `testSearchResultsStayScopedToCatalogDestination`.
+- Added `ContentDeckRouting` and changed `ContentDeckView` so search results are shown only when Catalog is the active destination and no catalog detail context is open.
+- Traced Phase 4 search playback:
+  - `SearchResultsView` renders playable search tracks through `TrackListSection`/`TrackRowView` and cards through `BestMatchCard`/`EntityCard`;
+  - those controls call the shared `store.activate(...)`;
+  - `PlayerStore.activate(_:in:)` sets queue/context and calls `play(item)` for playable tracks;
+  - `PlayerStore.play(_:)` updates `currentTrack`, `playbackState`, lyrics, provider playback, mini player state, and preparation.
+- Existing test `testActivatingCurrentSearchTrackTogglesPlaybackInsteadOfRestarting` is a valid Phase 4 RED: first activation starts shared playback, second activation restarts provider playback instead of pausing.
+- Updated `PlayerStore.activate(_:in:)` so activating the current playable item calls `togglePlayPause()` instead of replaying provider playback.
+- Added `testActivatingSearchResultUsesVisibleResultsForPlaybackContext` to verify a multi-result search activation updates queue/context from visible search results.
+- Added `ContentDeckRouting.showsCatalogDetail(...)` and routed catalog detail content through it, so artist/album detail screens only occupy the Catalog destination.
+- Scoped the TopBar Back affordance to active Catalog detail screens instead of any non-nil catalog context.
+- Changed `PlayerStore.leaveCatalogContext()` to cancel the active catalog detail task, clear local loading, and restore featured tracks when leaving with an empty query.
+- Guarded late `provider.catalogItems(for:)` success/failure updates with `catalogContext == item`, preventing stale detail responses from overwriting the current navigation surface.
+- Added focused Phase 5 regression tests for catalog-detail route scoping and Back cancellation with an empty query.
+- Audited current Library data sources: liked tracks come from persisted liked snapshots/known tracks, saved collections come from persisted saved snapshots/known collection items, and local playlists come from persisted `LocalPlaylist` data.
+- Reworked `LibrarySurfaceLayout` so liked tracks render first, playlists render below, and saved collections render after playlists.
+- Changed `LibraryPlaylistShelfBuilder` so the playlist shelf contains only real local playlists; Liked Songs is no longer synthesized into "Мои плейлисты".
+- Added a large `LikedSongsFeatureBlock` and changed favorite tracks to an adaptive two-column `LazyVGrid` of real `TrackRowView` rows.
+- Added `LibraryCreatePlaylistTile` to the playlists shelf, so create playlist is a first-class tile even when no local playlists exist yet.
+- Simplified `LibraryCollectionsShelf` to saved artist/album collections only, avoiding duplicate liked-song/derived collection cards above the real liked-songs section.
+- Scanned app sources for hardcoded Nirvana/Daft Punk/fake Library content; only ordinary TextField `placeholder` property names were found.
+- Resumed on 2026-06-07 17:57 MSK, re-read the stabilization master plan and durable state files, and confirmed the next task is Phase 7 lyrics interactivity inspection.
+- Completed Phase 7 lyrics interactivity:
+  - traced `TrackLyrics`, `TrackLyricsLine`, `LyricsReaderContentView`, `LyricsLineView`, and `PlayerStore.seek` behavior;
+  - confirmed synced lyrics already had active-line highlighting and scroll sync through `store.progress`;
+  - changed `PlayerStore.seek(to:)` to seek by absolute seconds;
+  - added `PlayerStore.seek(toFraction:)` for progress controls;
+  - updated progress drag/slider controls to use fraction seeking;
+  - made synchronized lyric rows plain-styled buttons that seek to `line.startTime`;
+  - added explicit `Unsynced` rendering for plain lyrics without timestamps.
+- Completed Phase 8 mini player contrast:
+  - audited `MiniPlayerBar`, `PlaybackControlsCompact`, `PlayerIconButton`, `PlayerModeButton`, `PlayerPanelButtonLabel`, `FavoriteButton`, `VolumeControl`, and `MiniPlayerProgressBar`;
+  - added `MiniPlayerVisualStyle` tokens for readable glass, inactive controls, progress rail, and primary button stroke/glow;
+  - reduced material tint/legacy dark fill from the too-dark player treatment;
+  - raised inactive controls from half-white to readable opacity;
+  - strengthened the primary play/pause button with clearer stroke and subtle accent glow;
+  - thickened and brightened the mini progress rail while preserving compact layout and behavior.
+- Completed Phase 9 sidebar palette/composition:
+  - audited `SidebarView`, `SidebarSearchField`, `SidebarItem`, and `SidebarPlaylistRow`;
+  - added `SidebarVisualStyle` tokens for material dimming, brand mark, active accent, active fill/stroke, inactive text/icon, hover, and search focus;
+  - changed sidebar search focus to use the app accent instead of unrelated gray/white focus styling;
+  - changed active nav rows to use a narrow accent marker plus subtle glass fill/stroke;
+  - pinned sidebar playlist-row accent to `NoirwaveTheme.primaryAccent` so current-track or collection palettes cannot recolor navigation rows.
+- Completed Phase 10 sidebar playlists:
+  - chose master-plan path B instead of removing the block;
+  - traced `SidebarPlaylistPreview` and found it mixed real local playlists with `liked.songs`, `discovery.mix`, top album, and top artist rows under a `Playlists` heading;
+  - added `SidebarPlaylistPreviewBuilder` and `SidebarPlaylistPreviewItem` as the sidebar playlist contract;
+  - changed the sidebar playlist block to read only `store.localPlaylists` and `store.playlistTracks(playlistID:)`;
+  - removed Liked Songs, discovery, album, artist, featured-track, and `playAll(collection.tracks)` synthetic sidebar rows from this block;
+  - added a compact header plus button and explicit create-playlist empty row wired to the existing playlist editor sheet;
+  - kept playlist row click behavior scoped to selecting the matching local playlist in Library.
+- Completed Phase 11 regression checklist:
+  - ran the focused Swift regression checklist across loading/bootstrap, 100-track copy, single search, search playback, search navigation, Library, lyrics, mini player, sidebar palette, and sidebar playlists;
+  - reran backend tests covering the public artist pagination/no-100-cap behavior;
+  - scanned app sources for hardcoded Nirvana/Daft Punk/fake content;
+  - scanned sidebar source for synthetic playlist rows and old playlist filler;
+  - scanned artist/backend code for old 100-track cap patterns;
+  - scanned touched task files/docs for anchored conflict markers;
+  - confirmed catalog search still has one catalog input (`SidebarSearchField`), with other text fields scoped to playlist naming, Library/playlist filters, and queue filter.
+- Completed Phase 12 mandatory docs:
+  - audited `docs/CHANGELOG.md`, `docs/IMPLEMENTATION_NOTES.md`, `docs/BUGS_AND_REGRESSIONS.md`, and `docs/DESIGN_NOTES.md`;
+  - added an explicit mandatory documentation coverage map in `docs/IMPLEMENTATION_NOTES.md`;
+  - confirmed docs now record regressions found/fixed, files touched, verification coverage, single-search guard, and 100-track origin;
+  - documented that no completion claim should ignore the remaining phases or the pre-existing unmerged repo index state.
+- Completed Phase 13 no-fake-completion audit:
+  - scanned progress, handoff, and mandatory docs for wording that would imply all 18 phases are complete;
+  - confirmed `docs/STABILIZATION_PROGRESS.md` keeps phases 14-18 open;
+  - confirmed `docs/HANDOFF.md` keeps Phase 14 as the next active task and preserves the unresolved git index warning;
+  - added explicit notes that completed phase slices do not mean the whole stabilization plan is finished.
+- Completed Phase 14 search input UX:
+  - traced `PlayerStore.updateSearchQuery(_:)`, `scheduleSearch()`, `runSearch()`, `SearchResultsView`, `SidebarSearchField`, and the existing search/navigation regression coverage;
+  - strengthened search tests so fast typing must stay local before debounce and repeated cached queries must not hit the provider again;
+  - changed search scheduling to use a 300ms remote debounce, immediate empty-query reset, immediate cached-query replay, cancellation of superseded search tasks, and normalized in-memory query cache keys;
+  - kept stale success/error guards so cancelled or old provider responses do not overwrite the active query;
+  - changed search loading UI to a small sidebar spinner plus compact empty-result searching state instead of a full search loading wall;
+  - adjusted the cancellation regression timing so it still tests cancellation of an in-flight provider request under the new 300ms debounce.
+- Completed Phase 15 artist header density:
+  - audited `ArtistDetailView`, `ArtistHeroView`, `ArtistHeroActionBar`, `ArtistLatestReleaseFeature`, and existing artist/catalog tests;
+  - added `testArtistHeaderLayoutKeepsFirstViewportDense` as the Phase 15 regression and captured the intended compile-time RED before adding production metrics;
+  - added `ArtistHeaderLayoutMetrics` to lock compact hero height, title size, foreground/background artwork sizes, action height, latest-release row height, section spacing, and estimated first-viewport fit;
+  - changed the artist hero to use the metrics contract instead of oversized literals, reducing min height, padding, gradient weight, title size, artwork scale, and action button height;
+  - tightened the latest-release feature row while preserving its album navigation behavior;
+  - verified that old oversized artist-hero literals are absent from the touched artist header source.
+- Completed Phase 16 popular tracks default limit:
+  - audited `ArtistDetailView`, `TrackListSection`, `TrackRowsStack`, and existing artist/catalog tests;
+  - added `testArtistPopularTracksPresentationDefaultsToTopFiveAndCanExpand` as the Phase 16 regression and captured the intended compile-time RED before adding production presentation code;
+  - added `ArtistPopularTracksPresentation` with top-five collapsed behavior, full-list expanded behavior, toggle visibility, and Show more / Show less copy;
+  - added `ArtistPopularTracksSection` so artist pages use the top-five/expand-collapse behavior without changing other `TrackListSection` call sites;
+  - kept `ArtistPopularTracksCopy.subtitle(count: tracks.count)` on the full received list so the UI remains honest about Deezer top-track totals while rendering only five rows by default.
+- Completed Phase 17 subtask 1, backend search response no longer waits for startup prefetch:
+  - audited search/loading hot spots across `PlayerStore`, `DeemixAPIProvider`, `ArtworkImagePipeline`, backend search/detail/prefetch routes, and SwiftUI loading surfaces;
+  - found `/api/search` awaited `warmForegroundPrefetch(...)` before returning track search payloads, coupling search result latency to playback startup-cache work;
+  - added `searchResponsePrefetch.mjs` with a synchronous `applySearchResponsePrefetch(...)` helper;
+  - changed `/api/search` to cache media metadata and schedule priority background prefetch without awaiting startup prefetch before `response.json(payload)`;
+  - added backend regression coverage for non-awaiting background prefetch scheduling and public fallback cache-only behavior.
+- Completed Phase 17 subtask 2, lyrics cache:
+  - audited `PlayerStore.loadLyrics(for:)`, playback start, existing lyrics tests, and test providers;
+  - added `testLyricsCacheReusesLoadedLyricsForRepeatedPlayback` and `LyricsCacheRecordingProvider`, then captured the intended RED where replaying a cached track returned lyrics state to `.loading` and made a second provider lyrics request;
+  - added an in-memory `lyricsCache` to `PlayerStore`, keyed by track ID;
+  - added `applyLyrics(_:)` so cached and fresh lyrics share the same loaded/unavailable state mapping;
+  - fresh provider lyrics are cached only after cancellation and current-track stale guards pass, so stale lyrics still cannot overwrite the active track.
+- Completed Phase 17 subtask 3, catalog detail cache:
+  - audited `PlayerStore.drillIntoCatalog(from:)`, catalog detail tests, and `CatalogDrillRecordingProvider`;
+  - added `testCatalogDetailCacheReusesLoadedItemsWithoutProviderRoundTrip` and captured the intended RED where repeat artist drill-in showed loading/empty content and called `catalogItems(for:)` twice;
+  - added an in-memory `catalogItemsCache` to `PlayerStore`, keyed by item kind and normalized catalog ID/ID;
+  - cached artist/album detail items now render immediately with `isSearching = false` and no provider round trip;
+  - fresh catalog detail responses populate the cache only after cancellation and active-context stale guards pass.
+- Completed Phase 17 subtask 4, remaining acceptance audit:
+  - scanned app/backend sources for old blocking search loaders, awaited foreground search prefetch, direct full-list artist Popular Tracks rendering, timeout/cancellation/cache paths, and long-list rendering boundaries;
+  - confirmed implemented guards for search cache/debounce/cancellation, backend non-awaiting search prefetch, lyrics cache, catalog detail cache, artwork cache/cancellation, and artist top-5 popular tracks;
+  - ran a 16-test combined Swift Phase 17 slice;
+  - reran the backend suite at 39/39;
+  - did not close Phase 17 because explicit slow-network/native-app verification remains unresolved.
+- Completed Phase 17 subtask 5, native slow-network equivalent:
+  - added `testSlowNetworkSearchKeepsShellPlaybackAndPreviousResultsUsable`;
+  - used a 3.5s delayed native test provider search to simulate the Slow 3G/API-delay acceptance path for the macOS SwiftUI app;
+  - verified query text updates locally, previous results remain visible while loading, playback/current track stay intact, player controls remain usable during the delayed request, and delayed results apply when the provider response arrives;
+  - documented this as the native substitute for Browser DevTools/Playwright throttling, which is not directly applicable to the app shell.
+- Completed Phase 18 subtask 1, root-cause performance investigation:
+  - wrote the mandatory root-cause report in `docs/IMPLEMENTATION_NOTES.md`;
+  - mirrored the investigation and fixed regressions in `docs/BUGS_AND_REGRESSIONS.md`;
+  - updated `docs/CHANGELOG.md`, `docs/DESIGN_NOTES.md`, and durable progress/handoff files;
+  - recorded true hang causes, blocking components, unnecessary/sequential requests, loading-wall removal, cache/stale-response guards, slow-network verification, and remaining potentially heavy areas.
+- Completed post-plan UI/performance polish:
+  - changed the global accent to softer cyan-mint `#6BE3D0`;
+  - replaced heavy search-result shelves with compact result rows backed by `SearchResultsPresentation`;
+  - hid album/release rows from artist-heavy search results so search stays search and artist pages load detail only after click;
+  - replaced generated-looking artwork fallback gradients with a neutral dark fallback;
+  - changed functional accents, progress, selected states, and player buttons to app mint instead of per-track palette colors;
+  - added inset mini-player progress geometry and a smaller visual play button with preserved hit area;
+  - added volume icon state mapping, popover slider, actual volume control wiring, and persisted volume.
+- Completed post-plan panel glass correction:
+  - added shared `LiquidGlassPanelStyle` / `NowPlayingPanelVisualStyle` tokens and `noirwavePanelGlass(...)`;
+  - applied the mini-player-style black glass language to the left sidebar and right now-playing/sound panel;
+  - embedded the equalizer block in a darker functional glass surface without changing search or artist flow;
+  - made the mini-player progress thinner and reduced the visual play button/icon while preserving hit area;
+  - reduced the panel glass opacity after user feedback that the first pass was too murky: material opacity now uses a lighter blend, dim/highlight/glow were lowered, and the panel stays black glass instead of a cloudy frosted surface.
+  - reduced the panel glass again after follow-up feedback that it was still too murky: native material opacity is now much lower, panel dim is below 0.10, inner/diagonal highlights are quieter, and mint glow is minimal.
+  - split panel glass appearances after user feedback: the left sidebar now uses a clearer, more transparent appearance, while the right now-playing/sound widget uses a darker, denser appearance.
+
+## Files Changed
+
+- `docs/STABILIZATION_MASTER_PLAN.md`
+- `docs/STABILIZATION_PROGRESS.md`
+- `docs/HANDOFF.md`
+- `Noirwave/Core/PlayerStore.swift`
+- `Noirwave/Core/DeemixAPIProvider.swift`
+- `Noirwave/Views/PlayerShellView.swift`
+- `NoirwaveBackend/src/publicDeezerSearch.mjs`
+- `NoirwaveBackend/src/searchResponsePrefetch.mjs`
+- `NoirwaveBackend/src/server.mjs`
+- `NoirwaveBackend/tests/publicDeezerSearch.test.mjs`
+- `NoirwaveBackend/tests/searchResponsePrefetch.test.mjs`
+- `NoirwaveTests/DeemixAPITrackMapperTests.swift`
+- `README.md`
+- `docs/CHANGELOG.md`
+- `docs/IMPLEMENTATION_NOTES.md`
+- `docs/BUGS_AND_REGRESSIONS.md`
+- `docs/DESIGN_NOTES.md`
+
+## Verification Run
+
+- 2026-06-07 resume: re-read `docs/STABILIZATION_MASTER_PLAN.md`, `docs/STABILIZATION_PROGRESS.md`, and `docs/HANDOFF.md`; confirmed Phase 5 is active.
+- Read `/Users/fsociety/TABILIZATION_MASTER_PLAN.md`.
+- Checked project docs under `/Users/fsociety/Noirwave/docs`.
+- Checked `git status --short --branch`; repo has pre-existing unresolved conflicts.
+- RED: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testBootstrapDoesNotSelectFeaturedTrackAsCurrentPlayback test` failed with `currentTrack` set to `Track 1` and queue non-empty.
+- GREEN: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testBootstrapPreparesVisiblePlaybackContextForFastSkipping -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testBootstrapDoesNotSelectFeaturedTrackAsCurrentPlayback test` passed: 2 tests, 0 failures.
+- Source check: `git diff --check -- Noirwave/Views/PlayerShellView.swift Noirwave/Core/PlayerStore.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` passed.
+- GREEN after skeleton UI: same focused `xcodebuild ... test` passed again: 2 tests, 0 failures.
+- Source check for removed Deezer seeds before this handoff update found only the old stale handoff entry plus the new README heading.
+- Source check: `git diff --check -- Noirwave/Core/DeemixAPIProvider.swift README.md Noirwave/Views/PlayerShellView.swift Noirwave/Core/PlayerStore.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` passed.
+- GREEN after seed removal: same focused `xcodebuild ... test` passed again: 2 tests, 0 failures.
+- Phase 2 trace: inspected `NoirwaveBackend/src/publicDeezerSearch.mjs`, `NoirwaveBackend/src/requestLimits.mjs`, `NoirwaveBackend/src/server.mjs`, `Noirwave/Core/DeemixAPIProvider.swift`, and the artist profile UI in `PlayerShellView.swift`.
+- Phase 2 live endpoint summaries were checked with `curl` plus JSON length summaries only; no large response bodies were logged.
+- RED: `node --test --test-name-pattern "does not impose an internal 100 item cap" tests/publicDeezerSearch.test.mjs` failed for the intended reason: expected 120 paginated tracks but received 100.
+- GREEN: `node --test --test-name-pattern "does not impose an internal 100 item cap" tests/publicDeezerSearch.test.mjs` passed: 1 test, 0 failures.
+- Source check: `git diff --check -- NoirwaveBackend/src/publicDeezerSearch.mjs NoirwaveBackend/tests/publicDeezerSearch.test.mjs docs` passed.
+- Backend suite: `npm test` in `NoirwaveBackend` passed: 37 tests, 0 failures.
+- RED: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testArtistPopularTracksSubtitleDescribesDeezerTopWindow test` failed for the intended compile-time reason: `ArtistPopularTracksCopy` was not in scope.
+- GREEN: same focused Swift test passed: 1 test, 0 failures.
+- Source check: `rg` found no `publicArtistDetailItemLimit`, no `collectPublicDataPages` default `limit = 100`, and no artist popular-track `subtitle: "\(tracks.count) tracks"` call in task scope.
+- Source check: `git diff --check -- Noirwave/Views/PlayerShellView.swift NoirwaveTests/DeemixAPITrackMapperTests.swift NoirwaveBackend/src/publicDeezerSearch.mjs NoirwaveBackend/tests/publicDeezerSearch.test.mjs docs` passed.
+- Phase 3 trace: inspected `PlayerStore.updateSearchQuery(_:)`, `scheduleSearch()`, `runSearch()`, `leaveCatalogContext()`, `SidebarSearchField`, `ContentDeckView`, `CatalogLandingView`, `SearchResultsView`, and catalog activation entry points.
+- RED: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testSearchResultsStayScopedToCatalogDestination test` failed for the intended compile-time reason: `ContentDeckRouting` was not in scope.
+- GREEN: same focused routing test passed: 1 test, 0 failures.
+- Source check: `git diff --check -- Noirwave/Views/PlayerShellView.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` passed.
+- Source check: `rg` found the new `ContentDeckRouting` usage and no old global `else if !store.searchQuery.trimmed.isEmpty` route in `ContentDeckView`.
+- Combined focused Swift check passed: 4 tests, 0 failures (`testBootstrapPreparesVisiblePlaybackContextForFastSkipping`, `testBootstrapDoesNotSelectFeaturedTrackAsCurrentPlayback`, `testArtistPopularTracksSubtitleDescribesDeezerTopWindow`, `testSearchResultsStayScopedToCatalogDestination`).
+- Phase 4 trace: inspected `SearchResultsView`, `BestMatchCard`, `EntityCard`, `TrackRowView`, `PlayerStore.activate(_:in:)`, `PlayerStore.play(_:)`, and existing search playback tests.
+- RED: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testActivatingCurrentSearchTrackTogglesPlaybackInsteadOfRestarting test` failed for the intended reason: playback stayed `.playing` and provider `playedIDs` contained the same track twice.
+- GREEN: same focused Phase 4 toggle test passed: 1 test, 0 failures.
+- Phase 4 focused playback tests passed: 2 tests, 0 failures (`testActivatingCurrentSearchTrackTogglesPlaybackInsteadOfRestarting`, `testActivatingSearchResultUsesVisibleResultsForPlaybackContext`).
+- Source check: `git diff --check -- Noirwave/Core/PlayerStore.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` passed.
+- RED: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testCatalogDetailStaysScopedToCatalogDestination -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testLeavingCatalogDetailWithEmptyQueryCancelsLateDetailResponse test` failed for the intended compile-time reason after test fixture correction: `ContentDeckRouting` had no `showsCatalogDetail` member.
+- GREEN: same focused Phase 5 tests passed: 2 tests, 0 failures.
+- Focused regression slice passed: 9 tests, 0 failures (`testBootstrapDoesNotSelectFeaturedTrackAsCurrentPlayback`, `testSearchResultsStayScopedToCatalogDestination`, `testCatalogDetailStaysScopedToCatalogDestination`, `testCatalogDrillKeepsSearchTextAndDoesNotRunSmartSearch`, `testAlbumSearchResultOpensAlbumDetailThroughSharedCatalogNavigation`, `testQueryUpdateAfterCatalogDrillReturnsToFreshSearchResults`, `testLeavingCatalogDetailWithEmptyQueryCancelsLateDetailResponse`, `testActivatingCurrentSearchTrackTogglesPlaybackInsteadOfRestarting`, `testActivatingSearchResultUsesVisibleResultsForPlaybackContext`).
+- Source check: `git diff --check -- Noirwave/Views/PlayerShellView.swift Noirwave/Core/PlayerStore.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` passed.
+- RED: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testLibrarySurfaceLayoutPlacesPlaylistsAtBottom -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testLibraryPlaylistShelfBuilderKeepsLikedSongsOutOfPlaylistShelf -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testLibraryPlaylistShelfBuilderFiltersOnlyRealLocalPlaylists test` failed for intended Phase 6 assertions: current layout put collections first and included `liked.songs` in the playlist shelf.
+- GREEN: same focused Phase 6 tests passed: 3 tests, 0 failures.
+- Focused Library/playlist regression slice passed: 19 tests, 0 failures.
+- Source check: `git diff --check -- Noirwave/Views/PlayerShellView.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` passed.
+- Source scan: `rg -n "Nirvana|Daft Punk|placeholder|fake|slop" Noirwave/Views Noirwave/Core --glob '!*.xcassets/**'` found no hardcoded Nirvana/Daft Punk or fake content in app sources; matches were only `placeholder` parameter names for local search fields.
+- 2026-06-07 17:57 MSK resume verification: `sed` re-read `docs/STABILIZATION_MASTER_PLAN.md`, `docs/STABILIZATION_PROGRESS.md`, and `docs/HANDOFF.md`; `git status --porcelain=v1 -uall` confirmed the repo still has pre-existing unmerged paths.
+- RED: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testLyricsSeekUpdatesProgressAndForwardsToProvider test` failed for the intended reason: `seek(to: 42)` clamped as a fraction and sent the player to 180 seconds.
+- RED: focused two-test seek run failed for the intended compile-time reason after adding `testProgressSliderSeekUsesFractionOfCurrentTrackDuration`: `seek(toFraction:)` did not exist yet.
+- GREEN: focused seek tests passed: 2 tests, 0 failures (`testLyricsSeekUpdatesProgressAndForwardsToProvider`, `testProgressSliderSeekUsesFractionOfCurrentTrackDuration`).
+- GREEN: focused Phase 7 lyrics slice passed: 4 tests, 0 failures (`testTrackLyricsSelectsActiveSynchronizedLine`, `testDecodesBackendLyricsResponse`, `testLyricsSeekUpdatesProgressAndForwardsToProvider`, `testProgressSliderSeekUsesFractionOfCurrentTrackDuration`).
+- Source check: `git diff --check -- Noirwave/Core/PlayerStore.swift Noirwave/Views/PlayerShellView.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` passed.
+- Source check: `rg -n "<<<<<<<|=======|>>>>>>>" Noirwave/Core/PlayerStore.swift Noirwave/Views/PlayerShellView.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` found no conflict markers in the touched task files.
+- RED: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testMiniPlayerVisualStyleKeepsGlassReadable test` failed for the intended compile-time reason: `MiniPlayerVisualStyle` was not in scope.
+- GREEN: same focused Phase 8 visual-token test passed: 1 test, 0 failures.
+- Source scan: `rg -n "black\\.opacity\\(0\\.18\\)|black\\.opacity\\(0\\.16\\)|white\\.opacity\\(0\\.52\\)|white\\.opacity\\(0\\.13\\)|frame\\(height: 2\\.5\\)" Noirwave/Views/PlayerShellView.swift` no longer found the old mini-player dark fill, low-contrast inactive controls, thin rail, or low-contrast rail tokens in the mini player scope. Remaining matches are outside the mini player contrast path or are shadows.
+- GREEN: combined Phase 7/8 focused slice passed: 5 tests, 0 failures (`testTrackLyricsSelectsActiveSynchronizedLine`, `testDecodesBackendLyricsResponse`, `testLyricsSeekUpdatesProgressAndForwardsToProvider`, `testProgressSliderSeekUsesFractionOfCurrentTrackDuration`, `testMiniPlayerVisualStyleKeepsGlassReadable`).
+- Source check: `rg -n "^(<<<<<<<|=======|>>>>>>>)" Noirwave/Views/PlayerShellView.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` found no real conflict markers.
+- Source check: `git diff --check -- Noirwave/Views/PlayerShellView.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` passed.
+- RED: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testSidebarVisualStyleUsesControlledNativePalette test` failed for the intended compile-time reason: `SidebarVisualStyle` was not in scope.
+- GREEN: same focused Phase 9 visual-token test passed: 1 test, 0 failures.
+- Source check: `git diff --check -- Noirwave/Views/PlayerShellView.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` passed.
+- GREEN: combined Phase 7/8/9 focused slice passed: 6 tests, 0 failures (`testTrackLyricsSelectsActiveSynchronizedLine`, `testDecodesBackendLyricsResponse`, `testLyricsSeekUpdatesProgressAndForwardsToProvider`, `testProgressSliderSeekUsesFractionOfCurrentTrackDuration`, `testMiniPlayerVisualStyleKeepsGlassReadable`, `testSidebarVisualStyleUsesControlledNativePalette`).
+- Source check: `rg -n "^(<<<<<<<|=======|>>>>>>>)" Noirwave/Views/PlayerShellView.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` found no real conflict markers.
+- RED: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testSidebarPlaylistPreviewBuilderUsesOnlyRealLocalPlaylists test` failed for the intended compile-time reason: `SidebarPlaylistPreviewBuilder` was not in scope.
+- GREEN: same focused Phase 10 sidebar-playlist test passed: 1 test, 0 failures.
+- GREEN: focused Phase 10 playlist/sidebar regression slice passed: 4 tests, 0 failures (`testSidebarPlaylistPreviewBuilderUsesOnlyRealLocalPlaylists`, `testLibraryPlaylistShelfBuilderKeepsLikedSongsOutOfPlaylistShelf`, `testLibraryPlaylistShelfBuilderFiltersOnlyRealLocalPlaylists`, `testSidebarVisualStyleUsesControlledNativePalette`).
+- Source scan: `rg -n "discovery\\.mix|Noirwave Mix|No saved collections|SidebarLibraryCollection|topAlbumCollection|topArtistCollection|playAll\\(collection|liked\\.songs" Noirwave/Views/PlayerShellView.swift` found only the `liked.songs` Library selection constant and no synthetic sidebar playlist rows.
+- Source check: `git diff --check -- Noirwave/Views/PlayerShellView.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` passed.
+- Source check: `rg -n "^(<<<<<<<|=======|>>>>>>>)" Noirwave/Views/PlayerShellView.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` found no real conflict markers.
+- GREEN: Phase 11 focused Swift checklist passed: 20 tests, 0 failures.
+- GREEN: Phase 11 backend checklist passed: 37 tests, 0 failures.
+- Source scan: `rg -n "Nirvana|Daft Punk|placeholder|fake|slop" Noirwave/Views Noirwave/Core --glob '!*.xcassets/**'` found no hardcoded Nirvana/Daft Punk/fake app content; matches were only local filter placeholder parameter names and labels.
+- Source scan: `rg -n "TextField\\(|Search catalog|SidebarSearchField|CatalogLandingView|SearchResultsView" Noirwave/Views/PlayerShellView.swift` confirmed one catalog search field in `SidebarSearchField`; other text fields are playlist name, Library/playlist filter, and queue filter.
+- Source scan: `rg -n "discovery\\.mix|Noirwave Mix|No saved collections|SidebarLibraryCollection|topAlbumCollection|topArtistCollection|playAll\\(collection"` found no remaining sidebar playlist filler.
+- Source scan: `rg -n "publicArtistDetailItemLimit|collectPublicDataPages\\([^\\n]*limit\\s*=\\s*100|subtitle:\\s*\\\"\\\\\\(tracks\\.count\\\\\\) tracks\\\""` found no old public artist 100-cap patterns.
+- Source check: `rg -n "^(<<<<<<<|=======|>>>>>>>)" Noirwave/Core/PlayerStore.swift Noirwave/Core/DeemixAPIProvider.swift Noirwave/Views/PlayerShellView.swift NoirwaveTests/DeemixAPITrackMapperTests.swift NoirwaveBackend/src/publicDeezerSearch.mjs NoirwaveBackend/tests/publicDeezerSearch.test.mjs docs` found no real conflict markers.
+- Phase 12 docs audit: `sed`/`rg` reviewed mandatory docs against master-plan requirements, then documentation coverage mapping was added.
+- Source check: `git diff --check -- docs` passed before the final Phase 12 documentation mapping update.
+- Phase 13 docs audit: `rg` scan found no premature claim that all 18 phases were complete at that checkpoint; progress and handoff then kept phases 14-18 open and noted unresolved `UU` repo state.
+- Source check: `git diff --check -- docs` passed before the final Phase 13 documentation update.
+- Phase 14 RED before production changes: focused search UX tests failed for the intended reasons. `testSearchDebouncesRemoteRequestAndKeepsTypingLocal` showed the old path started the remote query before the requested debounce window, and the strengthened cache test showed repeated normalized queries could hit the provider again.
+- Phase 14 GREEN focused pair: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testSearchDebouncesRemoteRequestAndKeepsTypingLocal -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testSearchUsesCachedResultsWithoutRepeatingRemoteQuery test` passed: 2 tests, 0 failures.
+- Phase 14 GREEN search/navigation slice: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testSearchDebouncesRemoteRequestAndKeepsTypingLocal -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testSearchUsesCachedResultsWithoutRepeatingRemoteQuery -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testCancelledSearchDoesNotSurfaceProviderError -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testSearchResultsStayScopedToCatalogDestination -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testActivatingCurrentSearchTrackTogglesPlaybackInsteadOfRestarting -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testActivatingSearchResultUsesVisibleResultsForPlaybackContext -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testCatalogDetailStaysScopedToCatalogDestination -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testAlbumSearchResultOpensAlbumDetailThroughSharedCatalogNavigation -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testQueryUpdateAfterCatalogDrillReturnsToFreshSearchResults test -quiet` passed with exit 0.
+- Phase 14 source check: `git diff --check -- Noirwave/Core/PlayerStore.swift Noirwave/Views/PlayerShellView.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` passed.
+- Phase 14 source check: `rg -n "^(<<<<<<<|=======|>>>>>>>)" Noirwave/Core/PlayerStore.swift Noirwave/Views/PlayerShellView.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` found no conflict markers in touched task files.
+- Phase 14 source scan confirmed the `searchResultsCache`/`searchCacheKey` path, the 300ms debounce, compact spinner usage, and no old full-panel `CatalogLoadingView(title: "Searching")` path in touched search UI.
+- Phase 15 RED: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testArtistHeaderLayoutKeepsFirstViewportDense test -quiet` failed for the intended compile-time reason because `ArtistHeaderLayoutMetrics` was not in scope.
+- Phase 15 GREEN focused test: same `testArtistHeaderLayoutKeepsFirstViewportDense` command passed after adding the metrics contract and applying it to the artist header.
+- Phase 15 GREEN artist/catalog slice: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testArtistHeaderLayoutKeepsFirstViewportDense -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testArtistPopularTracksSubtitleDescribesDeezerTopWindow -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testArtistCatalogComposerDoesNotTruncatePopularTracks -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testCatalogRequestWindowsAreExpandedPastPreviewLimits -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testCatalogDetailStaysScopedToCatalogDestination -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testAlbumSearchResultOpensAlbumDetailThroughSharedCatalogNavigation -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testQueryUpdateAfterCatalogDrillReturnsToFreshSearchResults test -quiet` passed with exit 0.
+- Phase 15 source check: `git diff --check -- Noirwave/Views/PlayerShellView.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` passed.
+- Phase 15 source check: `rg -n "^(<<<<<<<|=======|>>>>>>>)" Noirwave/Views/PlayerShellView.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` found no conflict markers in touched task files.
+- Phase 15 source scan: `rg -n "size: 420|size: 184|minHeight: 340|system\\(size: 58|padding\\(28\\)|ArtworkTile\\(track: release, size: 74" Noirwave/Views/PlayerShellView.swift` found no old oversized artist-hero literals.
+- Phase 16 RED: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testArtistPopularTracksPresentationDefaultsToTopFiveAndCanExpand test -quiet` failed for the intended compile-time reason because `ArtistPopularTracksPresentation` was not in scope.
+- Phase 16 GREEN focused test: same `testArtistPopularTracksPresentationDefaultsToTopFiveAndCanExpand` command passed after adding the presentation helper and artist-specific section.
+- Phase 16 GREEN artist/header/popular-tracks/catalog slice: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testArtistHeaderLayoutKeepsFirstViewportDense -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testArtistPopularTracksPresentationDefaultsToTopFiveAndCanExpand -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testArtistPopularTracksSubtitleDescribesDeezerTopWindow -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testArtistCatalogComposerDoesNotTruncatePopularTracks -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testCatalogRequestWindowsAreExpandedPastPreviewLimits -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testCatalogDetailStaysScopedToCatalogDestination -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testAlbumSearchResultOpensAlbumDetailThroughSharedCatalogNavigation -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testQueryUpdateAfterCatalogDrillReturnsToFreshSearchResults test -quiet` passed with exit 0.
+- Phase 16 source check: `git diff --check -- Noirwave/Views/PlayerShellView.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` passed.
+- Phase 16 source check: `rg -n "^(<<<<<<<|=======|>>>>>>>)" Noirwave/Views/PlayerShellView.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` found no conflict markers in touched task files.
+- Phase 16 source scan confirmed `ArtistPopularTracksPresentation`, `ArtistPopularTracksSection`, Show more / Show less copy, and no direct full-list `TrackListSection(title: "Popular Tracks")` path.
+- Phase 17 subtask 1 RED: `node --test tests/searchResponsePrefetch.test.mjs` failed for the intended module-missing reason because `src/searchResponsePrefetch.mjs` did not exist yet.
+- Phase 17 subtask 1 GREEN focused test: `node --test tests/searchResponsePrefetch.test.mjs` passed 2 tests, 0 failures.
+- Phase 17 subtask 1 backend suite: `npm test` in `NoirwaveBackend` passed 39 tests, 0 failures.
+- Phase 17 subtask 1 source check: `git diff --check -- NoirwaveBackend/src/server.mjs NoirwaveBackend/src/searchResponsePrefetch.mjs NoirwaveBackend/tests/searchResponsePrefetch.test.mjs docs` passed.
+- Phase 17 subtask 1 source check: `rg -n "^(<<<<<<<|=======|>>>>>>>)" NoirwaveBackend/src/server.mjs NoirwaveBackend/src/searchResponsePrefetch.mjs NoirwaveBackend/tests/searchResponsePrefetch.test.mjs docs` found no conflict markers in touched task files.
+- Phase 17 subtask 1 source scan: `rg -n "await warmForegroundPrefetch|warmForegroundPrefetch\\(" NoirwaveBackend/src/server.mjs` found no remaining search-response wait path.
+- Phase 17 subtask 2 RED: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testLyricsCacheReusesLoadedLyricsForRepeatedPlayback test` failed for the intended reason: repeat playback set `lyricsState` back to `.loading` and called the provider lyrics path twice for the same track.
+- Phase 17 subtask 2 GREEN focused test: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testLyricsCacheReusesLoadedLyricsForRepeatedPlayback test -quiet` passed.
+- Phase 17 subtask 2 GREEN lyrics/playback slice: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testLyricsCacheReusesLoadedLyricsForRepeatedPlayback -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testTrackLyricsSelectsActiveSynchronizedLine -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testDecodesBackendLyricsResponse -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testLyricsSeekUpdatesProgressAndForwardsToProvider -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testProgressSliderSeekUsesFractionOfCurrentTrackDuration -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testActivatingCurrentSearchTrackTogglesPlaybackInsteadOfRestarting -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testActivatingSearchResultUsesVisibleResultsForPlaybackContext test -quiet` passed with exit 0.
+- Phase 17 subtask 2 source check: `git diff --check -- Noirwave/Core/PlayerStore.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` passed.
+- Phase 17 subtask 2 source check: `rg -n "^(<<<<<<<|=======|>>>>>>>)" Noirwave/Core/PlayerStore.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` found no conflict markers in touched task files.
+- Phase 17 subtask 2 source scan confirmed `lyricsCache`, `applyLyrics`, `testLyricsCacheReusesLoadedLyricsForRepeatedPlayback`, and `LyricsCacheRecordingProvider`.
+- Phase 17 subtask 3 RED: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testCatalogDetailCacheReusesLoadedItemsWithoutProviderRoundTrip test` failed for the intended reason: repeat detail drill-in showed loading/empty content and called `catalogItems(for:)` twice.
+- Phase 17 subtask 3 GREEN focused test: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testCatalogDetailCacheReusesLoadedItemsWithoutProviderRoundTrip test -quiet` passed.
+- Phase 17 subtask 3 GREEN search/catalog/lyrics slice: `xcodebuild -project Noirwave.xcodeproj -scheme Noirwave -destination 'platform=macOS' -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testCatalogDetailCacheReusesLoadedItemsWithoutProviderRoundTrip -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testCatalogDrillKeepsSearchTextAndDoesNotRunSmartSearch -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testAlbumSearchResultOpensAlbumDetailThroughSharedCatalogNavigation -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testCatalogDrillShowsOptimisticArtistTracksWhileDetailLoads -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testQueryUpdateAfterCatalogDrillReturnsToFreshSearchResults -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testLeavingCatalogDetailWithEmptyQueryCancelsLateDetailResponse -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testSearchResultsStayScopedToCatalogDestination -only-testing:NoirwaveTests/DeemixAPITrackMapperTests/testLyricsCacheReusesLoadedLyricsForRepeatedPlayback test -quiet` passed with exit 0.
+- Phase 17 subtask 3 source check: `git diff --check -- Noirwave/Core/PlayerStore.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` passed.
+- Phase 17 subtask 3 source check: `rg -n "^(<<<<<<<|=======|>>>>>>>)" Noirwave/Core/PlayerStore.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs` found no conflict markers in touched task files.
+- Phase 17 subtask 3 source scan confirmed `catalogItemsCache`, `catalogItemsCacheKey`, the new cache regression, and the Phase 14-compatible 420ms search waits in catalog-drill tests.
+- Phase 17 subtask 4 source scan: `rg -n "CatalogLoadingView\\(title: \\\"Searching\\\"|await warmForegroundPrefetch|TrackListSection\\([^\\n]*title: \\\"Popular Tracks\\\"|prefix\\(100\\)|count: 100|limit = 100|publicArtistDetailItemLimit|milliseconds\\(180\\)" ...` found no old blocking search loader, awaited foreground search prefetch, direct full-list artist Popular Tracks path, old 100-cap production path, or stale 180ms search debounce wait. Matches were test detail-delay waits and copy assertions only.
+- Phase 17 subtask 4 source scan confirmed timeout/cancellation/cache paths across `PlayerStore`, `DeemixAPIProvider`, `ArtworkImagePipeline`, backend server/public Deezer/python catalog code, and streaming code.
+- Phase 17 subtask 4 source scan confirmed granular loading and long-list boundaries in `PlayerShellView`: sidebar/local search spinner, empty-search compact spinner, artist/album detail loaders only for empty detail states, `ArtistPopularTracksSection`, and artwork pipeline usage.
+- Phase 17 subtask 4 combined Swift acceptance slice passed with exit 0: 16 focused tests across search debounce/cache/cancellation, catalog detail cache/navigation, lyrics cache/seek, artist header density, and popular-track top-5 presentation.
+- Phase 17 subtask 4 backend acceptance suite: `npm test` in `NoirwaveBackend` passed 39 tests, 0 failures.
+- Phase 17 subtask 5 native synthetic slow-network regression passed: `testSlowNetworkSearchKeepsShellPlaybackAndPreviousResultsUsable` executed 1 test, 0 failures, with a 3.5s delayed provider response.
+- Phase 18 final Swift acceptance slice passed with exit 0: 17 focused tests across search debounce/cache/cancellation, native slow-network delayed search, catalog detail cache/navigation, lyrics cache/seek, artist header density, and popular-track top-5 presentation.
+- Phase 18 final backend suite passed: `npm test` in `NoirwaveBackend` passed 39 tests, 0 failures.
+- Phase 18 source checks passed:
+  - `git diff --check` for docs plus touched Swift/backend task files;
+  - conflict-marker scan found no markers in docs plus touched Swift/backend task files;
+  - Debug app bundle size checked at 43M;
+  - old-pattern scans found no production full search loading wall, awaited search prefetch, direct full-list artist Popular Tracks path, raw app `AsyncImage`, or old task-scope display/request caps.
+- Post-plan UI polish verification:
+  - focused RED captured compile-time failures for missing `SearchResultsPresentation`, `ArtworkFallbackStyle`, `VolumeIcon`, and mini-player progress/play-size tokens;
+  - focused GREEN passed for search presentation, mint/inset/progress tokens, neutral fallback, and volume persistence/icon mapping;
+  - broader Swift slice passed 18 focused tests covering search/cache/navigation, native slow-network search, artist navigation/detail cache, player visual tokens, and volume behavior;
+  - `git diff --check` passed for touched Swift/test files;
+  - conflict-marker scan found no markers in touched Swift/test files;
+  - source scans found no old `#5EE0C2`, generated fallback `AngularGradient`, fake fallback stripes, or per-track palette accent usage in `PlayerShellView`.
+- Post-plan panel glass verification:
+  - RED: `testSidePanelsShareMiniPlayerLiquidGlassLanguage` failed on the too-murky values (`dimOpacity` 0.20, `innerHighlightOpacity` 0.11, `mintGlowOpacity` 0.075);
+  - GREEN: focused Swift run passed 3 tests: `testSidePanelsShareMiniPlayerLiquidGlassLanguage`, `testMiniPlayerVisualStyleUsesInsetMintProgressAndSmallerPrimaryControl`, and `testSearchPresentationKeepsArtistResultsLightweight`;
+  - second RED/GREEN pass captured and fixed the still-too-murky material/dim/highlight values, then reran the same 3 focused tests successfully;
+  - third RED/GREEN pass added `testSidebarIsClearerAndNowPlayingPanelIsDarkerThanBaseGlass` and passed 4 focused tests covering distinct sidebar/right-panel appearances plus search presentation;
+  - earlier panel-glass focused run passed 4 tests including `testSidebarVisualStyleUsesControlledNativePalette`;
+  - `git diff --check -- Noirwave/Views/PlayerShellView.swift NoirwaveTests/DeemixAPITrackMapperTests.swift docs/HANDOFF.md` passed;
+  - conflict-marker scan found no markers in `Noirwave/Views/PlayerShellView.swift`, `NoirwaveTests/DeemixAPITrackMapperTests.swift`, or docs.
+
+## Remaining Issues
+
+- Phase 1 is complete for the current stabilization pass.
+- Phase 2 is complete for the current stabilization pass: backend no longer imposes a hidden 100-item cap, docs explain current Deezer top-track behavior, and artist UI copy no longer presents the value as a generic full-track total.
+- Phase 3 is complete for the current stabilization pass: there is one catalog search state/field, Catalog has no second input, and search results no longer override other destinations while the sidebar query remains non-empty.
+- Phase 4 is complete for the current stabilization pass: Play from search results uses the shared player store, updates current track/playback, uses visible search results for queue/context, and repeated activation toggles pause instead of replaying provider playback.
+- Phase 5 is complete for the current stabilization pass: artist/album detail navigation is scoped to Catalog, Back cancels stale detail loads, query updates recover to fresh search results, and search playback remains shared.
+- Phase 6 is complete for the current stabilization pass: Library uses real liked/saved/local playlist data, no fake Nirvana/Daft Punk filler was found in app sources, liked songs are a prominent top block, favorite tracks render in an adaptive two-column list, and playlists include a create tile.
+- Phase 7 is complete for the current stabilization pass: synchronized lyrics lines seek through the shared player timeline, active-line highlighting and scroll sync remain progress-driven, and unsynced lyrics are explicitly text-only.
+- Phase 8 is complete for the current stabilization pass: mini player glass is lighter, inactive controls are readable, play/pause is visibly emphasized, and progress/accent contrast is token-locked.
+- Phase 9 is complete for the current stabilization pass: sidebar palette/active/search styling is tokenized, selected and focused states use the shared app accent, and playlist rows no longer inherit random current-track/collection colors.
+- Phase 10 is complete for the current stabilization pass: the bottom sidebar playlist block follows path B, uses only real local playlists, includes create-playlist affordances and empty state, and no longer synthesizes Liked Songs/discovery/album/artist filler.
+- Phase 11 is complete for the current stabilization pass: the mandatory regression checklist passed across the focused Swift slice, backend tests, and source scans.
+- Phase 12 is complete for the current stabilization pass: mandatory docs now explicitly cover the requested stabilization documentation topics.
+- Phase 13 is complete for the current stabilization pass: durable docs avoided premature full-plan completion claims at that checkpoint; phases 14-18 were later completed and recorded here.
+- Phase 14 is complete for the current stabilization pass: search input is debounced at 300ms, repeated normalized queries use cache, superseded searches are cancelled, stale responses are ignored, empty queries reset immediately, and loading feedback is local/compact.
+- Phase 15 is complete for the current stabilization pass: artist header density is tokenized and compact enough to leave first-viewport room for latest release and the beginning of popular tracks.
+- Phase 16 is complete for the current stabilization pass: artist popular tracks show top 5 by default with Show more / Show less expansion for the full received list.
+- Phase 17 is complete for the current stabilization pass: backend search response latency, lyrics cache reuse, artist/album detail cache reuse, acceptance source/test audit, and native synthetic slow-network verification all passed.
+- Phase 18 is complete for the current stabilization pass: root-cause report and final verification are done.
+- Post-plan panel glass split correction is complete for the current pass and the latest Debug app is running.
+- Repo index remains unmerged from before this session. No conflict markers were found in app/backend files during this subtask, but `git status` still reports `UU` paths.
+
+## Next Exact Task
+
+No requested UI-polish task remains unless the user asks for another visual adjustment. The next non-plan task is resolving the pre-existing unmerged git index state if the user wants repository cleanup.
